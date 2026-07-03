@@ -1,0 +1,2250 @@
+Project Structure:
+requirements.txt
+Dockerfile
+README.md
+.gitattributes
+app.py
+static/index.html
+
+File Contents:
+requirements.txt:
+```
+fastapi==0.115.0
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+biplist==1.0.3
+
+
+```
+
+Dockerfile:
+```
+FROM python:3.11-slim
+
+RUN apt-get update && apt-get install -y p7zip-full genisoimage && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app.py .
+COPY static/ static/
+
+ENV PYTHONUNBUFFERED=1
+
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7860"]
+
+```
+
+README.md:
+```
+---
+title: Localspace Deployer
+emoji: 🐨
+colorFrom: indigo
+colorTo: yellow
+sdk: docker
+pinned: false
+---
+
+Check out the configuration reference at https://huggingface.co/docs/hub/spaces-config-reference
+
+```
+
+.gitattributes:
+```
+*.7z filter=lfs diff=lfs merge=lfs -text
+*.arrow filter=lfs diff=lfs merge=lfs -text
+*.bin filter=lfs diff=lfs merge=lfs -text
+*.bz2 filter=lfs diff=lfs merge=lfs -text
+*.ckpt filter=lfs diff=lfs merge=lfs -text
+*.ftz filter=lfs diff=lfs merge=lfs -text
+*.gz filter=lfs diff=lfs merge=lfs -text
+*.h5 filter=lfs diff=lfs merge=lfs -text
+*.joblib filter=lfs diff=lfs merge=lfs -text
+*.lfs.* filter=lfs diff=lfs merge=lfs -text
+*.mlmodel filter=lfs diff=lfs merge=lfs -text
+*.model filter=lfs diff=lfs merge=lfs -text
+*.msgpack filter=lfs diff=lfs merge=lfs -text
+*.npy filter=lfs diff=lfs merge=lfs -text
+*.npz filter=lfs diff=lfs merge=lfs -text
+*.onnx filter=lfs diff=lfs merge=lfs -text
+*.ot filter=lfs diff=lfs merge=lfs -text
+*.parquet filter=lfs diff=lfs merge=lfs -text
+*.pb filter=lfs diff=lfs merge=lfs -text
+*.pickle filter=lfs diff=lfs merge=lfs -text
+*.pkl filter=lfs diff=lfs merge=lfs -text
+*.pt filter=lfs diff=lfs merge=lfs -text
+*.pth filter=lfs diff=lfs merge=lfs -text
+*.rar filter=lfs diff=lfs merge=lfs -text
+*.safetensors filter=lfs diff=lfs merge=lfs -text
+saved_model/**/* filter=lfs diff=lfs merge=lfs -text
+*.tar.* filter=lfs diff=lfs merge=lfs -text
+*.tar filter=lfs diff=lfs merge=lfs -text
+*.tflite filter=lfs diff=lfs merge=lfs -text
+*.tgz filter=lfs diff=lfs merge=lfs -text
+*.wasm filter=lfs diff=lfs merge=lfs -text
+*.xz filter=lfs diff=lfs merge=lfs -text
+*.zip filter=lfs diff=lfs merge=lfs -text
+*.zst filter=lfs diff=lfs merge=lfs -text
+*tfevents* filter=lfs diff=lfs merge=lfs -text
+
+```
+
+app.py:
+```
+#!/usr/bin/env python3
+"""
+LocalSpace Deployer — Hugging Face Space (Vanilla)
+
+Drag a DMG. It gets OPENED on the server: extracted, inspected, and its
+app bundle metadata is displayed. The Space itself hosts the DMG contents.
+
+Pure FastAPI + HTML/JS. No Gradio, no Streamlit, no API keys.
+Public by default.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import plistlib
+import re
+import shutil
+import subprocess
+import time
+import uuid
+from pathlib import Path
+from typing import Any
+
+from fastapi import FastAPI, File, Request, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+
+# Try biplist for binary plists, fall back to plistlib
+try:
+    import biplist
+    HAS_BIPLIST = True
+except ImportError:
+    HAS_BIPLIST = False
+
+DATA_DIR = Path("data")
+DATA_DIR.mkdir(exist_ok=True)
+UPLOAD_DIR = DATA_DIR / "uploads"
+UPLOAD_DIR.mkdir(exist_ok=True)
+EXTRACT_DIR = DATA_DIR / "extracted"
+EXTRACT_DIR.mkdir(exist_ok=True)
+DB_PATH = DATA_DIR / "apps.json"
+
+app = FastAPI(title="LocalSpace Deployer")
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+_store: dict[str, dict[str, Any]] = {}
+
+
+def _load_db() -> None:
+    global _store
+    if DB_PATH.exists():
+        with open(DB_PATH) as f:
+            _store = json.load(f)
+    else:
+        _store = {}
+
+
+def _save_db() -> None:
+    with open(DB_PATH, "w") as f:
+        json.dump(_store, f, indent=2)
+
+
+def _slugify(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", name.lower().replace(".dmg", "")).strip("-")
+
+
+def _hash_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _read_plist(path: Path) -> dict[str, Any]:
+    """Read a plist file (XML or binary)."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        try:
+            return plistlib.loads(data)
+        except Exception:
+            pass
+        if HAS_BIPLIST:
+            try:
+                return biplist.readPlistFromString(data)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return {}
+
+
+def _find_app_bundles(root: Path) -> list[Path]:
+    """Find all .app directories under root."""
+    apps = []
+    for p in root.rglob("*.app"):
+        if p.is_dir():
+            apps.append(p)
+    return apps
+
+
+def _extract_dmg(dmg_path: Path, dest: Path) -> bool:
+    """Extract DMG using 7z. Returns True on success."""
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+        result = subprocess.run(
+            ["7z", "x", "-y", "-o" + str(dest), str(dmg_path)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def _inspect_app_bundle(app_path: Path) -> dict[str, Any]:
+    """Read Info.plist and extract metadata from an .app bundle."""
+    info_plist = app_path / "Contents" / "Info.plist"
+    if not info_plist.exists():
+        info_plist = app_path / "Info.plist"
+
+    info = _read_plist(info_plist) if info_plist.exists() else {}
+
+    icon_name = info.get("CFBundleIconFile", "")
+    icon_path = None
+    if icon_name:
+        icons_dir = app_path / "Contents" / "Resources"
+        if icons_dir.exists():
+            icns = icons_dir / (icon_name if icon_name.endswith(".icns") else icon_name + ".icns")
+            if icns.exists():
+                icon_path = str(icns)
+
+    files = []
+    if app_path.exists():
+        for f in sorted(app_path.rglob("*")):
+            if f.is_file():
+                try:
+                    rel = str(f.relative_to(app_path))
+                    files.append(rel)
+                except ValueError:
+                    pass
+
+    return {
+        "bundle_name": app_path.name,
+        "bundle_id": info.get("CFBundleIdentifier", ""),
+        "display_name": info.get("CFBundleDisplayName", "") or info.get("CFBundleName", ""),
+        "version": info.get("CFBundleShortVersionString", "") or info.get("CFBundleVersion", ""),
+        "min_os_version": info.get("LSMinimumSystemVersion", ""),
+        "executable": info.get("CFBundleExecutable", ""),
+        "icon_path": icon_path,
+        "info_plist": info,
+        "file_count": len(files),
+        "files": files[:200],
+    }
+
+
+def _open_dmg(app_id: str, dmg_path: Path) -> dict[str, Any]:
+    """Open a DMG: extract it, find apps, inspect them."""
+    extract_to = EXTRACT_DIR / app_id
+    if extract_to.exists():
+        shutil.rmtree(extract_to)
+
+    success = _extract_dmg(dmg_path, extract_to)
+    if not success:
+        return {"opened": False, "error": "Extraction failed. DMG may be encrypted or use an unsupported format."}
+
+    apps = _find_app_bundles(extract_to)
+    inspected = [_inspect_app_bundle(a) for a in apps]
+
+    # Build top-level tree
+    tree = []
+    for item in sorted(extract_to.iterdir()):
+        tree.append({
+            "name": item.name,
+            "type": "directory" if item.is_dir() else "file",
+            "size": item.stat().st_size if item.is_file() else 0,
+        })
+
+    # Discover all HTML files recursively for iframe preview
+    html_files: list[dict[str, Any]] = []
+    for f in extract_to.rglob("*.html"):
+        rel = f.relative_to(extract_to)
+        depth = len(rel.parts)
+        html_files.append({"path": str(rel), "depth": depth, "size": f.stat().st_size})
+    # Prefer shallowest HTML, then shortest path, then largest
+    html_files.sort(key=lambda x: (x["depth"], len(x["path"]), -x["size"]))
+
+    return {
+        "opened": True,
+        "extracted_path": str(extract_to),
+        "apps_found": len(inspected),
+        "apps": inspected,
+        "tree": tree,
+        "html_files": html_files[:50],
+        "has_preview": bool(html_files),
+        "preview_entry": html_files[0]["path"] if html_files else None,
+    }
+
+
+_load_db()
+
+
+@app.get("/", response_class=HTMLResponse)
+def index(request: Request) -> HTMLResponse:
+    with open("static/index.html") as f:
+        return HTMLResponse(content=f.read())
+
+
+@app.post("/api/upload")
+async def upload_file(file: UploadFile = File(...)) -> JSONResponse:
+    if not file.filename or not file.filename.lower().endswith(".dmg"):
+        return JSONResponse({"error": "Only .dmg files are accepted."}, status_code=400)
+
+    app_id = str(uuid.uuid4())
+    slug = _slugify(file.filename)
+    base_slug = slug
+    counter = 1
+    while any(a.get("slug") == slug for a in _store.values()):
+        slug = f"{base_slug}-{counter}"
+        counter += 1
+
+    dest = UPLOAD_DIR / f"{app_id}.dmg"
+    with open(dest, "wb") as f:
+        while True:
+            chunk = await file.read(65536)
+            if not chunk:
+                break
+            f.write(chunk)
+
+    sha256 = _hash_file(dest)
+    size = dest.stat().st_size
+
+    opened = _open_dmg(app_id, dest)
+
+    entry = {
+        "app_id": app_id,
+        "slug": slug,
+        "filename": file.filename,
+        "size": size,
+        "sha256": sha256,
+        "download_url": f"/api/download/{app_id}",
+        "opened": opened.get("opened", False),
+        "apps_found": opened.get("apps_found", 0),
+        "apps": opened.get("apps", []),
+        "tree": opened.get("tree", []),
+        "html_files": opened.get("html_files", []),
+        "has_preview": opened.get("has_preview", False),
+        "preview_entry": opened.get("preview_entry", None),
+        "created_at": time.time(),
+    }
+    _store[app_id] = entry
+    _save_db()
+
+    return JSONResponse({
+        "app": entry,
+        "message": "DMG uploaded and opened." if entry["opened"] else "DMG uploaded but could not be opened.",
+    }, status_code=201)
+
+
+@app.get("/api/apps")
+def list_apps() -> JSONResponse:
+    apps = sorted(_store.values(), key=lambda a: a["created_at"], reverse=True)
+    return JSONResponse({"apps": apps})
+
+
+@app.get("/app/{app_id}", response_class=HTMLResponse)
+def serve_app(app_id: str) -> HTMLResponse:
+    """Serve a published app as a full-page iframe viewer."""
+    entry = _store.get(app_id)
+    if not entry:
+        return HTMLResponse("<h1>Not found</h1>", status_code=404)
+
+    if not entry.get("has_preview"):
+        return HTMLResponse("<h1>This app has no web preview</h1>", status_code=404)
+
+    entry_path = entry.get("preview_entry", "")
+    iframe_src = f"/api/preview/{app_id}/{entry_path}" if entry_path else f"/api/preview/{app_id}"
+    app_name = entry.get("filename", "App")
+    display_name = ""
+    if entry.get("apps") and entry["apps"]:
+        display_name = entry["apps"][0].get("display_name", "") or entry["apps"][0].get("bundle_name", "")
+    if not display_name:
+        display_name = app_name.replace(".dmg", "").replace(".zip", "")
+
+    html = f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{display_name} — LocalSpace</title>
+<style>
+  * {{ box-sizing: border-box; margin: 0; }}
+  body {{ background: #0a0a0f; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }}
+  header {{ background: #14141a; border-bottom: 1px solid #2a2a35; padding: 12px 20px; display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; }}
+  header .title {{ color: #e2e2e8; font-weight: 600; font-size: 1rem; display: flex; align-items: center; gap: 10px; }}
+  header .title .badge {{ background: rgba(34,197,94,0.15); color: #22c55e; padding: 2px 8px; border-radius: 999px; font-size: 0.72rem; font-weight: 500; }}
+  header .actions {{ display: flex; gap: 10px; }}
+  header .actions a, header .actions button {{ background: #1c1c24; border: 1px solid #2a2a35; color: #e2e2e8; padding: 6px 14px; border-radius: 8px; font-size: 0.85rem; text-decoration: none; cursor: pointer; transition: background 0.15s; }}
+  header .actions a:hover, header .actions button:hover {{ background: #2a2a35; }}
+  .iframe-wrap {{ flex: 1; position: relative; overflow: hidden; }}
+  iframe {{ width: 100%; height: 100%; border: none; display: block; }}
+  .loading {{ position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: #0a0a0f; color: #888898; font-size: 0.95rem; z-index: 1; }}
+</style>
+</head>
+<body>
+<header>
+  <div class="title">
+    ⬡ {display_name}
+    <span class="badge">Live</span>
+  </div>
+  <div class="actions">
+    <a href="/" title="Back to deployer">← Back</a>
+    <a href="{iframe_src}" target="_blank" title="Open in new tab">↗ Open</a>
+    <button onclick="document.querySelector('iframe').requestFullscreen()">⛶ Fullscreen</button>
+  </div>
+</header>
+<div class="iframe-wrap">
+  <div class="loading" id="loader">Loading app...</div>
+  <iframe src="{iframe_src}" onload="document.getElementById('loader').style.display='none'"></iframe>
+</div>
+</body>
+</html>'''
+    return HTMLResponse(content=html)
+
+
+@app.get("/api/apps/{app_id}")
+def get_app(app_id: str) -> JSONResponse:
+    entry = _store.get(app_id)
+    if not entry:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    return JSONResponse({"app": entry})
+
+
+@app.get("/api/download/{app_id}")
+def download_app(app_id: str):
+    entry = _store.get(app_id)
+    if not entry:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+
+    path = UPLOAD_DIR / f"{app_id}.dmg"
+    if not path.exists():
+        return JSONResponse({
+            "error": "File not found on disk",
+            "detail": "This upload was stored in temporary storage that was cleared during a Space restart. Please re-upload the DMG."
+        }, status_code=404)
+
+    return FileResponse(
+        path=path,
+        filename=entry["filename"],
+        media_type="application/x-apple-diskimage",
+    )
+
+
+@app.get("/api/browse/{app_id}/{path:path}")
+def browse_extracted(app_id: str, path: str):
+    entry = _store.get(app_id)
+    if not entry:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+
+    safe_path = Path(path).name if not path else path
+    base = EXTRACT_DIR / app_id
+    target = base / safe_path
+
+    if not base.exists():
+        return JSONResponse({
+            "error": "Extracted files not found",
+            "detail": "This upload was stored in temporary storage that was cleared during a Space restart. Please re-upload the DMG."
+        }, status_code=404)
+
+    try:
+        target.resolve().relative_to(base.resolve())
+    except ValueError:
+        return JSONResponse({"error": "Access denied"}, status_code=403)
+
+    if not target.exists():
+        return JSONResponse({"error": "Not found"}, status_code=404)
+
+    if target.is_dir():
+        items = []
+        for item in sorted(target.iterdir()):
+            items.append({
+                "name": item.name,
+                "type": "directory" if item.is_dir() else "file",
+                "size": item.stat().st_size if item.is_file() else 0,
+            })
+        return JSONResponse({"items": items})
+
+    return FileResponse(path=target)
+
+
+# ─── Preview extracted HTML content in iframe ──────────────────────────────
+
+@app.get("/api/preview/{app_id}/{path:path}")
+def preview_content(app_id: str, path: str):
+    """Serve extracted DMG content for iframe preview."""
+    entry = _store.get(app_id)
+    if not entry:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+
+    base = EXTRACT_DIR / app_id
+    if not base.exists():
+        return JSONResponse({
+            "error": "Extracted files not found",
+            "detail": "This upload was stored in temporary storage that was cleared during a Space restart. Please re-upload the DMG."
+        }, status_code=404)
+
+    if path:
+        target = base / path
+    else:
+        # Default to index.html if no path
+        target = base / "index.html"
+        if not target.exists():
+            # Find any HTML file
+            for f in base.rglob("*.html"):
+                target = f
+                break
+
+    if not target.exists():
+        return JSONResponse({"error": "Not found"}, status_code=404)
+
+    # Security check
+    try:
+        target.resolve().relative_to(base.resolve())
+    except ValueError:
+        return JSONResponse({"error": "Access denied"}, status_code=403)
+
+    if target.is_dir():
+        # Look for index.html in directory
+        idx = target / "index.html"
+        if idx.exists():
+            target = idx
+        else:
+            return JSONResponse({"error": "No index.html"}, status_code=404)
+
+    mime_types = {
+        ".html": "text/html",
+        ".htm": "text/html",
+        ".js": "application/javascript",
+        ".css": "text/css",
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".gif": "image/gif",
+        ".svg": "image/svg+xml",
+        ".json": "application/json",
+        ".woff2": "font/woff2",
+        ".woff": "font/woff",
+        ".ttf": "font/ttf",
+    }
+    suffix = target.suffix.lower()
+    media_type = mime_types.get(suffix, "application/octet-stream")
+
+    # For HTML, inject base tag to handle relative paths
+    if media_type == "text/html":
+        content = target.read_text(errors="replace")
+        # Inject base tag after <head>
+        if "<base" not in content:
+            rel_dir = str(target.parent.relative_to(base)) if target.parent != base else ""
+            base_tag = f'<base href="/api/preview/{app_id}/{rel_dir}/">' if rel_dir else f'<base href="/api/preview/{app_id}/">'
+            content = content.replace("<head>", f"<head>{base_tag}", 1)
+            content = content.replace("<HEAD>", f"<HEAD>{base_tag}", 1)
+        return HTMLResponse(content=content, media_type=media_type)
+
+    return FileResponse(path=target, media_type=media_type)
+
+
+# ─── Create DMG from iframe URL (Web App → macOS App) ─────────────────────
+
+WEBAPP_DIR = DATA_DIR / "webapps"
+WEBAPP_DIR.mkdir(exist_ok=True)
+
+
+def _create_app_bundle(url: str, app_name: str, bundle_id: str, version: str) -> Path:
+    """Create a minimal macOS .app bundle that opens a URL."""
+    bundle_root = WEBAPP_DIR / f"{app_name}.app"
+    if bundle_root.exists():
+        shutil.rmtree(bundle_root)
+
+    contents = bundle_root / "Contents"
+    macos = contents / "MacOS"
+    resources = contents / "Resources"
+    macos.mkdir(parents=True)
+    resources.mkdir(parents=True)
+
+    # Info.plist
+    plist = {
+        "CFBundleDevelopmentRegion": "en",
+        "CFBundleExecutable": app_name.replace(" ", ""),
+        "CFBundleIdentifier": bundle_id,
+        "CFBundleInfoDictionaryVersion": "6.0",
+        "CFBundleName": app_name,
+        "CFBundlePackageType": "APPL",
+        "CFBundleShortVersionString": version,
+        "CFBundleVersion": version,
+        "LSMinimumSystemVersion": "10.15",
+        "LSUIElement": False,
+    }
+    with open(contents / "Info.plist", "wb") as f:
+        plistlib.dump(plist, f)
+
+    # Wrapper script that opens URL
+    script_path = macos / app_name.replace(" ", "")
+    script_content = f'''#!/bin/bash
+# Auto-generated web app wrapper
+URL="{url}"
+if command -v open >/dev/null 2>&1; then
+    open "$URL"
+else
+    # Fallback for Linux testing
+    xdg-open "$URL" 2>/dev/null || python3 -m webbrowser "$URL"
+fi
+'''
+    script_path.write_text(script_content)
+    script_path.chmod(0o755)
+
+    # Create a local HTML file as backup/embedded view
+    html_path = resources / "index.html"
+    html_path.write_text(f'''<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>{app_name}</title>
+<style>body{{margin:0;height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;font-family:sans-serif;background:#0a0a0f;color:#e2e2e8}}iframe{{width:95%;height:85%;border:1px solid #333;border-radius:8px}}</style></head>
+<body><h2>{app_name}</h2><p>Loading {url}...</p><iframe src="{url}" sandbox="allow-scripts allow-same-origin allow-popups allow-forms"></iframe></body></html>
+''')
+
+    return bundle_root
+
+
+def _create_dmg_from_app(app_bundle: Path, output_name: str) -> Path | None:
+    """Best-effort DMG creation. Returns path to DMG or None."""
+    dmg_path = WEBAPP_DIR / f"{output_name}.dmg"
+
+    # Try genisoimage + dmg if available (Linux)
+    try:
+        iso_path = WEBAPP_DIR / f"{output_name}.iso"
+        result = subprocess.run(
+            ["genisoimage", "-D", "-V", output_name, "-no-pad", "-r", "-apple",
+             "-o", str(iso_path), str(app_bundle)],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0:
+            # Try converting ISO to DMG
+            dmg_result = subprocess.run(
+                ["dmg", "iso", str(iso_path), str(dmg_path)],
+                capture_output=True, text=True, timeout=30,
+            )
+            if dmg_result.returncode == 0 and dmg_path.exists():
+                iso_path.unlink(missing_ok=True)
+                return dmg_path
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+    # Fallback: create a ZIP that user can extract on Mac and run hdiutil
+    zip_path = WEBAPP_DIR / f"{output_name}.zip"
+    shutil.make_archive(
+        base_name=str(WEBAPP_DIR / output_name),
+        format="zip",
+        root_dir=str(app_bundle.parent),
+        base_dir=app_bundle.name,
+    )
+    if zip_path.exists():
+        return zip_path
+
+    return None
+
+
+@app.post("/api/create-webapp")
+async def create_webapp(request: Request) -> JSONResponse:
+    """Create a macOS app bundle + DMG from a URL."""
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    url = data.get("url", "").strip()
+    app_name = data.get("app_name", "WebApp").strip()
+    bundle_id = data.get("bundle_id", "app.localspace.webapp").strip()
+    version = data.get("version", "1.0.0").strip()
+
+    if not url:
+        return JSONResponse({"error": "URL is required"}, status_code=400)
+    if not app_name:
+        return JSONResponse({"error": "App name is required"}, status_code=400)
+
+    # Sanitize
+    app_name_safe = re.sub(r'[^a-zA-Z0-9 ]+', '', app_name).strip()
+    if not app_name_safe:
+        app_name_safe = "WebApp"
+
+    try:
+        bundle = _create_app_bundle(url, app_name_safe, bundle_id, version)
+        pkg = _create_dmg_from_app(bundle, app_name_safe.replace(" ", "-"))
+
+        if pkg is None:
+            return JSONResponse({"error": "Failed to create package"}, status_code=500)
+
+        pkg_id = str(uuid.uuid4())
+        dest = UPLOAD_DIR / f"{pkg_id}{pkg.suffix}"
+        shutil.copy2(pkg, dest)
+
+        entry = {
+            "app_id": pkg_id,
+            "slug": _slugify(app_name_safe),
+            "filename": dest.name,
+            "size": dest.stat().st_size,
+            "sha256": _hash_file(dest),
+            "download_url": f"/api/download/{pkg_id}",
+            "source_url": url,
+            "app_name": app_name_safe,
+            "bundle_id": bundle_id,
+            "version": version,
+            "is_webapp": True,
+            "created_at": time.time(),
+        }
+        _store[pkg_id] = entry
+        _save_db()
+
+        return JSONResponse({
+            "app": entry,
+            "message": f"'{app_name_safe}' packaged. Download and extract on macOS, then run 'hdiutil create -srcfolder {app_name_safe}.app {app_name_safe}.dmg' to convert to DMG." if pkg.suffix == ".zip" else f"'{app_name_safe}' DMG created.",
+        }, status_code=201)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.delete("/api/apps/{app_id}")
+def delete_app(app_id: str) -> JSONResponse:
+    entry = _store.pop(app_id, None)
+    if entry:
+        dmg = UPLOAD_DIR / f"{app_id}.dmg"
+        if dmg.exists():
+            dmg.unlink()
+        extracted = EXTRACT_DIR / app_id
+        if extracted.exists():
+            shutil.rmtree(extracted)
+        _save_db()
+    return JSONResponse({"ok": True})
+
+```
+
+index.html:
+```
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>⬡ LocalSpace Deployer</title>
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    :root {
+      --bg: #0a0a0f;
+      --surface: #14141a;
+      --surface-hover: #1c1c24;
+      --border: #2a2a35;
+      --accent: #3b82f6;
+      --accent-hover: #2563eb;
+      --text: #e2e2e8;
+      --text-muted: #888898;
+      --success: #22c55e;
+      --warn: #f59e0b;
+      --radius: 12px;
+      --radius-sm: 8px;
+    }
+
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+
+    .container {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 40px 24px;
+    }
+
+    header {
+      text-align: center;
+      margin-bottom: 48px;
+      position: relative;
+      min-height: 200px;
+    }
+
+    header h1 {
+      margin: 0 0 8px;
+      font-size: 2.2rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+    }
+
+    header p {
+      margin: 0;
+      color: var(--text-muted);
+      font-size: 1.05rem;
+    }
+
+    /* ─── Landing Carousel ───────────────────────────────── */
+    .landing-carousel {
+      position: relative;
+      overflow: hidden;
+      min-height: 220px;
+    }
+
+    .landing-slide {
+      position: absolute;
+      inset: 0;
+      opacity: 0;
+      transform: translateY(20px);
+      transition: opacity 1.2s ease, transform 1.2s ease;
+      pointer-events: none;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 20px 0;
+    }
+
+    .landing-slide.active {
+      opacity: 1;
+      transform: translateY(0);
+      pointer-events: auto;
+    }
+
+    .landing-slide .icon {
+      font-size: 4rem;
+      margin-bottom: 12px;
+      line-height: 1;
+    }
+
+    .landing-slide .slide-title {
+      font-size: 2.4rem;
+      font-weight: 700;
+      margin: 0 0 10px;
+      letter-spacing: -0.02em;
+    }
+
+    .landing-slide .slide-subtitle {
+      color: var(--text-muted);
+      font-size: 1.1rem;
+      max-width: 520px;
+      line-height: 1.5;
+    }
+
+    .landing-slide .slide-cta {
+      margin-top: 16px;
+      padding: 10px 24px;
+      background: linear-gradient(135deg, var(--accent), #8b5cf6);
+      color: #fff;
+      border: none;
+      border-radius: var(--radius-sm);
+      font-size: 0.95rem;
+      cursor: pointer;
+      transition: transform 0.2s, box-shadow 0.2s;
+    }
+
+    .landing-slide .slide-cta:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 4px 20px rgba(59, 130, 246, 0.3);
+    }
+
+    .landing-dots {
+      display: flex;
+      gap: 8px;
+      justify-content: center;
+      margin-top: 16px;
+    }
+
+    .landing-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--border);
+      cursor: pointer;
+      transition: background 0.3s, transform 0.3s;
+    }
+
+    .landing-dot.active {
+      background: var(--accent);
+      transform: scale(1.3);
+    }
+
+    .landing-timer {
+      position: absolute;
+      bottom: 0;
+      left: 50%;
+      transform: translateX(-50%);
+      width: 120px;
+      height: 3px;
+      background: var(--border);
+      border-radius: 2px;
+      overflow: hidden;
+    }
+
+    .landing-timer .fill {
+      height: 100%;
+      background: var(--accent);
+      width: 0%;
+      border-radius: 2px;
+    }
+
+    /* Drop zone */
+    .dropzone {
+      border: 2px dashed var(--border);
+      border-radius: var(--radius);
+      padding: 64px 32px;
+      text-align: center;
+      background: var(--surface);
+      transition: all 0.2s ease;
+      cursor: pointer;
+      position: relative;
+    }
+
+    .dropzone:hover,
+    .dropzone.dragover {
+      border-color: var(--accent);
+      background: var(--surface-hover);
+    }
+
+    .dropzone .icon {
+      font-size: 3rem;
+      margin-bottom: 16px;
+      opacity: 0.7;
+    }
+
+    .dropzone h3 {
+      margin: 0 0 8px;
+      font-size: 1.2rem;
+    }
+
+    .dropzone p {
+      margin: 0;
+      color: var(--text-muted);
+      font-size: 0.9rem;
+    }
+
+    .dropzone input[type="file"] {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      opacity: 0;
+      cursor: pointer;
+    }
+
+    /* Progress */
+    .progress-wrap {
+      margin-top: 24px;
+      display: none;
+    }
+
+    .progress-wrap.active {
+      display: block;
+    }
+
+    .progress-bar {
+      height: 6px;
+      background: var(--border);
+      border-radius: 3px;
+      overflow: hidden;
+    }
+
+    .progress-bar .fill {
+      height: 100%;
+      background: var(--accent);
+      width: 0%;
+      transition: width 0.3s ease;
+      border-radius: 3px;
+    }
+
+    .progress-text {
+      text-align: center;
+      margin-top: 8px;
+      font-size: 0.85rem;
+      color: var(--text-muted);
+    }
+
+    /* Result */
+    .result {
+      margin-top: 24px;
+      padding: 20px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      display: none;
+    }
+
+    .result.active {
+      display: block;
+    }
+
+    .result h4 {
+      margin: 0 0 12px;
+      color: var(--accent);
+    }
+
+    .result .field {
+      display: flex;
+      justify-content: space-between;
+      padding: 8px 0;
+      border-bottom: 1px solid var(--border);
+      font-size: 0.92rem;
+    }
+
+    .result .field:last-child {
+      border-bottom: none;
+    }
+
+    .result .field .label {
+      color: var(--text-muted);
+    }
+
+    .result .field .value {
+      font-family: ui-monospace, monospace;
+      font-size: 0.85rem;
+    }
+
+    .result .actions {
+      margin-top: 16px;
+      display: flex;
+      gap: 12px;
+    }
+
+    .btn {
+      padding: 10px 20px;
+      border-radius: var(--radius-sm);
+      border: none;
+      font-size: 0.92rem;
+      cursor: pointer;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: background 0.15s;
+    }
+
+    .btn-primary {
+      background: var(--accent);
+      color: #fff;
+    }
+
+    .btn-primary:hover {
+      background: var(--accent-hover);
+    }
+
+    .btn-secondary {
+      background: var(--surface-hover);
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+
+    .btn-secondary:hover {
+      background: var(--border);
+    }
+
+    /* App bundles */
+    .app-bundle {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+      margin-top: 20px;
+    }
+
+    .app-bundle .bundle-header {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      margin-bottom: 16px;
+    }
+
+    .app-bundle .bundle-icon {
+      width: 56px;
+      height: 56px;
+      border-radius: var(--radius-sm);
+      background: var(--surface-hover);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.6rem;
+      flex-shrink: 0;
+    }
+
+    .app-bundle .bundle-title {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .app-bundle .bundle-title .name {
+      font-weight: 600;
+      font-size: 1.1rem;
+      margin-bottom: 4px;
+    }
+
+    .app-bundle .bundle-title .meta {
+      font-size: 0.82rem;
+      color: var(--text-muted);
+    }
+
+    .app-bundle .badge {
+      display: inline-block;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 0.75rem;
+      font-weight: 500;
+      margin-left: 8px;
+    }
+
+    .badge-success {
+      background: rgba(34, 197, 94, 0.15);
+      color: var(--success);
+    }
+
+    .badge-warn {
+      background: rgba(245, 158, 11, 0.15);
+      color: var(--warn);
+    }
+
+    /* File tree */
+    .file-tree {
+      margin-top: 16px;
+      padding: 12px;
+      background: var(--bg);
+      border-radius: var(--radius-sm);
+      max-height: 300px;
+      overflow-y: auto;
+    }
+
+    .file-tree .item {
+      padding: 4px 0;
+      font-size: 0.85rem;
+      font-family: ui-monospace, monospace;
+      color: var(--text-muted);
+    }
+
+    .file-tree .item::before {
+      content: "📄 ";
+    }
+
+    .file-tree .item.dir::before {
+      content: "📁 ";
+    }
+
+    /* Section */
+    .section {
+      margin-top: 48px;
+    }
+
+    .section h2 {
+      margin: 0 0 20px;
+      font-size: 1.3rem;
+    }
+
+    .app-grid {
+      display: grid;
+      gap: 12px;
+    }
+
+    .app-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px 20px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      transition: border-color 0.15s;
+    }
+
+    .app-card:hover {
+      border-color: var(--accent);
+    }
+
+    .app-card .info {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .app-card .info .name {
+      font-weight: 600;
+      margin-bottom: 4px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .app-card .info .meta {
+      font-size: 0.82rem;
+      color: var(--text-muted);
+    }
+
+    .app-card .actions {
+      display: flex;
+      gap: 8px;
+      flex-shrink: 0;
+    }
+
+    .app-card .actions a {
+      padding: 6px 14px;
+      border-radius: var(--radius-sm);
+      background: var(--surface-hover);
+      color: var(--text);
+      text-decoration: none;
+      font-size: 0.82rem;
+      border: 1px solid var(--border);
+    }
+
+    .app-card .actions a:hover {
+      background: var(--border);
+    }
+
+    .empty {
+      text-align: center;
+      padding: 40px;
+      color: var(--text-muted);
+    }
+
+    /* Toast */
+    .toast {
+      position: fixed;
+      bottom: 24px;
+      left: 50%;
+      transform: translateX(-50%) translateY(100px);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      padding: 12px 24px;
+      border-radius: var(--radius-sm);
+      font-size: 0.9rem;
+      opacity: 0;
+      transition: all 0.3s ease;
+      z-index: 1000;
+    }
+
+    .toast.show {
+      opacity: 1;
+      transform: translateX(-50%) translateY(0);
+    }
+
+    .toast.error {
+      border-color: #ef4444;
+      color: #fca5a5;
+    }
+
+    .toast.success {
+      border-color: #22c55e;
+      color: #86efac;
+    }
+
+    /* ─── Context Menu ───────────────────────────────────── */
+    .ctx-menu {
+      position: fixed;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 6px 0;
+      min-width: 200px;
+      z-index: 2000;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+      display: none;
+    }
+
+    .ctx-menu-item {
+      padding: 8px 16px;
+      font-size: 0.88rem;
+      color: var(--text);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      transition: background 0.1s;
+    }
+
+    .ctx-menu-item:hover {
+      background: var(--surface-hover);
+    }
+
+    .ctx-menu-sep {
+      height: 1px;
+      background: var(--border);
+      margin: 4px 0;
+    }
+
+    /* ─── Links Table ────────────────────────────────────── */
+    .links-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.9rem;
+    }
+
+    .links-table th,
+    .links-table td {
+      padding: 10px 12px;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .links-table th {
+      color: var(--text-muted);
+      font-weight: 500;
+      font-size: 0.82rem;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+    }
+
+    .links-table td {
+      color: var(--text);
+    }
+
+    .links-table .link-cell {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .links-table input {
+      flex: 1;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 6px 10px;
+      border-radius: var(--radius-sm);
+      font-size: 0.82rem;
+      font-family: ui-monospace, monospace;
+    }
+
+    .links-table .copy-btn {
+      padding: 5px 10px;
+      border-radius: var(--radius-sm);
+      background: var(--surface-hover);
+      border: 1px solid var(--border);
+      color: var(--text);
+      font-size: 0.8rem;
+      cursor: pointer;
+    }
+
+    .links-table .copy-btn:hover {
+      background: var(--border);
+    }
+
+    /* ─── Microspaces Dashboard ────────────────────────────── */
+    .view-toggle {
+      display: flex;
+      gap: 8px;
+      justify-content: center;
+      margin-bottom: 24px;
+    }
+
+    .view-toggle button {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 8px 18px;
+      border-radius: var(--radius-sm);
+      cursor: pointer;
+      font-size: 0.9rem;
+      transition: all 0.15s;
+    }
+
+    .view-toggle button.active {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+
+    .microspaces-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      grid-template-rows: repeat(2, 320px);
+      gap: 12px;
+      margin-bottom: 40px;
+    }
+
+    @media (max-width: 900px) {
+      .microspaces-grid {
+        grid-template-columns: repeat(2, 1fr);
+        grid-template-rows: repeat(3, 280px);
+      }
+    }
+
+    @media (max-width: 600px) {
+      .microspaces-grid {
+        grid-template-columns: 1fr;
+        grid-template-rows: repeat(6, 260px);
+      }
+    }
+
+    .microspace {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .microspace-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 6px 10px;
+      background: var(--surface-hover);
+      border-bottom: 1px solid var(--border);
+      font-size: 0.8rem;
+      color: var(--text-muted);
+    }
+
+    .microspace-header select {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      font-size: 0.78rem;
+      padding: 3px 6px;
+      border-radius: 4px;
+      max-width: 160px;
+    }
+
+    .microspace-body {
+      flex: 1;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .microspace-body iframe {
+      width: 100%;
+      height: 100%;
+      border: none;
+      display: block;
+    }
+
+    .microspace-empty {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 100%;
+      color: var(--text-muted);
+      font-size: 0.85rem;
+    }
+
+    /* ─── Terminal ───────────────────────────────────────── */
+    .terminal {
+      background: #0c0c12;
+      color: #e2e2e8;
+      font-family: "SF Mono", Monaco, "Cascadia Code", "Roboto Mono", Consolas, "Courier New", monospace;
+      font-size: 0.82rem;
+      line-height: 1.5;
+      height: 100%;
+      overflow-y: auto;
+      padding: 10px;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .terminal-output {
+      flex: 1;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .terminal-output .cmd {
+      color: #22c55e;
+    }
+
+    .terminal-output .err {
+      color: #f87171;
+    }
+
+    .terminal-output .info {
+      color: #60a5fa;
+    }
+
+    .terminal-output .warn {
+      color: #fbbf24;
+    }
+
+    .terminal-input-line {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding-top: 4px;
+    }
+
+    .terminal-prompt {
+      color: #22c55e;
+      white-space: nowrap;
+    }
+
+    .terminal-input {
+      flex: 1;
+      background: transparent;
+      border: none;
+      color: #e2e2e8;
+      font-family: inherit;
+      font-size: inherit;
+      outline: none;
+      padding: 0;
+      margin: 0;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="container">
+    <header>
+      <div class="landing-carousel" id="landingCarousel">
+        <!-- Slide 1: Deploy -->
+        <div class="landing-slide active" data-slide="0">
+          <div class="icon">📦</div>
+          <div class="slide-title">Deploy Any DMG</div>
+          <div class="slide-subtitle">Drag a macOS app bundle onto the Space. We extract it, inspect it, and serve it
+            live — no setup required.</div>
+          <button class="slide-cta" onclick="switchView('deploy')">Start Deploying →</button>
+        </div>
+        <!-- Slide 2: Microspaces -->
+        <div class="landing-slide" data-slide="1">
+          <div class="icon">🪟</div>
+          <div class="slide-title">Six Microspaces</div>
+          <div class="slide-subtitle">Run 5 apps side-by-side in a grid, plus a built-in terminal. Mix web apps and
+            native previews in one dashboard.</div>
+          <button class="slide-cta" onclick="switchView('micro')">Open Microspaces →</button>
+        </div>
+        <!-- Slide 3: Share -->
+        <div class="landing-slide" data-slide="2">
+          <div class="icon">🔗</div>
+          <div class="slide-title">Share Instantly</div>
+          <div class="slide-subtitle">Every upload gets permanent public URLs. Right-click any app to copy its link.
+            Shareable app viewers for anyone.</div>
+          <button class="slide-cta" onclick="switchView('links')">View Links →</button>
+        </div>
+      </div>
+      <div class="landing-dots" id="landingDots">
+        <div class="landing-dot active" onclick="goToSlide(0)"></div>
+        <div class="landing-dot" onclick="goToSlide(1)"></div>
+        <div class="landing-dot" onclick="goToSlide(2)"></div>
+      </div>
+      <div class="landing-timer">
+        <div class="fill" id="landingTimerFill"></div>
+      </div>
+    </header>
+
+    <div class="view-toggle">
+      <button id="viewDeployBtn" class="active" onclick="switchView('deploy')">📦 Deploy</button>
+      <button id="viewMicroBtn" onclick="switchView('micro')">🪟 Microspaces</button>
+      <button id="viewLinksBtn" onclick="switchView('links')">🔗 Links</button>
+    </div>
+
+    <!-- ─── Microspaces Dashboard ─────────────────────────── -->
+    <div id="microspacesView" style="display:none;">
+      <div class="microspaces-grid" id="microGrid">
+        <!-- 6 microspaces generated by JS -->
+      </div>
+    </div>
+
+    <!-- ─── Links View ────────────────────────────────────── -->
+    <div id="linksView" style="display:none;">
+      <div class="section">
+        <h2>🔗 App Links</h2>
+        <p style="color:var(--text-muted);margin:-12px 0 20px;">Every app gets permanent shareable URLs. Right-click any
+          card to copy a link.</p>
+        <div id="linksTableWrap">
+          <div class="empty">Loading...</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ─── Deploy View (existing content) ────────────────── -->
+    <div id="deployView">
+      <div class="dropzone" id="dropzone">
+        <input type="file" id="fileInput" accept=".dmg">
+        <div class="icon">📦</div>
+        <h3>Drop a DMG here</h3>
+        <p>or click to browse. The DMG will be opened and its contents shown below.</p>
+      </div>
+
+      <div class="progress-wrap" id="progressWrap">
+        <div class="progress-bar">
+          <div class="fill" id="progressFill"></div>
+        </div>
+        <div class="progress-text" id="progressText">Uploading and opening...</div>
+      </div>
+
+      <div class="result" id="result">
+        <h4 id="resTitle">Registered</h4>
+        <div class="field"><span class="label">Slug</span><span class="value" id="resSlug">-</span></div>
+        <div class="field"><span class="label">Filename</span><span class="value" id="resFilename">-</span></div>
+        <div class="field"><span class="label">Size</span><span class="value" id="resSize">-</span></div>
+        <div class="field"><span class="label">SHA-256</span><span class="value" id="resHash">-</span></div>
+        <div class="actions">
+          <a href="#" class="btn btn-primary" id="launchBtn" target="_blank"
+            style="display:none;background:linear-gradient(135deg,#3b82f6,#8b5cf6);">🚀 Launch App</a>
+          <a href="#" class="btn btn-secondary" id="downloadBtn" target="_blank" style="display:none;">⬇ Download</a>
+          <button class="btn btn-secondary" id="copyBtn">📋 Copy Link</button>
+        </div>
+        <div id="bundles"></div>
+
+        <div id="previewWrap" style="margin-top:24px;display:none;">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+            <h4 style="margin:0;color:var(--accent)">🌐 Live Preview</h4>
+            <div style="display:flex;gap:8px;">
+              <select id="previewFileSelect"
+                style="padding:6px 10px;border-radius:var(--radius-sm);border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:0.85rem;max-width:220px;"></select>
+              <button class="btn btn-secondary" id="previewNewTabBtn" style="padding:6px 14px;font-size:0.82rem;">↗ New
+                Tab</button>
+              <button class="btn btn-secondary" id="previewFullscreenBtn" style="padding:6px 14px;font-size:0.82rem;">⛶
+                Fullscreen</button>
+            </div>
+          </div>
+          <div id="previewContainer"
+            style="position:relative;border:1px solid var(--border);border-radius:var(--radius-sm);overflow:hidden;background:#fff;">
+            <iframe id="previewFrame" style="width:100%;height:500px;border:none;display:block;"></iframe>
+            <div id="previewLoading"
+              style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(10,10,15,0.9);color:var(--text-muted);">
+              <span style="animation:pulse 1.4s infinite;">Loading preview...</span>
+            </div>
+          </div>
+          <style>
+            @keyframes pulse {
+
+              0%,
+              100% {
+                opacity: 0.4
+              }
+
+              50% {
+                opacity: 1
+              }
+            }
+          </style>
+        </div>
+      </div>
+
+      <div class="section">
+        <h2>🧪 Create App from URL</h2>
+        <p style="color:var(--text-muted);margin-bottom:16px;">Turn any website into a downloadable macOS app bundle.
+          Enter a URL, get an .app/.dmg.</p>
+        <div style="display:grid;gap:12px;max-width:600px;">
+          <input type="text" id="webUrl" placeholder="https://example.com"
+            style="padding:10px 14px;border-radius:var(--radius-sm);border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:0.95rem;">
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+            <input type="text" id="webAppName" placeholder="App Name" value="MyApp"
+              style="padding:10px 14px;border-radius:var(--radius-sm);border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:0.95rem;">
+            <input type="text" id="webBundleId" placeholder="Bundle ID" value="app.localspace.myapp"
+              style="padding:10px 14px;border-radius:var(--radius-sm);border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:0.95rem;">
+          </div>
+          <input type="text" id="webVersion" placeholder="Version" value="1.0.0"
+            style="padding:10px 14px;border-radius:var(--radius-sm);border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:0.95rem;">
+          <button class="btn btn-primary" id="createWebappBtn" style="justify-self:start;">📦 Package as App</button>
+        </div>
+        <div id="webappResult" style="margin-top:16px;display:none;" class="result"></div>
+      </div>
+
+      <div class="section">
+        <h2>📦 Published Apps Gallery</h2>
+        <p style="color:var(--text-muted);margin:-12px 0 20px;">Every uploaded app with a web preview gets its own
+          public
+          URL. Click Launch to open it.</p>
+        <div class="app-grid" id="appGrid">
+          <div class="empty">No apps yet. Upload a DMG above to open it.</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="toast" id="toast"></div>
+
+    <script>
+      const $ = id => document.getElementById(id);
+      const dropzone = $('dropzone'), fileInput = $('fileInput');
+      const progressWrap = $('progressWrap'), progressFill = $('progressFill'), progressText = $('progressText');
+      const result = $('result'), bundlesEl = $('bundles');
+      const toast = $('toast');
+
+      function showToast(msg, type = 'success') {
+        toast.textContent = msg; toast.className = 'toast ' + type + ' show';
+        setTimeout(() => toast.classList.remove('show'), 3000);
+      }
+
+      ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(e => {
+        dropzone.addEventListener(e, ev => { ev.preventDefault(); ev.stopPropagation(); });
+      });
+      ['dragenter', 'dragover'].forEach(e => dropzone.addEventListener(e, () => dropzone.classList.add('dragover')));
+      ['dragleave', 'drop'].forEach(e => dropzone.addEventListener(e, () => dropzone.classList.remove('dragover')));
+
+      dropzone.addEventListener('drop', e => { if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]); });
+      fileInput.addEventListener('change', e => { if (fileInput.files.length) handleFile(fileInput.files[0]); });
+
+      async function handleFile(file) {
+        if (!file.name.toLowerCase().endsWith('.dmg')) { showToast('Only .dmg files.', 'error'); return; }
+        progressWrap.classList.add('active'); result.classList.remove('active'); progressFill.style.width = '0%';
+        progressText.textContent = 'Uploading and opening DMG...';
+
+        const form = new FormData(); form.append('file', file);
+        try {
+          const xhr = new XMLHttpRequest();
+          xhr.open('POST', '/api/upload');
+          xhr.upload.onprogress = e => {
+            if (e.lengthComputable) {
+              const pct = Math.round((e.loaded / e.total) * 60);
+              progressFill.style.width = pct + '%';
+              progressText.textContent = `Uploading... ${pct}%`;
+            }
+          };
+          xhr.onload = () => {
+            progressWrap.classList.remove('active');
+            if (xhr.status === 201) {
+              const data = JSON.parse(xhr.responseText);
+              showApp(data.app);
+              showToast(data.message || 'Opened!');
+              loadApps();
+            } else {
+              const err = JSON.parse(xhr.responseText || '{}');
+              showToast(err.error || 'Upload failed', 'error');
+            }
+          };
+          xhr.onerror = () => { progressWrap.classList.remove('active'); showToast('Network error', 'error'); };
+          xhr.send(form);
+        } catch (err) { progressWrap.classList.remove('active'); showToast(String(err), 'error'); }
+      }
+
+      function showApp(app) {
+        $('resTitle').textContent = app.opened ? '✅ DMG Opened' : '⚠️ Uploaded (could not open)';
+        $('resTitle').style.color = app.opened ? 'var(--success)' : 'var(--warn)';
+        $('resSlug').textContent = app.slug;
+        $('resFilename').textContent = app.filename;
+        $('resSize').textContent = app.size.toLocaleString() + ' bytes';
+        $('resHash').textContent = app.sha256.substring(0, 32) + '...';
+        $('copyBtn').onclick = () => { navigator.clipboard.writeText(window.location.origin + app.download_url); showToast('Link copied!'); };
+
+        // Launch = primary for web-previewable apps; Download = only for non-preview
+        const launchBtn = $('launchBtn');
+        const downloadBtn = $('downloadBtn');
+        if (app.has_preview) {
+          launchBtn.href = `/app/${app.app_id}`;
+          launchBtn.style.display = 'inline-flex';
+          downloadBtn.style.display = 'none';
+        } else {
+          launchBtn.style.display = 'none';
+          downloadBtn.href = app.download_url;
+          downloadBtn.style.display = 'inline-flex';
+        }
+
+        bundlesEl.innerHTML = '';
+        if (app.apps && app.apps.length) {
+          app.apps.forEach((bundle, i) => {
+            const div = document.createElement('div');
+            div.className = 'app-bundle';
+            const filesHtml = (bundle.files || []).slice(0, 50).map(f => `<div class="item">${escapeHtml(f)}</div>`).join('');
+            div.innerHTML = `
+        <div class="bundle-header">
+          <div class="bundle-icon">🚀</div>
+          <div class="bundle-title">
+            <div class="name">${escapeHtml(bundle.display_name || bundle.bundle_name)} <span class="badge badge-success">v${escapeHtml(bundle.version || '?')}</span></div>
+            <div class="meta">${escapeHtml(bundle.bundle_id || '')} · ${bundle.file_count} files · executable: ${escapeHtml(bundle.executable || 'N/A')}</div>
+          </div>
+        </div>
+        ${filesHtml ? `<div class="file-tree">${filesHtml}</div>` : ''}
+      `;
+            bundlesEl.appendChild(div);
+          });
+        } else if (app.opened) {
+          bundlesEl.innerHTML = '<p style="color:var(--text-muted);margin-top:12px;">No .app bundles found inside this DMG.</p>';
+        }
+
+        // Show iframe preview for web content
+        const previewWrap = $('previewWrap');
+        const previewFrame = $('previewFrame');
+        const previewLoading = $('previewLoading');
+        const previewFileSelect = $('previewFileSelect');
+        previewWrap.style.display = 'none';
+        previewFileSelect.innerHTML = '';
+
+        if (app.has_preview && app.html_files && app.html_files.length) {
+          previewWrap.style.display = 'block';
+          previewLoading.style.display = 'flex';
+
+          // Populate file selector
+          app.html_files.forEach((hf, idx) => {
+            const opt = document.createElement('option');
+            opt.value = hf.path;
+            opt.textContent = hf.path;
+            if (hf.path === app.preview_entry) opt.selected = true;
+            previewFileSelect.appendChild(opt);
+          });
+
+          // Load the default entry point
+          const entryPath = app.preview_entry || app.html_files[0].path;
+          previewFrame.src = `/api/preview/${app.app_id}/${entryPath}`;
+          previewFrame.onload = () => { previewLoading.style.display = 'none'; };
+
+          // File selector change
+          previewFileSelect.onchange = () => {
+            previewLoading.style.display = 'flex';
+            previewFrame.src = `/api/preview/${app.app_id}/${previewFileSelect.value}`;
+          };
+
+          // New tab button
+          $('previewNewTabBtn').onclick = () => {
+            window.open(`/api/preview/${app.app_id}/${previewFileSelect.value || entryPath}`, '_blank');
+          };
+
+          // Fullscreen button
+          $('previewFullscreenBtn').onclick = () => {
+            const container = $('previewContainer');
+            if (container.requestFullscreen) container.requestFullscreen();
+            else if (container.webkitRequestFullscreen) container.webkitRequestFullscreen();
+          };
+        }
+
+        result.classList.add('active');
+      }
+
+      async function loadApps() {
+        try {
+          const res = await fetch('/api/apps');
+          const data = await res.json();
+          const grid = $('appGrid');
+          if (!data.apps || !data.apps.length) {
+            grid.innerHTML = '<div class="empty">No apps yet. Upload a DMG above to open it.</div>';
+            return;
+          }
+          grid.innerHTML = '';
+          data.apps.forEach(a => {
+            const date = new Date(a.created_at * 1000).toLocaleString();
+            let status;
+            if (a.is_webapp) {
+              status = `<span class="badge" style="background:rgba(59,130,246,0.15);color:var(--accent);">Web App</span>`;
+            } else if (a.opened) {
+              status = `<span class="badge badge-success">Opened</span>`;
+            } else {
+              status = `<span class="badge badge-warn">Closed</span>`;
+            }
+            const apps = (a.apps || []).map(b => `<div style="font-size:0.82rem;color:var(--text-muted);margin-top:4px;">🚀 ${escapeHtml(b.display_name || b.bundle_name)} ${b.version ? 'v' + b.version : ''}</div>`).join('');
+            const sourceUrl = a.source_url ? `<div style="font-size:0.82rem;color:var(--text-muted);margin-top:4px;">🔗 ${escapeHtml(a.source_url)}</div>` : '';
+            const launchLink = a.has_preview
+              ? `<a href="/app/${a.app_id}" target="_blank" style="background:linear-gradient(135deg,#3b82f6,#8b5cf6);color:#fff;border:none;">🚀 Launch</a>`
+              : `<a href="${a.download_url}" download>⬇ Download</a>`;
+            const card = document.createElement('div');
+            card.className = 'app-card';
+            card.innerHTML = `
+        <div class="info">
+          <div class="name">${escapeHtml(a.filename)} ${status}</div>
+          <div class="meta">${escapeHtml(a.slug)} · ${a.size.toLocaleString()} bytes · ${date}</div>
+          ${apps}${sourceUrl}
+        </div>
+        <div class="actions">${launchLink}</div>`;
+            attachContextMenu(card, a.app_id);
+            grid.appendChild(card);
+          });
+        } catch (e) { console.error(e); }
+      }
+
+      function escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text || '';
+        return div.innerHTML;
+      }
+
+      // ─── Create Web App from URL ───────────────────────────────────────────
+      $('createWebappBtn').addEventListener('click', async () => {
+        const url = $('webUrl').value.trim();
+        const appName = $('webAppName').value.trim();
+        const bundleId = $('webBundleId').value.trim();
+        const version = $('webVersion').value.trim();
+        if (!url) { showToast('Enter a URL.', 'error'); return; }
+        if (!url.startsWith('http')) { showToast('URL must start with http:// or https://', 'error'); return; }
+        $('createWebappBtn').textContent = 'Packaging...';
+        $('createWebappBtn').disabled = true;
+        try {
+          const res = await fetch('/api/create-webapp', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url, app_name: appName, bundle_id: bundleId, version }),
+          });
+          const data = await res.json();
+          const resultDiv = $('webappResult');
+          if (res.status === 201) {
+            const app = data.app;
+            resultDiv.innerHTML = `
+            <h4 style="margin:0 0 12px;color:var(--success)">✅ ${escapeHtml(app.app_name)} Packaged</h4>
+            <div class="field"><span class="label">Source URL</span><span class="value">${escapeHtml(app.source_url)}</span></div>
+            <div class="field"><span class="label">Bundle ID</span><span class="value">${escapeHtml(app.bundle_id)}</span></div>
+            <div class="field"><span class="label">Version</span><span class="value">${escapeHtml(app.version)}</span></div>
+            <div class="field"><span class="label">Download</span><span class="value"><a href="${app.download_url}">${escapeHtml(app.filename)}</a></span></div>
+            <p style="margin-top:12px;color:var(--text-muted);font-size:0.85rem;">${escapeHtml(data.message)}</p>
+          `;
+            resultDiv.style.display = 'block';
+            showToast('App packaged!');
+            loadApps();
+          } else {
+            showToast(data.error || 'Failed to package app.', 'error');
+          }
+        } catch (err) {
+          showToast(String(err), 'error');
+        } finally {
+          $('createWebappBtn').textContent = '📦 Package as App';
+          $('createWebappBtn').disabled = false;
+        }
+      });
+
+      // ─── Microspaces & Terminal ───────────────────────────────
+      let _appsCache = [];
+      let _kvStore = {};
+
+      function switchView(view) {
+        $('deployView').style.display = view === 'deploy' ? 'block' : 'none';
+        $('microspacesView').style.display = view === 'micro' ? 'block' : 'none';
+        $('linksView').style.display = view === 'links' ? 'block' : 'none';
+        $('viewDeployBtn').classList.toggle('active', view === 'deploy');
+        $('viewMicroBtn').classList.toggle('active', view === 'micro');
+        $('viewLinksBtn').classList.toggle('active', view === 'links');
+        if (view === 'micro') renderMicrospaces();
+        if (view === 'links') renderLinks();
+      }
+
+      // ─── Links View ─────────────────────────────────────────
+      async function renderLinks() {
+        const wrap = $('linksTableWrap');
+        try {
+          const res = await fetch('/api/apps');
+          const data = await res.json();
+          const apps = data.apps || [];
+          if (!apps.length) {
+            wrap.innerHTML = '<div class="empty">No apps yet. Upload a DMG to generate links.</div>';
+            return;
+          }
+          const origin = window.location.origin;
+          let html = `<table class="links-table"><thead><tr><th>App</th><th>App Viewer</th><th>Preview</th><th>Download</th></tr></thead><tbody>`;
+          apps.forEach(a => {
+            const appUrl = a.has_preview ? `${origin}/app/${a.app_id}` : '';
+            const previewUrl = a.has_preview && a.preview_entry ? `${origin}/api/preview/${a.app_id}/${a.preview_entry}` : (a.has_preview ? `${origin}/api/preview/${a.app_id}` : '');
+            const downloadUrl = `${origin}${a.download_url}`;
+            html += `<tr><td><strong>${escapeHtml(a.filename)}</strong><div style="font-size:0.78rem;color:var(--text-muted);margin-top:2px;">${a.slug}</div></td>`;
+            html += `<td>${appUrl ? `<div class="link-cell"><input value="${appUrl}" readonly onclick="this.select()"><button class="copy-btn" onclick="navigator.clipboard.writeText('${appUrl}');showToast('Copied!')">Copy</button></div>` : '<span style="color:var(--text-muted)">—</span>'}</td>`;
+            html += `<td>${previewUrl ? `<div class="link-cell"><input value="${previewUrl}" readonly onclick="this.select()"><button class="copy-btn" onclick="navigator.clipboard.writeText('${previewUrl}');showToast('Copied!')">Copy</button></div>` : '<span style="color:var(--text-muted)">—</span>'}</td>`;
+            html += `<td><div class="link-cell"><input value="${downloadUrl}" readonly onclick="this.select()"><button class="copy-btn" onclick="navigator.clipboard.writeText('${downloadUrl}');showToast('Copied!')">Copy</button></div></td></tr>`;
+          });
+          html += '</tbody></table>';
+          wrap.innerHTML = html;
+        } catch (e) { wrap.innerHTML = '<div class="empty">Error loading links.</div>'; console.error(e); }
+      }
+
+      // ─── Context Menu ───────────────────────────────────────
+      let _ctxAppId = null;
+      document.addEventListener('click', () => { $('ctxMenu').style.display = 'none'; });
+      document.addEventListener('scroll', () => { $('ctxMenu').style.display = 'none'; }, true);
+
+      function attachContextMenu(el, appId) {
+        el.addEventListener('contextmenu', e => {
+          e.preventDefault();
+          _ctxAppId = appId;
+          const menu = $('ctxMenu');
+          menu.style.display = 'block';
+          const x = Math.min(e.clientX, window.innerWidth - 220);
+          const y = Math.min(e.clientY, window.innerHeight - 200);
+          menu.style.left = x + 'px';
+          menu.style.top = y + 'px';
+        });
+      }
+      function ctxOpenApp() { if (_ctxAppId) window.location.href = `/app/${_ctxAppId}`; }
+      function ctxLaunchNewTab() { if (_ctxAppId) window.open(`/app/${_ctxAppId}`, '_blank'); }
+      function ctxCopyLink(type) {
+        if (!_ctxAppId) return;
+        const app = _appsCache.find(a => a.app_id === _ctxAppId); if (!app) return;
+        const origin = window.location.origin;
+        let url = '';
+        if (type === 'app') url = `${origin}/app/${_ctxAppId}`;
+        else if (type === 'preview') url = app.preview_entry ? `${origin}/api/preview/${_ctxAppId}/${app.preview_entry}` : `${origin}/api/preview/${_ctxAppId}`;
+        else if (type === 'download') url = `${origin}${app.download_url}`;
+        navigator.clipboard.writeText(url); showToast(`${type} link copied!`); $('ctxMenu').style.display = 'none';
+      }
+      function ctxCopyId() { if (_ctxAppId) { navigator.clipboard.writeText(_ctxAppId); showToast('App ID copied!'); $('ctxMenu').style.display = 'none'; } }
+
+      async function renderMicrospaces() {
+        const grid = $('microGrid');
+        // Build 6 panels if not already built
+        if (!grid.dataset.built) {
+          grid.innerHTML = '';
+          for (let i = 0; i < 6; i++) {
+            const isTerminal = i === 5; // last cell = terminal
+            const div = document.createElement('div');
+            div.className = 'microspace';
+            div.id = `micro-${i}`;
+            div.innerHTML = `
+            <div class="microspace-header">
+              <span>🪟 Space ${i + 1}</span>
+              ${isTerminal ? '<span>⌨️ Terminal</span>' : `<select id="microSel-${i}" onchange="updateMicrospace(${i})"><option value="">— Select app —</option></select>`}
+            </div>
+            <div class="microspace-body" id="microBody-${i}">
+              ${isTerminal ? buildTerminalHTML() : '<div class="microspace-empty">Select an app above</div>'}
+            </div>
+          `;
+            grid.appendChild(div);
+            if (isTerminal) initTerminal();
+          }
+          grid.dataset.built = '1';
+        }
+        // Refresh selectors with current apps
+        try {
+          const res = await fetch('/api/apps');
+          const data = await res.json();
+          _appsCache = data.apps || [];
+          const previewApps = _appsCache.filter(a => a.has_preview);
+          for (let i = 0; i < 5; i++) {
+            const sel = $(`microSel-${i}`);
+            if (!sel) continue;
+            const prevVal = sel.value;
+            sel.innerHTML = '<option value="">— Select app —</option>';
+            previewApps.forEach(a => {
+              const opt = document.createElement('option');
+              opt.value = a.app_id;
+              opt.textContent = a.filename;
+              sel.appendChild(opt);
+            });
+            if (prevVal) sel.value = prevVal;
+          }
+        } catch (e) { console.error(e); }
+      }
+
+      function updateMicrospace(idx) {
+        const sel = $(`microSel-${idx}`);
+        const body = $(`microBody-${idx}`);
+        const appId = sel.value;
+        if (!appId) {
+          body.innerHTML = '<div class="microspace-empty">Select an app above</div>';
+          return;
+        }
+        const app = _appsCache.find(a => a.app_id === appId);
+        const entryPath = app && app.preview_entry ? app.preview_entry : '';
+        const src = entryPath ? `/api/preview/${appId}/${entryPath}` : `/api/preview/${appId}`;
+        body.innerHTML = `<iframe src="${src}" loading="lazy"></iframe>`;
+      }
+
+      function buildTerminalHTML() {
+        return `
+        <div class="terminal" id="termContainer" onclick="document.getElementById('termInput').focus()">
+          <div class="terminal-output" id="termOutput"></div>
+          <div class="terminal-input-line">
+            <span class="terminal-prompt">localspace$</span>
+            <input type="text" class="terminal-input" id="termInput" autocomplete="off" spellcheck="false" onkeydown="handleTerminalKey(event)">
+          </div>
+        </div>
+      `;
+      }
+
+      function initTerminal() {
+        const out = $('termOutput');
+        if (!out) return;
+        out.innerHTML = '';
+        termPrint('LocalSpace Terminal v1.0', 'info');
+        termPrint('Type \'help\' for available commands.', 'info');
+        termPrint('');
+      }
+
+      function termPrint(text, cls = '') {
+        const out = $('termOutput');
+        if (!out) return;
+        const line = document.createElement('div');
+        if (cls) line.className = cls;
+        line.textContent = text;
+        out.appendChild(line);
+        out.scrollTop = out.scrollHeight;
+      }
+
+      async function handleTerminalKey(e) {
+        if (e.key !== 'Enter') return;
+        const input = $('termInput');
+        const cmd = input.value.trim();
+        input.value = '';
+        termPrint(`localspace$ ${cmd}`, 'cmd');
+        if (!cmd) return;
+        await runTerminalCommand(cmd);
+      }
+
+      async function runTerminalCommand(cmd) {
+        const parts = cmd.split(/\s+/);
+        const action = parts[0].toLowerCase();
+
+        // ─── KV Memory (session-only, per-tab) ──────────────────
+        if (action === 'set') {
+          if (parts.length < 3) { termPrint('Usage: set <key> <value>', 'err'); return; }
+          const key = parts[1]; const val = parts.slice(2).join(' ');
+          if (!_kvStore) _kvStore = {};
+          _kvStore[key] = val;
+          termPrint(`Set "${key}" = "${val}"`, 'success');
+          return;
+        }
+        if (action === 'get') {
+          if (parts.length < 2) { termPrint('Usage: get <key>', 'err'); return; }
+          const val = _kvStore?.[parts[1]];
+          if (val === undefined) termPrint(`Key "${parts[1]}" not found.`, 'warn');
+          else termPrint(`${parts[1]} = ${val}`, 'info');
+          return;
+        }
+        if (action === 'del') {
+          if (parts.length < 2) { termPrint('Usage: del <key>', 'err'); return; }
+          if (_kvStore) delete _kvStore[parts[1]];
+          termPrint(`Deleted "${parts[1]}"`, 'success');
+          return;
+        }
+        if (action === 'keys') {
+          const keys = _kvStore ? Object.keys(_kvStore) : [];
+          if (!keys.length) { termPrint('No KV entries.', 'warn'); return; }
+          termPrint('KV Keys:', 'info');
+          keys.forEach(k => termPrint(`  ${k} = ${_kvStore[k]}`, 'muted'));
+          termPrint(`${keys.length} entries.`);
+          return;
+        }
+        if (action === 'clear_kv') {
+          _kvStore = {};
+          termPrint('KV memory cleared.', 'success');
+          return;
+        }
+
+        if (action === 'help' || action === 'h') {
+          termPrint('Commands:', 'info');
+          termPrint('  help              Show this message');
+          termPrint('  apps              List all apps with previews');
+          termPrint('  open <id>         Open app preview URL');
+          termPrint('  launch <id>       Launch app in new tab');
+          termPrint('  set <k> <v>       Store KV pair (session)');
+          termPrint('  get <k>           Retrieve KV value');
+          termPrint('  del <k>           Delete KV pair');
+          termPrint('  keys              List all KV keys');
+          termPrint('  clear_kv          Clear KV memory');
+          termPrint('  status            Server status');
+          termPrint('  clear             Clear terminal');
+          termPrint('  reload            Reload app list');
+          return;
+        }
+
+        if (action === 'clear') {
+          $('termOutput').innerHTML = '';
+          return;
+        }
+
+        if (action === 'status') {
+          termPrint('Server: ONLINE', 'success');
+          termPrint(`Apps cached: ${_appsCache.length}`);
+          const previewCount = _appsCache.filter(a => a.has_preview).length;
+          termPrint(`Apps with preview: ${previewCount}`);
+          return;
+        }
+
+        if (action === 'apps') {
+          const previewApps = _appsCache.filter(a => a.has_preview);
+          if (!previewApps.length) { termPrint('No apps with web preview.', 'warn'); return; }
+          previewApps.forEach(a => {
+            termPrint(`  ${a.app_id.substring(0, 8)}…  ${a.filename}`, 'info');
+          });
+          return;
+        }
+
+        if (action === 'reload') {
+          await renderMicrospaces();
+          termPrint('App list reloaded.', 'success');
+          return;
+        }
+
+        if (action === 'open' || action === 'launch') {
+          const id = parts[1];
+          if (!id) { termPrint('Usage: open <app-id>', 'err'); return; }
+          const app = _appsCache.find(a => a.app_id.startsWith(id) || a.app_id === id);
+          if (!app) { termPrint(`App not found: ${id}`, 'err'); return; }
+          const entryPath = app.preview_entry || '';
+          const url = entryPath ? `/api/preview/${app.app_id}/${entryPath}` : `/api/preview/${app.app_id}`;
+          if (action === 'launch') {
+            window.open(url, '_blank');
+            termPrint(`Launched ${app.filename} in new tab.`, 'success');
+          } else {
+            termPrint(`Preview URL: ${window.location.origin}${url}`, 'info');
+          }
+          return;
+        }
+
+        termPrint(`Unknown command: ${action}. Type 'help' for commands.`, 'err');
+      }
+
+      // ─── Landing Carousel ───────────────────────────────────
+      let _currentSlide = 0;
+      const _slideInterval = 40000; // 40 seconds
+      let _slideTimer = null;
+      let _timerStart = 0;
+
+      function goToSlide(idx) {
+        const slides = document.querySelectorAll('.landing-slide');
+        const dots = document.querySelectorAll('.landing-dot');
+        slides.forEach((s, i) => s.classList.toggle('active', i === idx));
+        dots.forEach((d, i) => d.classList.toggle('active', i === idx));
+        _currentSlide = idx;
+        _timerStart = Date.now();
+      }
+
+      function nextSlide() {
+        const total = document.querySelectorAll('.landing-slide').length;
+        goToSlide((_currentSlide + 1) % total);
+      }
+
+      function startCarousel() {
+        if (_slideTimer) clearInterval(_slideTimer);
+        _timerStart = Date.now();
+        _slideTimer = setInterval(nextSlide, _slideInterval);
+        animateTimerBar();
+      }
+
+      function animateTimerBar() {
+        const fill = $('landingTimerFill');
+        if (!fill) return;
+        function tick() {
+          if (!_timerStart) return;
+          const elapsed = Date.now() - _timerStart;
+          const pct = Math.min((elapsed / _slideInterval) * 100, 100);
+          fill.style.width = pct + '%';
+          if (pct < 100) requestAnimationFrame(tick);
+        }
+        requestAnimationFrame(tick);
+      }
+
+      // Pause carousel when user interacts, resume after
+      document.querySelectorAll('.landing-slide').forEach(s => {
+        s.addEventListener('mouseenter', () => { if (_slideTimer) clearInterval(_slideTimer); });
+        s.addEventListener('mouseleave', () => startCarousel());
+      });
+
+      startCarousel();
+
+      loadApps();
+    </script>
+  </div> <!-- /deployView -->
+  </div> <!-- /container -->
+
+  <!-- ─── Context Menu ─────────────────────────────────── -->
+  <div class="ctx-menu" id="ctxMenu">
+    <div class="ctx-menu-item" onclick="ctxOpenApp()">🚀 Open App</div>
+    <div class="ctx-menu-item" onclick="ctxLaunchNewTab()">↗ Open in New Tab</div>
+    <div class="ctx-menu-sep"></div>
+    <div class="ctx-menu-item" onclick="ctxCopyLink('app')">📋 Copy App Link</div>
+    <div class="ctx-menu-item" onclick="ctxCopyLink('preview')">🌐 Copy Preview Link</div>
+    <div class="ctx-menu-item" onclick="ctxCopyLink('download')">⬇ Copy Download Link</div>
+    <div class="ctx-menu-sep"></div>
+    <div class="ctx-menu-item" onclick="ctxCopyId()"># Copy App ID</div>
+  </div>
+</body>
+
+</html>
+```

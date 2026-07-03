@@ -1,0 +1,822 @@
+Project Structure:
+requirements.txt
+Dockerfile
+README.md
+.gitignore
+.gitattributes
+frontend/index.html
+backend/requirements.txt
+backend/__init__.py
+backend/main.py
+space/README.md
+
+File Contents:
+requirements.txt:
+```
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+pillow==11.1.0
+requests==2.32.3
+openai==1.59.7
+numpy==2.2.1
+
+```
+
+Dockerfile:
+```
+FROM python:3.11-slim
+
+WORKDIR /app
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY backend /app/backend
+COPY frontend /app/frontend
+
+ENV PORT=7860
+EXPOSE 7860
+CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "7860"]
+
+```
+
+README.md:
+```
+---
+title: Live Code Camera Engine
+emoji: 🎥
+colorFrom: blue
+colorTo: purple
+sdk: docker
+pinned: false
+---
+
+# Live Code Camera Engine
+
+A live **camera + microphone → evidence compression → multimodal LLM → code stream** engine.
+
+This is the upgraded version of the click-to-capture prototype. It continuously samples the camera, tracks evidence density, collects speech transcript text, and periodically asks a multimodal LLM to generate or revise code based on what the camera and audio are exposing.
+
+## Core primitive
+
+```text
+iPhone / laptop camera
+→ live frame stream
+→ evidence compressor
+→ rolling observation buffer
+→ LLM code synthesizer
+→ live code updates
+→ receipt chain
+```
+
+## What "continuity" means here
+
+The practical version is:
+
+```text
+iPhone Safari / laptop browser
+→ HTTPS Hugging Face Space
+→ FastAPI WebSocket endpoint
+→ multimodal LLM backend
+```
+
+If your iPhone and laptop are near each other, the shared continuity is not magic hardware continuity; it is a shared live endpoint. You open the same Space URL from either device, grant camera/mic permissions, and the stream becomes an evidence source.
+
+## Run locally
+
+```bash
+cd live-code-camera-engine
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r backend/requirements.txt
+
+export PROVIDER=ollama
+export OLLAMA_MODEL=llava
+uvicorn backend.main:app --host 0.0.0.0 --port 8000
+```
+
+Open:
+
+```text
+http://localhost:8000
+```
+
+For iPhone on same Wi-Fi, use your laptop LAN IP:
+
+```text
+http://YOUR_LAPTOP_IP:8000
+```
+
+Camera/mic access on mobile is most reliable over HTTPS, except localhost. For remote iPhone use, deploy to Hugging Face Spaces or use an HTTPS tunnel.
+
+## Deploy to Hugging Face Spaces
+
+Create a Docker Space and upload this folder. Required files are already included:
+
+```text
+Dockerfile
+requirements.txt
+backend/main.py
+frontend/index.html
+```
+
+Set secrets/environment variables in the Space:
+
+```text
+PROVIDER=ollama or openai
+OPENAI_API_KEY=...
+OPENAI_MODEL=<current multimodal model>
+```
+
+For local Ollama you normally run the backend locally, not inside Hugging Face, unless you provide a reachable Ollama endpoint.
+
+## Modes
+
+- `continuous_code`: generate code as the camera moves.
+- `debug_visible_error`: point camera at terminal/browser error and generate a fix.
+- `derive_pipeline`: infer a pipeline from scene + speech.
+- `soft_qr_xlc`: decode/encode QR-like exoatomic carriers.
+- `research_prism`: convert video/audio observations into code + research hypotheses.
+
+## Receipts
+
+Every synthesis has:
+
+```text
+session_id
+frame hashes
+transcript hash
+observation entropy
+frame-delta score
+prompt hash
+provider
+timestamp
+```
+
+This makes the stream auditable without storing raw frames by default.
+
+## Safety boundaries
+
+- The app does not execute generated code automatically.
+- It does not secretly record; the browser asks for permissions.
+- It does not store raw camera frames unless you add persistence.
+- It should not be used for covert surveillance, credential theft, malware, or unauthorized automation.
+- Multi-speaker separation is represented as an extension point. True speaker diarization needs an ASR/diarization model such as Whisper-family ASR plus a diarization stack.
+
+```
+
+.gitignore:
+```
+__pycache__/
+*.pyc
+.env
+.DS_Store
+runtime/
+data/
+
+```
+
+.gitattributes:
+```
+*.7z filter=lfs diff=lfs merge=lfs -text
+*.arrow filter=lfs diff=lfs merge=lfs -text
+*.bin filter=lfs diff=lfs merge=lfs -text
+*.bz2 filter=lfs diff=lfs merge=lfs -text
+*.ckpt filter=lfs diff=lfs merge=lfs -text
+*.ftz filter=lfs diff=lfs merge=lfs -text
+*.gz filter=lfs diff=lfs merge=lfs -text
+*.h5 filter=lfs diff=lfs merge=lfs -text
+*.joblib filter=lfs diff=lfs merge=lfs -text
+*.lfs.* filter=lfs diff=lfs merge=lfs -text
+*.mlmodel filter=lfs diff=lfs merge=lfs -text
+*.model filter=lfs diff=lfs merge=lfs -text
+*.msgpack filter=lfs diff=lfs merge=lfs -text
+*.npy filter=lfs diff=lfs merge=lfs -text
+*.npz filter=lfs diff=lfs merge=lfs -text
+*.onnx filter=lfs diff=lfs merge=lfs -text
+*.ot filter=lfs diff=lfs merge=lfs -text
+*.parquet filter=lfs diff=lfs merge=lfs -text
+*.pb filter=lfs diff=lfs merge=lfs -text
+*.pickle filter=lfs diff=lfs merge=lfs -text
+*.pkl filter=lfs diff=lfs merge=lfs -text
+*.pt filter=lfs diff=lfs merge=lfs -text
+*.pth filter=lfs diff=lfs merge=lfs -text
+*.rar filter=lfs diff=lfs merge=lfs -text
+*.safetensors filter=lfs diff=lfs merge=lfs -text
+saved_model/**/* filter=lfs diff=lfs merge=lfs -text
+*.tar.* filter=lfs diff=lfs merge=lfs -text
+*.tar filter=lfs diff=lfs merge=lfs -text
+*.tflite filter=lfs diff=lfs merge=lfs -text
+*.tgz filter=lfs diff=lfs merge=lfs -text
+*.wasm filter=lfs diff=lfs merge=lfs -text
+*.xz filter=lfs diff=lfs merge=lfs -text
+*.zip filter=lfs diff=lfs merge=lfs -text
+*.zst filter=lfs diff=lfs merge=lfs -text
+*tfevents* filter=lfs diff=lfs merge=lfs -text
+
+```
+
+index.html:
+```
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Live Code Camera Engine</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    body { margin: 0; background: #070910; color: #f6f8ff; }
+    main { max-width: 1240px; margin: 0 auto; padding: 18px; }
+    h1 { margin: 0 0 6px; font-size: 28px; }
+    .sub { color: #aeb9ca; margin-bottom: 14px; }
+    .grid { display: grid; grid-template-columns: 1.05fr 0.95fr; gap: 16px; align-items: start; }
+    @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+    video, canvas { width: 100%; background: #111827; border-radius: 16px; border: 1px solid #273142; }
+    textarea, select, input, button {
+      width: 100%; box-sizing: border-box; border-radius: 12px; border: 1px solid #2f3a4e;
+      background: #101827; color: #f5f7fb; padding: 11px; font-size: 15px;
+    }
+    button { cursor: pointer; background: #1f6feb; border: none; font-weight: 750; margin-top: 8px; }
+    button.secondary { background: #2b3445; }
+    button.danger { background: #8b1e3f; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #05070d; border: 1px solid #273142; padding: 14px; border-radius: 14px; min-height: 220px; max-height: 520px; overflow-y: auto; }
+    label { display:block; margin: 11px 0 6px; color: #b9c2d0; font-size: 13px; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .status { color: #9fb1c7; font-size: 14px; margin-top: 8px; }
+    .metrics { display:grid; grid-template-columns: repeat(3, 1fr); gap:8px; margin-top:10px; }
+    .metric { background:#111827; border:1px solid #273142; border-radius:12px; padding:10px; font-size:13px; color:#b9c2d0;}
+    .metric strong { color:#fff; display:block; font-size:18px; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Live Code Camera Engine</h1>
+  <div class="sub">Camera + audio transcript stream → evidence compression → multimodal LLM → live code updates.</div>
+
+  <div class="grid">
+    <section>
+      <video id="video" autoplay playsinline muted></video>
+      <canvas id="canvas" style="display:none"></canvas>
+
+      <div class="row">
+        <button id="startBtn">Start live engine</button>
+        <button id="stopBtn" class="danger">Stop</button>
+      </div>
+
+      <div class="row">
+        <button id="speechBtn" class="secondary">Start speech</button>
+        <button id="forceBtn" class="secondary">Force synthesize now</button>
+      </div>
+
+      <div class="metrics">
+        <div class="metric"><strong id="entropy">0</strong>visual entropy</div>
+        <div class="metric"><strong id="delta">0</strong>frame delta</div>
+        <div class="metric"><strong id="buffered">0</strong>frames buffered</div>
+      </div>
+
+      <p id="status" class="status">Idle.</p>
+    </section>
+
+    <section>
+      <label>Mode</label>
+      <select id="mode">
+        <option value="continuous_code">continuous_code</option>
+        <option value="debug_visible_error">debug_visible_error</option>
+        <option value="derive_pipeline">derive_pipeline</option>
+        <option value="soft_qr_xlc">soft_qr_xlc</option>
+        <option value="research_prism">research_prism</option>
+      </select>
+
+      <label>Instruction</label>
+      <textarea id="instruction" rows="4" placeholder="Example: As I point the camera around, infer what app/code/pipeline should be generated."></textarea>
+
+      <label>Live speech transcript</label>
+      <textarea id="transcript" rows="5" placeholder="Speech transcript appears here if supported. You can type too."></textarea>
+
+      <label>Frame interval, milliseconds</label>
+      <input id="frameMs" value="1200" />
+
+      <label>LLM synthesis interval, seconds</label>
+      <input id="synthSec" value="8" />
+    </section>
+  </div>
+
+  <h2>Live generated code / reasoning summary</h2>
+  <pre id="output"></pre>
+
+  <h2>Latest receipt</h2>
+  <pre id="receipt"></pre>
+</main>
+
+<script>
+const video = document.getElementById("video");
+const canvas = document.getElementById("canvas");
+const statusEl = document.getElementById("status");
+const transcriptEl = document.getElementById("transcript");
+const outputEl = document.getElementById("output");
+const receiptEl = document.getElementById("receipt");
+
+let stream = null;
+let ws = null;
+let frameTimer = null;
+let recognition = null;
+let sessionId = null;
+
+function setStatus(msg) { statusEl.textContent = msg; }
+
+function wsUrl() {
+  const scheme = location.protocol === "https:" ? "wss" : "ws";
+  return `${scheme}://${location.host}/ws/live-code`;
+}
+
+async function startCamera() {
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } },
+    audio: true
+  });
+  video.srcObject = stream;
+}
+
+function connectWs() {
+  ws = new WebSocket(wsUrl());
+  ws.onopen = () => setStatus("WebSocket connected.");
+  ws.onmessage = (event) => {
+    const msg = JSON.parse(event.data);
+    if (msg.type === "session") {
+      sessionId = msg.session_id;
+      setStatus("Session: " + sessionId);
+    } else if (msg.type === "frame_ack") {
+      document.getElementById("entropy").textContent = msg.entropy;
+      document.getElementById("delta").textContent = msg.delta;
+      document.getElementById("buffered").textContent = msg.buffered;
+    } else if (msg.type === "synthesis") {
+      outputEl.textContent = msg.output + "\n\n---\n\n" + outputEl.textContent;
+      receiptEl.textContent = JSON.stringify(msg.receipt, null, 2);
+      setStatus("Live synthesis received.");
+    } else if (msg.type === "error") {
+      outputEl.textContent = "ERROR: " + msg.message + "\n\n" + outputEl.textContent;
+      setStatus("Backend error.");
+    }
+  };
+  ws.onclose = () => setStatus("WebSocket closed.");
+}
+
+function captureFrameDataUrl() {
+  const w = video.videoWidth || 1280;
+  const h = video.videoHeight || 720;
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d");
+  ctx.drawImage(video, 0, 0, w, h);
+  return canvas.toDataURL("image/jpeg", 0.74);
+}
+
+function sendFrame(force=false) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const dataUrl = captureFrameDataUrl();
+  ws.send(JSON.stringify({
+    type: "frame",
+    frame: dataUrl,
+    transcript: transcriptEl.value,
+    instruction: document.getElementById("instruction").value,
+    mode: document.getElementById("mode").value,
+    auto: true,
+    force,
+    synthesis_interval: Number(document.getElementById("synthSec").value || 8)
+  }));
+  if (transcriptEl.value.trim()) {
+    ws.send(JSON.stringify({ type: "transcript", text: transcriptEl.value }));
+  }
+}
+
+async function startLive() {
+  await startCamera();
+  connectWs();
+  const ms = Math.max(300, Number(document.getElementById("frameMs").value || 1200));
+  frameTimer = setInterval(() => sendFrame(false), ms);
+  setStatus("Live camera stream active.");
+}
+
+function stopLive() {
+  if (frameTimer) clearInterval(frameTimer);
+  frameTimer = null;
+  if (recognition) recognition.stop();
+  if (stream) {
+    stream.getTracks().forEach(t => t.stop());
+    stream = null;
+  }
+  if (ws) ws.close();
+  setStatus("Stopped.");
+}
+
+function startSpeech() {
+  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SpeechRecognition) {
+    setStatus("SpeechRecognition unavailable in this browser. Type transcript manually.");
+    return;
+  }
+  recognition = new SpeechRecognition();
+  recognition.lang = "en-US";
+  recognition.continuous = true;
+  recognition.interimResults = true;
+  recognition.onresult = (event) => {
+    let text = "";
+    for (let i = 0; i < event.results.length; i++) {
+      text += event.results[i][0].transcript + " ";
+    }
+    transcriptEl.value = text.trim();
+  };
+  recognition.onerror = (e) => setStatus("Speech error: " + e.error);
+  recognition.start();
+  setStatus("Speech recognition active.");
+}
+
+document.getElementById("startBtn").onclick = () => startLive().catch(e => setStatus(e.message));
+document.getElementById("stopBtn").onclick = stopLive;
+document.getElementById("speechBtn").onclick = startSpeech;
+document.getElementById("forceBtn").onclick = () => sendFrame(true);
+</script>
+</body>
+</html>
+
+```
+
+requirements.txt:
+```
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+pillow==11.1.0
+requests==2.32.3
+openai==1.59.7
+numpy==2.2.1
+
+```
+
+__init__.py:
+```
+
+```
+
+main.py:
+```
+import base64
+import hashlib
+import io
+import json
+import os
+import time
+import uuid
+from collections import deque
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any
+
+import numpy as np
+import requests
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from PIL import Image
+
+APP_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+FRONTEND_INDEX = os.path.join(APP_ROOT, "frontend", "index.html")
+
+app = FastAPI(title="Live Code Camera Engine", version="0.2.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # production: set exact origins
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+SYSTEM_PROMPT = """
+You are Live Code Camera Engine.
+
+You generate code from a rolling sensor stream:
+- sampled camera frames
+- audio transcript text
+- scene-change metrics
+- signal-density metrics
+- user instruction
+
+You must output:
+1. OBSERVATION: concise visible/audio evidence summary.
+2. INFERENCE: what the evidence seems to imply, with uncertainty.
+3. CODE: complete runnable code or patch.
+4. RUN: exact run command.
+5. RECEIPT: short audit record explaining which evidence hashes informed the output.
+
+Rules:
+- Do not claim to know hidden information.
+- Do not expose private chain-of-thought; provide a useful reasoning summary.
+- Do not execute generated code automatically.
+- Refuse malware, credential theft, covert surveillance, or unauthorized access.
+- If the scene includes faces or private environments, keep outputs privacy-preserving unless the user explicitly asks for local personal analysis.
+"""
+
+
+@dataclass
+class FrameEvidence:
+    ts: float
+    sha256: str
+    phash: str
+    entropy: float
+    size_bytes: int
+    width: int
+    height: int
+    delta: float
+    jpeg_b64: str
+
+
+@dataclass
+class LiveSession:
+    session_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    frames: deque = field(default_factory=lambda: deque(maxlen=8))
+    transcripts: deque = field(default_factory=lambda: deque(maxlen=20))
+    created_at: float = field(default_factory=time.time)
+    last_synthesis_at: float = 0.0
+    synth_count: int = 0
+
+
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def parse_data_url(data_url: str) -> bytes:
+    if "," in data_url and data_url.startswith("data:"):
+        data_url = data_url.split(",", 1)[1]
+    return base64.b64decode(data_url)
+
+
+def normalize_jpeg(image_bytes: bytes, max_side: int = 960) -> tuple[bytes, Image.Image]:
+    im = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    scale = min(1.0, max_side / max(im.width, im.height))
+    if scale < 1:
+        im = im.resize((int(im.width * scale), int(im.height * scale)))
+    out = io.BytesIO()
+    im.save(out, format="JPEG", quality=82, optimize=True)
+    return out.getvalue(), im
+
+
+def image_entropy(im: Image.Image) -> float:
+    g = im.convert("L").resize((128, 128))
+    arr = np.asarray(g, dtype=np.uint8)
+    hist = np.bincount(arr.flatten(), minlength=256).astype(np.float64)
+    probs = hist / max(1, hist.sum())
+    probs = probs[probs > 0]
+    return float(-(probs * np.log2(probs)).sum())
+
+
+def average_hash(im: Image.Image, size: int = 8) -> str:
+    g = im.convert("L").resize((size, size))
+    arr = np.asarray(g, dtype=np.float32)
+    mean = arr.mean()
+    bits = (arr > mean).astype(np.uint8).flatten()
+    value = 0
+    for bit in bits:
+        value = (value << 1) | int(bit)
+    return f"{value:016x}"
+
+
+def phash_delta(a: str | None, b: str) -> float:
+    if not a:
+        return 1.0
+    x = int(a, 16)
+    y = int(b, 16)
+    return bin(x ^ y).count("1") / 64.0
+
+
+def build_evidence_summary(session: LiveSession, user_instruction: str, mode: str) -> dict[str, Any]:
+    frames = list(session.frames)
+    transcript_text = " ".join(list(session.transcripts))[-4000:]
+
+    if frames:
+        avg_entropy = sum(f.entropy for f in frames) / len(frames)
+        avg_delta = sum(f.delta for f in frames) / len(frames)
+        last_frame = frames[-1]
+    else:
+        avg_entropy = 0
+        avg_delta = 0
+        last_frame = None
+
+    return {
+        "session_id": session.session_id,
+        "mode": mode,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "frame_count_buffered": len(frames),
+        "frame_hashes": [f.sha256 for f in frames],
+        "frame_phashes": [f.phash for f in frames],
+        "avg_visual_entropy": round(avg_entropy, 4),
+        "avg_frame_delta": round(avg_delta, 4),
+        "transcript_hash": sha256_text(transcript_text),
+        "instruction_hash": sha256_text(user_instruction),
+        "transcript_excerpt": transcript_text[-1200:],
+        "instruction": user_instruction,
+        "last_frame": {
+            "sha256": last_frame.sha256,
+            "width": last_frame.width,
+            "height": last_frame.height,
+            "entropy": last_frame.entropy,
+            "delta": last_frame.delta,
+        } if last_frame else None,
+    }
+
+
+def image_data_url_from_frame(frame: FrameEvidence) -> str:
+    return "data:image/jpeg;base64," + frame.jpeg_b64
+
+
+def call_ollama(prompt: str, frame: FrameEvidence | None) -> str:
+    model = os.getenv("OLLAMA_MODEL", "llava")
+    host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+    }
+    if frame:
+        payload["images"] = [frame.jpeg_b64]
+    r = requests.post(f"{host}/api/generate", json=payload, timeout=180)
+    if r.status_code >= 400:
+        raise RuntimeError(f"Ollama error: {r.text[:500]}")
+    return r.json().get("response", "")
+
+
+def call_openai(prompt: str, frame: FrameEvidence | None) -> str:
+    from openai import OpenAI
+    model = os.getenv("OPENAI_MODEL")
+    if not model:
+        raise RuntimeError("OPENAI_MODEL is not set.")
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    content = [{"type": "input_text", "text": prompt}]
+    if frame:
+        content.append({"type": "input_image", "image_url": image_data_url_from_frame(frame)})
+    response = client.responses.create(
+        model=model,
+        input=[{"role": "user", "content": content}],
+    )
+    return response.output_text
+
+
+def synthesize(session: LiveSession, user_instruction: str, mode: str) -> dict[str, Any]:
+    evidence = build_evidence_summary(session, user_instruction, mode)
+    last_frame = list(session.frames)[-1] if session.frames else None
+
+    prompt = f"""
+{SYSTEM_PROMPT}
+
+MODE:
+{mode}
+
+USER INSTRUCTION:
+{user_instruction or "[none]"}
+
+ROLLING EVIDENCE SUMMARY:
+{json.dumps(evidence, indent=2)}
+
+Generate a live code update from the evidence. If the evidence is insufficient, generate the next instrumentation code needed to collect better evidence.
+"""
+
+    provider = os.getenv("PROVIDER", "ollama").lower().strip()
+    if provider == "ollama":
+        output = call_ollama(prompt, last_frame)
+    elif provider == "openai":
+        output = call_openai(prompt, last_frame)
+    else:
+        raise RuntimeError(f"Unknown PROVIDER={provider!r}")
+
+    session.synth_count += 1
+    session.last_synthesis_at = time.time()
+
+    receipt = {
+        "receipt_type": "LIVE_CODE_CAMERA_RECEIPT_V1",
+        "session_id": session.session_id,
+        "synthesis_index": session.synth_count,
+        "provider": provider,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "evidence_hash": sha256_text(json.dumps(evidence, sort_keys=True)),
+        "prompt_hash": sha256_text(prompt),
+        "frame_hashes": evidence["frame_hashes"],
+        "transcript_hash": evidence["transcript_hash"],
+        "avg_visual_entropy": evidence["avg_visual_entropy"],
+        "avg_frame_delta": evidence["avg_frame_delta"],
+        "mode": mode,
+    }
+
+    return {"type": "synthesis", "ok": True, "output": output, "receipt": receipt, "evidence": evidence}
+
+
+@app.get("/")
+def index():
+    return FileResponse(FRONTEND_INDEX)
+
+
+@app.get("/health")
+def health():
+    return {
+        "ok": True,
+        "app": "live-code-camera-engine",
+        "provider": os.getenv("PROVIDER", "ollama"),
+        "time": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.websocket("/ws/live-code")
+async def live_code(ws: WebSocket):
+    await ws.accept()
+    session = LiveSession()
+    await ws.send_json({"type": "session", "session_id": session.session_id})
+
+    try:
+        while True:
+            msg = await ws.receive_json()
+            msg_type = msg.get("type")
+            mode = msg.get("mode", "continuous_code")
+            user_instruction = msg.get("instruction", "")
+
+            if msg_type == "frame":
+                raw = parse_data_url(msg["frame"])
+                jpeg, im = normalize_jpeg(raw)
+                ph = average_hash(im)
+                previous_ph = session.frames[-1].phash if session.frames else None
+                evidence = FrameEvidence(
+                    ts=time.time(),
+                    sha256=sha256_bytes(jpeg),
+                    phash=ph,
+                    entropy=image_entropy(im),
+                    size_bytes=len(jpeg),
+                    width=im.width,
+                    height=im.height,
+                    delta=phash_delta(previous_ph, ph),
+                    jpeg_b64=base64.b64encode(jpeg).decode("ascii"),
+                )
+                session.frames.append(evidence)
+                await ws.send_json({
+                    "type": "frame_ack",
+                    "sha256": evidence.sha256,
+                    "entropy": round(evidence.entropy, 4),
+                    "delta": round(evidence.delta, 4),
+                    "buffered": len(session.frames),
+                })
+
+                auto = bool(msg.get("auto", True))
+                interval = float(msg.get("synthesis_interval", 8.0))
+                enough_time = time.time() - session.last_synthesis_at >= interval
+                enough_frames = len(session.frames) >= 2
+                force = bool(msg.get("force", False))
+
+                if force or (auto and enough_time and enough_frames):
+                    try:
+                        result = synthesize(session, user_instruction, mode)
+                        await ws.send_json(result)
+                    except Exception as e:
+                        await ws.send_json({"type": "error", "message": str(e)})
+
+            elif msg_type == "transcript":
+                text = (msg.get("text") or "").strip()
+                if text:
+                    session.transcripts.append(text)
+                await ws.send_json({"type": "transcript_ack", "chars": len(text)})
+
+            elif msg_type == "synthesize":
+                try:
+                    result = synthesize(session, user_instruction, mode)
+                    await ws.send_json(result)
+                except Exception as e:
+                    await ws.send_json({"type": "error", "message": str(e)})
+
+            elif msg_type == "ping":
+                await ws.send_json({"type": "pong", "session_id": session.session_id})
+
+            else:
+                await ws.send_json({"type": "error", "message": f"Unknown message type: {msg_type}"})
+
+    except WebSocketDisconnect:
+        return
+
+```
+
+README.md:
+```
+---
+title: Live Code Camera Engine
+emoji: 🎥
+colorFrom: blue
+colorTo: purple
+sdk: docker
+pinned: false
+---
+
+# Live Code Camera Engine
+
+Docker Space for live camera/audio-to-code generation.
+
+```

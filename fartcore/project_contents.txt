@@ -1,0 +1,890 @@
+Project Structure:
+requirements.txt
+Dockerfile
+README.md
+.gitattributes
+app.py
+static/index.html
+
+File Contents:
+requirements.txt:
+```
+fastapi
+uvicorn
+python-multipart
+numpy
+huggingface-hub
+
+```
+
+Dockerfile:
+```
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+RUN mkdir -p uploads output data
+ENV DATABASE_PATH=/app/data/afip.db
+ENV PORT=7860
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7860"]
+
+```
+
+README.md:
+```
+---
+title: Fartcore
+emoji: 🚀
+colorFrom: yellow
+colorTo: red
+sdk: docker
+pinned: false
+---
+
+Check out the configuration reference at https://huggingface.co/docs/hub/spaces-config-reference
+
+```
+
+.gitattributes:
+```
+*.7z filter=lfs diff=lfs merge=lfs -text
+*.arrow filter=lfs diff=lfs merge=lfs -text
+*.bin filter=lfs diff=lfs merge=lfs -text
+*.bz2 filter=lfs diff=lfs merge=lfs -text
+*.ckpt filter=lfs diff=lfs merge=lfs -text
+*.ftz filter=lfs diff=lfs merge=lfs -text
+*.gz filter=lfs diff=lfs merge=lfs -text
+*.h5 filter=lfs diff=lfs merge=lfs -text
+*.joblib filter=lfs diff=lfs merge=lfs -text
+*.lfs.* filter=lfs diff=lfs merge=lfs -text
+*.mlmodel filter=lfs diff=lfs merge=lfs -text
+*.model filter=lfs diff=lfs merge=lfs -text
+*.msgpack filter=lfs diff=lfs merge=lfs -text
+*.npy filter=lfs diff=lfs merge=lfs -text
+*.npz filter=lfs diff=lfs merge=lfs -text
+*.onnx filter=lfs diff=lfs merge=lfs -text
+*.ot filter=lfs diff=lfs merge=lfs -text
+*.parquet filter=lfs diff=lfs merge=lfs -text
+*.pb filter=lfs diff=lfs merge=lfs -text
+*.pickle filter=lfs diff=lfs merge=lfs -text
+*.pkl filter=lfs diff=lfs merge=lfs -text
+*.pt filter=lfs diff=lfs merge=lfs -text
+*.pth filter=lfs diff=lfs merge=lfs -text
+*.rar filter=lfs diff=lfs merge=lfs -text
+*.safetensors filter=lfs diff=lfs merge=lfs -text
+saved_model/**/* filter=lfs diff=lfs merge=lfs -text
+*.tar.* filter=lfs diff=lfs merge=lfs -text
+*.tar filter=lfs diff=lfs merge=lfs -text
+*.tflite filter=lfs diff=lfs merge=lfs -text
+*.tgz filter=lfs diff=lfs merge=lfs -text
+*.wasm filter=lfs diff=lfs merge=lfs -text
+*.xz filter=lfs diff=lfs merge=lfs -text
+*.zip filter=lfs diff=lfs merge=lfs -text
+*.zst filter=lfs diff=lfs merge=lfs -text
+*tfevents* filter=lfs diff=lfs merge=lfs -text
+
+```
+
+app.py:
+```
+#!/usr/bin/env python3
+"""
+fartcore — LocalSpace App Bundler & Deployer
+
+Upload .app, .dmg, or .zip bundles. They get extracted, inspected,
+and auto-registered with your LocalSpace coordinator as artifacts + spaces.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import plistlib
+import re
+import shutil
+import subprocess
+import time
+import uuid
+from pathlib import Path
+from typing import Any
+
+import httpx
+from fastapi import FastAPI, File, Request, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+
+DATA_DIR = Path("data")
+DATA_DIR.mkdir(exist_ok=True)
+UPLOAD_DIR = DATA_DIR / "uploads"
+UPLOAD_DIR.mkdir(exist_ok=True)
+EXTRACT_DIR = DATA_DIR / "extracted"
+EXTRACT_DIR.mkdir(exist_ok=True)
+DB_PATH = DATA_DIR / "apps.json"
+
+LOCALSPACE_API_URL = os.getenv("LOCALSPACE_API_URL", "http://localhost:8000").rstrip("/")
+LOCALSPACE_API_KEY = os.getenv("LOCALSPACE_API_KEY", "dev-key-change-me")
+
+app = FastAPI(title="fartcore — LocalSpace Deployer")
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+_store: dict[str, dict[str, Any]] = {}
+
+
+def _load_db() -> None:
+    global _store
+    if DB_PATH.exists():
+        with open(DB_PATH, "r") as f:
+            _store = json.load(f)
+
+
+def _save_db() -> None:
+    with open(DB_PATH, "w") as f:
+        json.dump(_store, f, indent=2, default=str)
+
+
+def _hash_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _slugify(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", name.lower().replace(".app", "").replace(".dmg", "")).strip("-")
+
+
+def _read_info_plist(app_path: Path) -> dict[str, Any]:
+    plist_path = app_path / "Contents" / "Info.plist"
+    if not plist_path.exists():
+        return {}
+    try:
+        with open(plist_path, "rb") as f:
+            return plistlib.load(f)
+    except Exception:
+        return {}
+
+
+def _find_app_in_dir(directory: Path) -> Path | None:
+    for item in directory.iterdir():
+        if item.suffix == ".app":
+            return item
+    for item in directory.iterdir():
+        if item.is_dir():
+            for sub in item.iterdir():
+                if sub.suffix == ".app":
+                    return sub
+    return None
+
+
+def _extract_zip(zip_path: Path, dest: Path) -> Path | None:
+    try:
+        subprocess.run(["unzip", "-q", str(zip_path), "-d", str(dest)], check=True, capture_output=True)
+        return _find_app_in_dir(dest)
+    except Exception:
+        return None
+
+
+def _extract_dmg(dmg_path: Path, dest: Path) -> Path | None:
+    import platform
+    if platform.system() != "Darwin":
+        return None
+    mount_point = Path(f"/Volumes/fartcore-{uuid.uuid4().hex[:8]}")
+    try:
+        subprocess.run(
+            ["hdiutil", "attach", str(dmg_path), "-mountpoint", str(mount_point), "-nobrowse", "-quiet"],
+            check=True,
+            capture_output=True,
+        )
+        app = _find_app_in_dir(mount_point)
+        if app:
+            copied = dest / app.name
+            shutil.copytree(app, copied, dirs_exist_ok=True)
+            return copied
+        return None
+    except Exception:
+        return None
+    finally:
+        if mount_point.exists():
+            subprocess.run(["hdiutil", "detach", str(mount_point), "-quiet"], capture_output=True)
+
+
+def _extract_upload(upload_path: Path, dest: Path) -> Path | None:
+    suffix = upload_path.suffix.lower()
+    if suffix == ".zip":
+        return _extract_zip(upload_path, dest)
+    elif suffix == ".dmg":
+        return _extract_dmg(upload_path, dest)
+    elif suffix == ".app":
+        copied = dest / upload_path.name
+        if upload_path.is_dir():
+            shutil.copytree(upload_path, copied, dirs_exist_ok=True)
+        return copied
+    return None
+
+
+def _scan_app_bundle(app_path: Path) -> dict[str, Any]:
+    info = _read_info_plist(app_path)
+    return {
+        "bundle_id": info.get("CFBundleIdentifier", "unknown"),
+        "display_name": info.get("CFBundleDisplayName") or info.get("CFBundleName", app_path.stem),
+        "version": info.get("CFBundleShortVersionString", "1.0.0"),
+        "bundle_version": info.get("CFBundleVersion", "1"),
+        "executable": info.get("CFBundleExecutable", ""),
+        "minimum_os": info.get("LSMinimumSystemVersion", "10.15"),
+        "icon_file": info.get("CFBundleIconFile", ""),
+    }
+
+
+def _find_preview_file(app_path: Path) -> Path | None:
+    resources = app_path / "Contents" / "Resources"
+    if not resources.exists():
+        return None
+    for pattern in ("index.html", "ui.html", "main.html"):
+        candidate = resources / pattern
+        if candidate.exists():
+            return candidate
+    matches = list(resources.glob("*.html"))
+    return matches[0] if matches else None
+
+
+async def _register_with_localspace(
+    app_name: str,
+    app_path: Path,
+    artifact_type: str,
+    runtime_command: str = "",
+) -> dict[str, Any] | None:
+    headers = {"Authorization": f"Bearer {LOCALSPACE_API_KEY}", "Content-Type": "application/json"}
+    slug = _slugify(app_name)
+
+    try:
+        r = await httpx.AsyncClient().get(f"{LOCALSPACE_API_URL}/workers", headers=headers, timeout=5)
+        workers = r.json() if r.status_code == 200 else []
+        if not workers:
+            return None
+        worker_id = workers[0].get("worker_id", "auto")
+    except Exception:
+        return None
+
+    artifact_payload = {
+        "artifact_type": artifact_type,
+        "name": app_name,
+        "local_path": str(app_path),
+        "runtime_command": runtime_command,
+    }
+    try:
+        r = await httpx.AsyncClient().post(
+            f"{LOCALSPACE_API_URL}/artifacts", headers=headers, json=artifact_payload, timeout=10
+        )
+        if r.status_code in (200, 201):
+            artifact_id = r.json()["artifact_id"]
+        else:
+            return None
+    except Exception:
+        return None
+
+    space_payload = {
+        "slug": slug,
+        "worker_id": worker_id,
+        "artifact_id": artifact_id,
+        "compute_lease": {
+            "cpu_cores": 2,
+            "memory_mb": 512,
+            "disk_mb": 1024,
+            "max_job_seconds": 30,
+            "allowed_runtimes": [artifact_type],
+        },
+        "description": f"Deployed via fartcore: {app_name}",
+    }
+    try:
+        r = await httpx.AsyncClient().post(
+            f"{LOCALSPACE_API_URL}/spaces", headers=headers, json=space_payload, timeout=10
+        )
+        if r.status_code in (200, 201):
+            return r.json()
+    except Exception:
+        pass
+    return None
+
+
+@app.on_event("startup")
+async def startup():
+    _load_db()
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    return open(Path(__file__).parent / "static" / "index.html").read() if (Path(__file__).parent / "static" / "index.html").exists() else _default_html()
+
+
+def _default_html() -> str:
+    return """<!DOCTYPE html><html><head><meta charset="UTF-8"><title>fartcore</title>
+<style>:root{--bg:#0f0f0f;--card:#1a1a1a;--text:#e0e0e0;--muted:#888;--accent:#3b82f6;}
+body{font-family:system-ui;background:var(--bg);color:var(--text);margin:0;padding:2rem;}
+.container{max-width:900px;margin:0 auto;}h1{font-size:2rem;margin-bottom:.5rem;}
+.sub{color:var(--muted);margin-bottom:2rem;}
+.drop-zone{border:2px dashed #444;border-radius:12px;padding:3rem;text-align:center;cursor:pointer;}
+.drop-zone:hover{border-color:var(--accent);}.drop-zone input{display:none;}
+.apps{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:1rem;margin-top:2rem;}
+.app-card{background:var(--card);border-radius:10px;padding:1rem;border:1px solid #2a2a2a;}
+.app-card h3{margin:0 0 .5rem;font-size:1rem;}.app-card .meta{font-size:.8rem;color:var(--muted);}
+.app-card a{color:var(--accent);text-decoration:none;font-size:.85rem;}
+.status{margin-top:1rem;font-size:.9rem;color:var(--muted);}</style></head><body>
+<div class="container"><h1>fartcore</h1><p class="sub">Drop a .app, .dmg, or .zip &mdash; get a LocalSpace public URL.</p>
+<div class="drop-zone" id="dz" onclick="document.getElementById('fi').click()">
+<p>Drop file here or click to browse</p><input type="file" id="fi" accept=".dmg,.zip" onchange="up(this.files)"></div>
+<div class="status" id="st"></div><div class="apps" id="apps"></div></div>
+<script>
+const dz=document.getElementById('dz');
+dz.addEventListener('dragover',e=>{e.preventDefault();dz.style.borderColor='var(--accent)';});
+dz.addEventListener('dragleave',()=>{dz.style.borderColor='#444';});
+dz.addEventListener('drop',e=>{e.preventDefault();dz.style.borderColor='#444';up(e.dataTransfer.files);});
+async function up(files){if(!files.length)return;st.textContent='Uploading...';const fd=new FormData();fd.append('file',files[0]);const r=await fetch('/api/upload',{method:'POST',body:fd});const j=await r.json();st.textContent=j.message||j.error||'Done';loadApps();}
+async function loadApps(){const r=await fetch('/api/apps');const j=await r.json();const el=document.getElementById('apps');el.innerHTML='';(j.apps||[]).forEach(a=>{const d=document.createElement('div');d.className='app-card';d.innerHTML=`<h3>${a.display_name||a.name}</h3><div class="meta">${a.version||''} &middot; ${a.bundle_id||''}</div><div class="meta">${(a.size||0).toLocaleString()} bytes</div><a href="/app/${a.id}">Preview</a> | <a href="/api/download/${a.id}">Download</a>${a.localspace_url?` | <a href="${a.localspace_url}" target="_blank">LocalSpace</a>`:''}`;el.appendChild(d);});}
+loadApps();
+</script></body></html>"""
+
+
+@app.post("/api/upload")
+async def upload(file: UploadFile = File(...)):
+    app_id = str(uuid.uuid4())
+    upload_path = UPLOAD_DIR / f"{app_id}_{file.filename}"
+    with open(upload_path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+
+    extract_dest = EXTRACT_DIR / app_id
+    extract_dest.mkdir(exist_ok=True)
+    app_bundle = _extract_upload(upload_path, extract_dest)
+
+    if not app_bundle:
+        return JSONResponse(
+            status_code=422,
+            content={"error": "Could not extract app bundle from upload. Supported: .app folder, .zip containing .app, .dmg (macOS only)"},
+        )
+
+    meta = _scan_app_bundle(app_bundle)
+    preview_file = _find_preview_file(app_bundle)
+
+    record = {
+        "id": app_id,
+        "name": file.filename,
+        "display_name": meta.get("display_name", file.filename),
+        "bundle_id": meta.get("bundle_id"),
+        "version": meta.get("version"),
+        "bundle_version": meta.get("bundle_version"),
+        "executable": meta.get("executable"),
+        "minimum_os": meta.get("minimum_os"),
+        "uploaded_at": time.time(),
+        "size": upload_path.stat().st_size,
+        "upload_path": str(upload_path),
+        "extracted_path": str(app_bundle),
+        "preview_path": str(preview_file) if preview_file else None,
+    }
+
+    # Try to auto-register with LocalSpace
+    artifact_type = "dmg" if upload_path.suffix.lower() == ".dmg" else "app"
+    space_info = await _register_with_localspace(
+        record["display_name"],
+        app_bundle,
+        artifact_type,
+    )
+    if space_info:
+        record["localspace_url"] = space_info.get("public_url")
+        record["localspace_space_id"] = space_info.get("space_id")
+        record["localspace_slug"] = space_info.get("slug")
+
+    _store[app_id] = record
+    _save_db()
+
+    return {
+        "id": app_id,
+        "message": f"Extracted {meta.get('display_name', file.filename)} v{meta.get('version', '?')}",
+        "localspace_url": record.get("localspace_url"),
+        **record,
+    }
+
+
+@app.get("/api/apps")
+async def list_apps():
+    apps = sorted(_store.values(), key=lambda a: a["uploaded_at"], reverse=True)
+    return {"apps": apps}
+
+
+@app.get("/app/{app_id}", response_class=HTMLResponse)
+async def app_page(app_id: str):
+    rec = _store.get(app_id)
+    if not rec:
+        return HTMLResponse("<h1>Not found</h1>", status_code=404)
+    preview = rec.get("preview_path")
+    if preview and Path(preview).exists():
+        content = Path(preview).read_text(errors="replace")
+        return HTMLResponse(content)
+    return HTMLResponse(f"<h1>{rec.get('display_name', rec['name'])}</h1><p>No preview available.</p>")
+
+
+@app.get("/api/preview/{app_id}/{path:path}")
+async def preview_file(app_id: str, path: str):
+    rec = _store.get(app_id)
+    if not rec:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    base = Path(rec["extracted_path"])
+    target = base / path
+    try:
+        target.resolve().relative_to(base.resolve())
+    except ValueError:
+        return JSONResponse({"error": "path traversal"}, status_code=403)
+    if not target.exists():
+        return JSONResponse({"error": "file not found"}, status_code=404)
+    return FileResponse(target)
+
+
+@app.get("/api/download/{app_id}")
+async def download(app_id: str):
+    rec = _store.get(app_id)
+    if not rec:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    upload_path = Path(rec["upload_path"])
+    if not upload_path.exists():
+        return JSONResponse({"error": "file missing"}, status_code=404)
+    return FileResponse(upload_path, filename=rec["name"])
+
+
+@app.delete("/api/apps/{app_id}")
+async def delete_app(app_id: str):
+    rec = _store.pop(app_id, None)
+    if rec:
+        try:
+            shutil.rmtree(EXTRACT_DIR / app_id, ignore_errors=True)
+            Path(rec["upload_path"]).unlink(missing_ok=True)
+        except Exception:
+            pass
+        _save_db()
+    return {"deleted": app_id}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=7860)
+UPLOADS.mkdir(exist_ok=True)
+
+B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+def b58(v):
+    n = int.from_bytes(v, "big")
+    if n == 0: return B58[0]
+    s = ""
+    while n:
+        n, r = divmod(n, 58)
+        s = B58[r] + s
+    return s
+
+def solana_kp(audio_hash):
+    seed = hashlib.sha512(audio_hash).digest()[:32]
+    try:
+        from nacl.signing import SigningKey
+        sk = SigningKey(seed)
+        vk = sk.verify_key
+        pub = bytes(vk)
+        priv = bytes(sk) + pub
+        return b58(priv), b58(pub)
+    except ImportError:
+        pub = hashlib.sha256(seed).digest()
+        priv = hashlib.sha256(pub).digest() + pub
+        return b58(priv), b58(pub)
+
+def init_db():
+    with sqlite3.connect(DB) as c:
+        c.execute("""CREATE TABLE IF NOT EXISTS farts (
+            id TEXT PRIMARY KEY, created TEXT, audio_hash TEXT,
+            duration REAL, note_count INTEGER, midi_path TEXT,
+            solana_priv TEXT, solana_pub TEXT, fartscore INTEGER, report TEXT
+        )""")
+        c.commit()
+init_db()
+
+class Wav:
+    @staticmethod
+    def read(path):
+        with open(path, "rb") as f:
+            assert f.read(4) == b"RIFF"; f.read(4)
+            assert f.read(4) == b"WAVE"
+            fmt = data = b""
+            while True:
+                cid = f.read(4)
+                if not cid: break
+                sz = struct.unpack("<I", f.read(4))[0]
+                chunk = f.read(sz)
+                if cid == b"fmt ": fmt = chunk
+                elif cid == b"data": data = chunk
+            af, ch, sr, _, _, bits = struct.unpack("<HHIIHH", fmt[:16])
+            assert af == 1 and bits == 16
+            samples = struct.unpack(f"<{len(data)//2}h", data)
+            if ch == 2:
+                samples = [(samples[i]+samples[i+1])/2 for i in range(0,len(samples),2)]
+            return np.array(samples, np.float32)/32768.0, sr
+
+    @staticmethod
+    def write(path, samples, sr=16000):
+        data = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+        fmt = struct.pack("<HHIIHH", 1, 1, sr, sr * 2, 2, 16)
+        with open(path, "wb") as f:
+            f.write(b"RIFF")
+            f.write(struct.pack("<I", 36 + len(data)))
+            f.write(b"WAVE")
+            f.write(b"fmt " + struct.pack("<I", 16) + fmt)
+            f.write(b"data" + struct.pack("<I", len(data)) + data)
+
+class YIN:
+    def __init__(self, sr=16000):
+        self.sr = sr
+        self.fs = int(sr * 0.046)
+        self.hop = self.fs // 4
+        self.th = 0.15
+    def _diff(self, x):
+        n = len(x); mt = n // 2; d = np.zeros(mt)
+        for t in range(1, mt): d[t] = np.sum((x[:n-t] - x[t:n])**2)
+        return d
+    def _cmdf(self, d):
+        c = np.ones(len(d)); rs = 0.0
+        for t in range(1, len(d)):
+            rs += d[t]
+            c[t] = d[t] / (rs/t) if rs > 0 else 1.0
+        return c
+    def pitch(self, frame):
+        if len(frame) < self.fs: frame = np.pad(frame, (0, self.fs - len(frame)))
+        else: frame = frame[:self.fs]
+        frame = frame * np.hanning(len(frame))
+        d = self._diff(frame); c = self._cmdf(d)
+        est = None
+        for t in range(2, len(c)):
+            if c[t] < self.th:
+                while t+1 < len(c) and c[t+1] < c[t]: t += 1
+                est = t; break
+        if est is None: est = int(np.argmin(c[2:])) + 2
+        if 1 <= est < len(c) - 1:
+            a, b, g = c[est-1], c[est], c[est+1]
+            est += 0.5 * (a - g) / (a - 2*b + g)
+        return self.sr / est if est > 0 else None
+    def detect(self, y):
+        return [(i/self.sr, self.pitch(y[i:i+self.fs])) for i in range(0, len(y)-self.fs, self.hop)]
+
+class SMF:
+    def __init__(self, tpq=480):
+        self.tpq = tpq; self.tracks = []
+    def add(self): self.tracks.append([]); return len(self.tracks)-1
+    def _vlq(self, v):
+        b = [v & 0x7F]; v >>= 7
+        while v: b.append((v & 0x7F) | 0x80); v >>= 7
+        return bytes(reversed(b))
+    def meta(self, t, d=b""): return bytes([0xFF, t, len(d)]) + d
+    def tempo(self, tr, us=500000): self.tracks[tr].append((0, self.meta(0x51, struct.pack(">I", us)[1:])))
+    def pc(self, tr, ch, p): self.tracks[tr].append((0, bytes([0xC0 | (ch & 0x0F), p & 0x7F])))
+    def on(self, tr, ch, n, v, d=0): self.tracks[tr].append((d, bytes([0x90 | (ch & 0x0F), n & 0x7F, v & 0x7F])))
+    def off(self, tr, ch, n, d=0): self.tracks[tr].append((d, bytes([0x80 | (ch & 0x0F), n & 0x7F, 0])))
+    def eot(self, tr, d=0): self.tracks[tr].append((d, self.meta(0x2F)))
+    def save(self, path):
+        with open(path, "wb") as f:
+            f.write(b"MThd" + struct.pack(">IHHH", 6, 1, len(self.tracks), self.tpq))
+            for ev in self.tracks:
+                td = b""; at = 0
+                for d, m in ev:
+                    at += d
+                    td += self._vlq(d) + m
+                f.write(b"MTrk" + struct.pack(">I", len(td)) + td)
+    @classmethod
+    def from_notes(cls, notes, path):
+        if not notes: return None
+        w = cls(); t = w.add()
+        w.tempo(t); w.pc(t, 0, 58)
+        bps = 120 / 60.0; tps = 480 * bps; lt = 0
+        for st, du, n, v in sorted(notes, key=lambda x: x[0]):
+            stt = int(st * tps); dut = max(1, int(du * tps))
+            w.on(t, 0, n, v, stt - lt); w.off(t, 0, n, dut)
+            lt = stt + dut
+        w.eot(t, 0); w.save(path); return path
+
+def freq2midi(f): return int(np.clip(69 + 12 * np.log2(f / 440), 20, 108))
+
+def notes_from_pitch(pitches):
+    notes = []; cur_note = None; cur_start = 0.0
+    for i, (t, f) in enumerate(pitches):
+        if f is None or f < 40:
+            if cur_note is not None:
+                notes.append((cur_start, t - cur_start, cur_note, 80)); cur_note = None
+            continue
+        note = freq2midi(f)
+        if cur_note is None or abs(note - cur_note) >= 2:
+            if cur_note is not None:
+                notes.append((cur_start, t - cur_start, cur_note, 80))
+            cur_note = note; cur_start = t
+    if cur_note is not None and len(pitches) > 0:
+        notes.append((cur_start, pitches[-1][0] - cur_start, cur_note, 80))
+    merged = []
+    for n in notes:
+        if n[1] < 0.05: continue
+        if merged and abs(n[0] - (merged[-1][0] + merged[-1][1])) < 0.03 and n[2] == merged[-1][2]:
+            merged[-1] = (merged[-1][0], merged[-1][1] + n[1], n[2], max(merged[-1][3], n[3]))
+        else: merged.append(n)
+    return merged
+
+def analyze_audio(path):
+    y, sr = Wav.read(path)
+    duration = len(y) / sr
+    audio_hash = hashlib.sha256(open(path, "rb").read()).digest()
+    ah_hex = audio_hash.hex()
+    yin = YIN(sr)
+    pitches = yin.detect(y)
+    notes = notes_from_pitch(pitches)
+    midi_path = UPLOADS / f"{ah_hex[:16]}.mid"
+    SMF.from_notes(notes, midi_path)
+    fs = int(hashlib.sha256(ah_hex.encode()).hexdigest(), 16) % 101
+    priv, pub = solana_kp(audio_hash)
+    report = {
+        "audio_hash": ah_hex, "duration_sec": round(duration, 3), "sample_rate": sr,
+        "frame_count": len(pitches), "note_count": len(notes),
+        "notes": [{"start": round(s,3), "dur": round(d,3), "note": n, "vel": v} for s,d,n,v in notes[:20]],
+        "midi_file": str(midi_path.name), "fartscore": fs,
+        "solana_private": priv, "solana_public": pub,
+    }
+    with sqlite3.connect(DB) as c:
+        c.execute("INSERT OR REPLACE INTO farts VALUES (?,?,?,?,?,?,?,?,?,?)", (
+            ah_hex[:16], datetime.now(timezone.utc).isoformat(), ah_hex,
+            duration, len(notes), str(midi_path), priv, pub, fs, json.dumps(report)
+        ))
+        c.commit()
+    return report
+
+def generate_mock_wav(path, seed=42):
+    np.random.seed(seed)
+    sr = 16000
+    notes_hz = [261.63, 329.63, 392.00, 523.25, 440.00, 349.23, 293.66]
+    np.random.shuffle(notes_hz)
+    segments = []
+    for hz in notes_hz[:4]:
+        dur = np.random.uniform(0.3, 0.7)
+        t = np.linspace(0, dur, int(sr * dur), endpoint=False)
+        seg = np.sin(2 * np.pi * hz * t) * 0.5
+        seg += np.sin(2 * np.pi * hz * 2 * t) * 0.15
+        seg += np.sin(2 * np.pi * hz * 3 * t) * 0.08
+        seg += np.random.normal(0, 0.03, len(t))
+        env = np.ones_like(t)
+        fade = int(sr * 0.02)
+        env[:fade] = np.linspace(0, 1, fade)
+        env[-fade:] = np.linspace(1, 0, fade)
+        segments.append(seg * env)
+    gap = np.zeros(int(sr * 0.1))
+    full = []
+    for seg in segments:
+        full.extend(seg); full.extend(gap)
+    samples = np.array(full[:sr * 5], dtype=np.float32)
+    Wav.write(path, samples, sr)
+    return path
+
+app = FastAPI(title="AFIP", version="3.0")
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+@app.get("/")
+def root(): return FileResponse("static/index.html")
+
+@app.post("/api/analyze")
+async def analyze(file: UploadFile = File(...)):
+    if not file.filename.endswith(".wav"): raise HTTPException(400, "Only .wav")
+    tmp = UPLOADS / f"tmp_{int(time.time()*1000)}.wav"
+    with open(tmp, "wb") as f: f.write(await file.read())
+    try: return JSONResponse(analyze_audio(tmp))
+    finally: tmp.unlink(missing_ok=True)
+
+@app.post("/api/mock")
+async def mock():
+    seed = int(time.time() * 1000) % 0xFFFFFFFF
+    tmp = UPLOADS / f"mock_{seed}.wav"
+    generate_mock_wav(tmp, seed)
+    try: return JSONResponse(analyze_audio(tmp))
+    finally: tmp.unlink(missing_ok=True)
+
+@app.get("/api/midi/{file_id}")
+def get_midi(file_id: str):
+    p = UPLOADS / f"{file_id}.mid"
+    if not p.exists(): raise HTTPException(404, "MIDI not found")
+    return FileResponse(p, media_type="audio/midi", filename=f"{file_id}.mid")
+
+@app.get("/api/history")
+def history(limit: int = 20):
+    with sqlite3.connect(DB) as c:
+        c.row_factory = sqlite3.Row
+        rows = c.execute("SELECT * FROM farts ORDER BY created DESC LIMIT ?", (limit,)).fetchall()
+        return JSONResponse([dict(r) for r in rows])
+
+@app.get("/api/leaderboard")
+def leaderboard():
+    with sqlite3.connect(DB) as c:
+        c.row_factory = sqlite3.Row
+        rows = c.execute("SELECT id, created, fartscore, solana_pub FROM farts ORDER BY fartscore DESC LIMIT 10").fetchall()
+        return JSONResponse([dict(r) for r in rows])
+
+@app.get("/api/wallet/{pubkey}")
+def wallet_info(pubkey: str):
+    with sqlite3.connect(DB) as c:
+        c.row_factory = sqlite3.Row
+        row = c.execute("SELECT * FROM farts WHERE solana_pub = ?", (pubkey,)).fetchone()
+        if not row: raise HTTPException(404, "Wallet not found")
+        return JSONResponse(dict(row))
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "7860")))
+
+```
+
+index.html:
+```
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AFIP — Acoustic Flatulence Intelligence Platform</title>
+<style>
+  :root { --bg: #0a0a0f; --surface: #14141a; --border: #2a2a35; --text: #e2e2e8; --text-muted: #888898; --accent: #3b82f6; --success: #22c55e; --warn: #eab308; }
+  * { box-sizing: border-box; margin: 0; }
+  body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; padding: 40px 24px; }
+  .container { max-width: 720px; margin: 0 auto; }
+  header { text-align: center; margin-bottom: 40px; }
+  h1 { font-size: 2rem; margin-bottom: 8px; }
+  p { color: var(--text-muted); }
+  .actions { display: flex; gap: 12px; justify-content: center; margin-bottom: 32px; flex-wrap: wrap; }
+  button {
+    background: linear-gradient(135deg, var(--accent), #8b5cf6); color: #fff; border: none;
+    padding: 12px 28px; border-radius: 10px; font-size: 1rem; cursor: pointer; transition: transform 0.15s;
+  }
+  button:hover { transform: translateY(-2px); }
+  button.secondary { background: var(--surface); border: 1px solid var(--border); color: var(--text); }
+  .dropzone {
+    border: 2px dashed var(--border); border-radius: 12px; padding: 48px 24px;
+    text-align: center; background: var(--surface); cursor: pointer; transition: border-color 0.2s;
+  }
+  .dropzone:hover, .dropzone.dragover { border-color: var(--accent); }
+  .dropzone input { display: none; }
+  .result { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin-top: 24px; display: none; }
+  .result.show { display: block; }
+  .result h3 { margin-bottom: 12px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .kv { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 0.9rem; }
+  .kv .key { color: var(--text-muted); }
+  .badge { background: rgba(34,197,94,0.15); color: var(--success); padding: 2px 10px; border-radius: 999px; font-size: 0.75rem; }
+  .notes { max-height: 200px; overflow-y: auto; font-family: ui-monospace, monospace; font-size: 0.82rem; margin-top: 12px; }
+  .note-row { padding: 4px 0; border-bottom: 1px solid var(--border); display: flex; gap: 12px; }
+  .note-row span { color: var(--text-muted); }
+  .loading { text-align: center; color: var(--text-muted); margin-top: 20px; display: none; }
+  .leaderboard { margin-top: 32px; }
+  .leaderboard h3 { margin-bottom: 12px; }
+  .lb-row { display: flex; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid var(--border); font-size: 0.9rem; }
+  .lb-row .score { color: var(--success); font-weight: 600; }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>💨 AFIP</h1>
+    <p>Acoustic Flatulence Intelligence Platform v3.0<br>Upload a .wav — get a FartScore, MIDI, and Solana wallet.</p>
+  </header>
+
+  <div class="actions">
+    <button onclick="document.getElementById('fileInput').click()">📁 Upload WAV</button>
+    <button class="secondary" onclick="runMock()">🎲 Generate Mock</button>
+    <button class="secondary" onclick="loadLeaderboard()">🏆 Leaderboard</button>
+  </div>
+
+  <div class="dropzone" id="dropzone" onclick="document.getElementById('fileInput').click()">
+    <input type="file" id="fileInput" accept=".wav" onchange="handleFile(this.files[0])">
+    <div style="font-size: 3rem; margin-bottom: 8px;">🎵</div>
+    <h3>Drop a WAV file</h3>
+    <p style="color: var(--text-muted);">or click to browse</p>
+  </div>
+
+  <div class="loading" id="loading">Analyzing...</div>
+
+  <div class="result" id="result">
+    <h3>Analysis Result <span class="badge" id="scoreBadge">FartScore: 0</span></h3>
+    <div class="grid" id="grid"></div>
+    <div class="notes" id="notes"></div>
+    <div style="margin-top: 12px;">
+      <a id="midiLink" href="#" style="color: var(--accent); text-decoration: none;">⬇ Download MIDI</a>
+    </div>
+  </div>
+
+  <div class="leaderboard" id="leaderboard" style="display:none;">
+    <h3>🏆 Leaderboard</h3>
+    <div id="lbList"></div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+async function handleFile(file) {
+  if (!file) return;
+  $('loading').style.display = 'block';
+  $('result').classList.remove('show');
+  const fd = new FormData();
+  fd.append('file', file);
+  try {
+    const r = await fetch('/api/analyze', { method: 'POST', body: fd });
+    const data = await r.json();
+    showResult(data);
+  } catch (e) { alert('Error: ' + e.message); }
+  $('loading').style.display = 'none';
+}
+
+async function runMock() {
+  $('loading').style.display = 'block';
+  $('result').classList.remove('show');
+  try {
+    const r = await fetch('/api/mock', { method: 'POST' });
+    const data = await r.json();
+    showResult(data);
+  } catch (e) { alert('Error: ' + e.message); }
+  $('loading').style.display = 'none';
+}
+
+function showResult(data) {
+  $('scoreBadge').textContent = 'FartScore: ' + data.fartscore;
+  $('grid').innerHTML = `
+    <div class="kv"><span class="key">Duration</span><span>${data.duration_sec}s</span></div>
+    <div class="kv"><span class="key">Sample Rate</span><span>${data.sample_rate} Hz</span></div>
+    <div class="kv"><span class="key">Frames</span><span>${data.frame_count}</span></div>
+    <div class="kv"><span class="key">Notes</span><span>${data.note_count}</span></div>
+    <div class="kv"><span class="key">Solana Pub</span><span style="font-size:0.78rem;">${data.solana_public.substring(0,24)}...</span></div>
+    <div class="kv"><span class="key">Audio Hash</span><span style="font-size:0.78rem;">${data.audio_hash.substring(0,24)}...</span></div>
+  `;
+  $('notes').innerHTML = (data.notes || []).map(n =>
+    `<div class="note-row"><span>${n.start}s</span><span>${n.dur}s</span><span>MIDI ${n.note}</span><span>vel ${n.vel}</span></div>`
+  ).join('');
+  $('midiLink').href = '/api/midi/' + data.audio_hash.substring(0,16);
+  $('result').classList.add('show');
+}
+
+async function loadLeaderboard() {
+  try {
+    const r = await fetch('/api/leaderboard');
+    const data = await r.json();
+    $('lbList').innerHTML = data.map((row, i) =>
+      `<div class="lb-row"><span>#${i+1} ${row.id}</span><span class="score">${row.fartscore}</span></div>`
+    ).join('');
+    $('leaderboard').style.display = 'block';
+  } catch (e) { console.error(e); }
+}
+
+const dz = $('dropzone');
+dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('dragover'); });
+dz.addEventListener('dragleave', () => dz.classList.remove('dragover'));
+dz.addEventListener('drop', e => {
+  e.preventDefault(); dz.classList.remove('dragover');
+  const f = e.dataTransfer.files[0];
+  if (f && f.name.endsWith('.wav')) handleFile(f);
+});
+</script>
+</body>
+</html>
+
+```

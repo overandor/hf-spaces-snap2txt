@@ -1,0 +1,246 @@
+Project Structure:
+Dockerfile
+README.md
+.gitattributes
+app.py
+docs/TERMINAL_DEPLOYMENT.md
+scripts/curl_test_ollama.sh
+scripts/expose_with_cloudflared.sh
+scripts/run_local_ollama.sh
+
+File Contents:
+Dockerfile:
+```
+FROM python:3.11-slim
+WORKDIR /app
+COPY app.py /app/app.py
+RUN pip install --no-cache-dir fastapi==0.115.6 uvicorn[standard]==0.34.0 httpx==0.28.1
+ENV PORT=7860
+EXPOSE 7860
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7860"]
+
+```
+
+README.md:
+```
+---
+title: Continuity Code Camera Relay
+emoji: 🎥
+colorFrom: indigo
+colorTo: green
+sdk: docker
+pinned: false
+---
+
+# Continuity Code Camera Relay
+
+Public Hugging Face relay/card for a local Ollama-backed Code Camera Engine.
+
+```
+
+.gitattributes:
+```
+*.7z filter=lfs diff=lfs merge=lfs -text
+*.arrow filter=lfs diff=lfs merge=lfs -text
+*.bin filter=lfs diff=lfs merge=lfs -text
+*.bz2 filter=lfs diff=lfs merge=lfs -text
+*.ckpt filter=lfs diff=lfs merge=lfs -text
+*.ftz filter=lfs diff=lfs merge=lfs -text
+*.gz filter=lfs diff=lfs merge=lfs -text
+*.h5 filter=lfs diff=lfs merge=lfs -text
+*.joblib filter=lfs diff=lfs merge=lfs -text
+*.lfs.* filter=lfs diff=lfs merge=lfs -text
+*.mlmodel filter=lfs diff=lfs merge=lfs -text
+*.model filter=lfs diff=lfs merge=lfs -text
+*.msgpack filter=lfs diff=lfs merge=lfs -text
+*.npy filter=lfs diff=lfs merge=lfs -text
+*.npz filter=lfs diff=lfs merge=lfs -text
+*.onnx filter=lfs diff=lfs merge=lfs -text
+*.ot filter=lfs diff=lfs merge=lfs -text
+*.parquet filter=lfs diff=lfs merge=lfs -text
+*.pb filter=lfs diff=lfs merge=lfs -text
+*.pickle filter=lfs diff=lfs merge=lfs -text
+*.pkl filter=lfs diff=lfs merge=lfs -text
+*.pt filter=lfs diff=lfs merge=lfs -text
+*.pth filter=lfs diff=lfs merge=lfs -text
+*.rar filter=lfs diff=lfs merge=lfs -text
+*.safetensors filter=lfs diff=lfs merge=lfs -text
+saved_model/**/* filter=lfs diff=lfs merge=lfs -text
+*.tar.* filter=lfs diff=lfs merge=lfs -text
+*.tar filter=lfs diff=lfs merge=lfs -text
+*.tflite filter=lfs diff=lfs merge=lfs -text
+*.tgz filter=lfs diff=lfs merge=lfs -text
+*.wasm filter=lfs diff=lfs merge=lfs -text
+*.xz filter=lfs diff=lfs merge=lfs -text
+*.zip filter=lfs diff=lfs merge=lfs -text
+*.zst filter=lfs diff=lfs merge=lfs -text
+*tfevents* filter=lfs diff=lfs merge=lfs -text
+
+```
+
+app.py:
+```
+
+import os
+import httpx
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse
+
+app = FastAPI(title="Continuity Code Camera Relay")
+LOCAL_ENGINE_URL = os.getenv("LOCAL_ENGINE_URL", "").rstrip("/")
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    target = LOCAL_ENGINE_URL or "SET_LOCAL_ENGINE_URL_SECRET"
+    return f"""<!doctype html>
+<html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Continuity Code Camera Relay</title></head>
+<body style="font-family:system-ui;background:#070910;color:#fff;padding:20px">
+<h1>Continuity Code Camera Relay</h1>
+<p>This Space relays to your local Ollama-backed live engine.</p>
+<p><b>Target:</b> {target}</p>
+<p>Open the local/tunnel target directly for camera permissions and lowest latency:</p>
+<p><a style="color:#82aaff" href="{target}">{target}</a></p>
+</body></html>"""
+
+@app.get("/health")
+async def health():
+    if not LOCAL_ENGINE_URL:
+        return {"ok": False, "reason": "LOCAL_ENGINE_URL not set"}
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.get(f"{LOCAL_ENGINE_URL}/health")
+        return {"ok": True, "relay_target": LOCAL_ENGINE_URL, "engine": r.json()}
+
+@app.api_route("/proxy/{path:path}", methods=["GET","POST","PUT","DELETE","PATCH"])
+async def proxy(path: str, request: Request):
+    if not LOCAL_ENGINE_URL:
+        return JSONResponse({"ok": False, "reason": "LOCAL_ENGINE_URL not set"}, status_code=500)
+    body = await request.body()
+    headers = {k:v for k,v in request.headers.items() if k.lower() not in {"host","content-length"}}
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.request(request.method, f"{LOCAL_ENGINE_URL}/{path}", content=body, headers=headers, params=request.query_params)
+        ct = r.headers.get("content-type","")
+        if "application/json" in ct:
+            return JSONResponse(r.json(), status_code=r.status_code)
+        return JSONResponse({"text": r.text}, status_code=r.status_code)
+
+```
+
+TERMINAL_DEPLOYMENT.md:
+```
+# Terminal + Ollama + Hugging Face Exposure Deployment
+
+## Target topology
+
+```text
+iPhone / laptop browser
+→ camera/mic permission
+→ live camera engine page
+→ WebSocket now / WebRTC next
+→ local FastAPI engine
+→ local Ollama vision model
+→ generated code stream
+→ optional Hugging Face public relay/demo
+```
+
+## Terminal sequence
+
+From the `live-code-camera-engine` project root:
+
+```bash
+bash scripts/run_local_ollama.sh
+```
+
+Second terminal:
+
+```bash
+bash scripts/expose_with_cloudflared.sh
+```
+
+Open the printed HTTPS tunnel URL on iPhone.
+
+## Hugging Face exposure
+
+Create a Docker Space and upload `hf_space/`.
+
+Set Space secret:
+
+```text
+LOCAL_ENGINE_URL=https://your-cloudflared-url.trycloudflare.com
+```
+
+The Space becomes a public continuity card pointing to your local engine.
+
+## Why not expose Ollama directly?
+
+Ollama is a local model server. If you expose `localhost:11434` publicly without auth, anyone with the URL may hit your local model worker. Expose the application layer instead, then add auth, receipts, rate limits, and CORS controls.
+
+## WebRTC upgrade path
+
+The current engine uses sampled JPEG frames over WebSocket. That is easier to deploy and debug. For true WebRTC:
+
+1. Add FastRTC or aiortc.
+2. Keep the same evidence compressor.
+3. Replace `/ws/live-code` frame messages with a WebRTC media track handler.
+4. Preserve the same receipts and Ollama call boundary.
+
+```
+
+curl_test_ollama.sh:
+```
+#!/usr/bin/env bash
+set -euo pipefail
+
+curl -s http://localhost:11434/api/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"llama3.2-vision","prompt":"Return JSON: {ok:true, role:\"local vision worker\"}","stream":false}' | python3 -m json.tool
+
+```
+
+expose_with_cloudflared.sh:
+```
+#!/usr/bin/env bash
+set -euo pipefail
+
+if ! command -v cloudflared >/dev/null 2>&1; then
+  echo "cloudflared is not installed."
+  echo "macOS: brew install cloudflared"
+  exit 1
+fi
+
+echo "Starting temporary public HTTPS tunnel to local engine..."
+echo "Keep this terminal open. Open the generated https:// URL on iPhone or put it in HF Space as LOCAL_ENGINE_URL."
+cloudflared tunnel --url http://localhost:8000
+
+```
+
+run_local_ollama.sh:
+```
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "[1/5] Checking Ollama..."
+if ! command -v ollama >/dev/null 2>&1; then
+  echo "Ollama is not installed. Install it from https://ollama.com first."
+  exit 1
+fi
+
+echo "[2/5] Pulling local vision model..."
+ollama pull llama3.2-vision || ollama pull llava
+
+echo "[3/5] Creating venv..."
+python3 -m venv .venv
+source .venv/bin/activate
+
+echo "[4/5] Installing backend dependencies..."
+pip install --upgrade pip
+pip install fastapi==0.115.6 'uvicorn[standard]'==0.34.0 python-multipart==0.0.20 pillow==11.1.0 requests==2.32.3 openai==1.59.7 numpy==2.2.1
+
+echo "[5/5] Starting local live engine..."
+export PROVIDER=ollama
+export OLLAMA_MODEL="${OLLAMA_MODEL:-llama3.2-vision}"
+export OLLAMA_HOST="${OLLAMA_HOST:-http://localhost:11434}"
+
+echo "Open: http://localhost:8000"
+uvicorn backend.main:app --host 0.0.0.0 --port 8000
+
+```

@@ -1,0 +1,3120 @@
+Project Structure:
+requirements.txt
+alembic.ini
+Dockerfile
+README.md
+requirements-minimal.txt
+.gitignore
+.gitattributes
+requirements-sqlite.txt
+docker-compose.yml
+app/__init__.py
+app/main.py
+app/core/config.py
+app/core/security.py
+app/core/google_config.py
+app/models/user.py
+app/models/__init__.py
+app/models/chat.py
+app/schemas/user.py
+app/schemas/__init__.py
+app/schemas/chat.py
+app/db/base.py
+app/api/auth.py
+app/api/deps.py
+app/api/__init__.py
+app/api/google.py
+app/api/chats.py
+app/services/file_to_chat.py
+app/services/normalizer.py
+static/index.html
+alembic/script.py.mako
+alembic/env.py
+alembic/versions/.gitkeep
+
+File Contents:
+requirements.txt:
+```
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+python-multipart==0.0.6
+sqlalchemy==2.0.25
+alembic==1.13.1
+psycopg2-binary==2.9.9
+pydantic==2.5.3
+pydantic-settings==2.1.0
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+python-dotenv==1.0.0
+slowapi==0.1.9
+redis==5.0.1
+structlog==24.1.0
+aiofiles==23.2.1
+httpx==0.26.0
+
+```
+
+alembic.ini:
+```
+# A generic, single database configuration.
+
+[alembic]
+# path to migration scripts
+script_location = alembic
+
+# template used to generate migration file names; The default value is %%(rev)s_%%(slug)s
+file_template = %%(year)d%%(month).2d%%(day).2d_%%(hour).2d%%(minute).2d_%%(rev)s_%%(slug)s
+
+# sys.path path, will be prepended to sys.path if present.
+prepend_sys_path = .
+
+# timezone to use when rendering the date within the migration file
+# as well as the filename.
+# If specified, requires the python>=3.9.
+# or python-dateutil installed (if python < 3.9).
+# timezone =
+
+# max length of characters to apply to the
+# "slug" field
+# truncate_slug_length = 40
+
+# set to 'true' to run the environment during
+# the 'revision' command, regardless of autogenerate
+# revision_environment = false
+
+# set to 'true' to allow .pyc and .pyo files without
+# a source .py file to be detected as revisions in the
+# versions/ directory
+# sourceless = false
+
+# version location specification; This defaults
+# to alembic/versions.  When using multiple version
+# directories, initial revisions must be specified with --version-path.
+# The path separator used here should be the separator specified by "version_path_separator" below.
+# version_locations = %(here)s/bar:%(here)s/bat:alembic/versions
+
+# version path separator; As mentioned above, this is the character used to split
+# version_locations. The default within new alembic.ini files is "os", which uses os.pathsep.
+# If this key is omitted entirely, it falls back to the legacy behavior of splitting on spaces and/or commas.
+# Valid values for version_path_separator are:
+#
+# version_path_separator = :
+# version_path_separator = ;
+# version_path_separator = space
+version_path_separator = os  # Use os.pathsep. Default configuration used for new projects.
+
+# set to 'true' to search source files recursively
+# in each "version_locations" directory
+# new in Alembic version 1.10
+# recursive_version_locations = false
+
+# the output encoding used when revision files
+# are written from script.py.mako
+# output_encoding = utf-8
+
+sqlalchemy.url = postgresql://chat_provenance:chat_provenance_password@localhost:5432/chat_provenance
+
+
+[post_write_hooks]
+# post_write_hooks defines scripts or Python functions that are run
+# on newly generated revision scripts.  See the documentation for further
+# detail and examples
+
+# Logging configuration
+[loggers]
+keys = root,sqlalchemy,alembic
+
+[handlers]
+keys = console
+
+[formatters]
+keys = generic
+
+[logger_root]
+level = WARN
+handlers = console
+qualname =
+
+[logger_sqlalchemy]
+level = WARN
+handlers =
+qualname = sqlalchemy.engine
+
+[logger_alembic]
+level = INFO
+handlers =
+qualname = alembic
+
+[handler_console]
+class = StreamHandler
+args = (sys.stderr,)
+level = NOTSET
+formatter = generic
+
+[formatter_generic]
+format = %(levelname)-5.5s [%(name)s] %(message)s
+datefmt = %H:%M:%S
+
+```
+
+Dockerfile:
+```
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    postgresql-client \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements
+COPY requirements.txt .
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application
+COPY . .
+
+# Create uploads directory
+RUN mkdir -p uploads
+
+# Expose port
+EXPOSE 7860
+ENV PORT=7860
+
+# Run application
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "7860"]
+
+```
+
+README.md:
+```
+# Chat Provenance API
+
+A user-controlled API for managing ChatGPT conversation exports with public/private publishing controls.
+
+## Architecture
+
+**Flow:** User Export → Upload → Store → API → Public UI
+
+Users explicitly provide their chat data (no scraping). Your API serves only what they own and upload.
+
+## Features
+
+- **User Authentication**: JWT-based auth with access/refresh tokens
+- **Google OAuth Integration**: Connect to ChatGPT using your Google account
+- **ChatGPT Connection**: Direct integration with ChatGPT's authentication system
+- **Browser Extension**: Tampermonkey userscript for real-time ChatGPT integration
+- **Chat Upload**: Upload ChatGPT export files (JSON format)
+- **Chat Normalization**: Auto-detects and normalizes different ChatGPT export formats
+- **Public/Private Control**: Toggle visibility of your chats
+- **Role-Based Messages**: Preserves user vs assistant message structure
+- **Model Tracking**: Captures which GPT model was used
+- **Web UI**: Modern interface to view and manage chats
+- **Real-time Status**: Live ChatGPT connection status in the UI
+
+## Quick Start
+
+### Backend (Python/FastAPI)
+
+```bash
+# Clone or navigate to the directory
+cd chat-provenance-api
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Set up environment
+cp .env.example .env
+# Edit .env with your settings
+
+# Start with Docker (recommended)
+docker-compose up -d
+
+# Or start manually
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+### Web UI
+
+Once the backend is running:
+- Open http://localhost:8000 in your browser
+- The web UI will load automatically
+- Register or login to access your chats
+- **Connect to ChatGPT** using the "Sign in with Google" button
+- Install the browser extension to enable real-time chat export
+- Browse your chats and public conversations
+
+### Google OAuth Integration
+
+The system integrates with ChatGPT's Google OAuth authentication:
+
+1. **Login Screen**: Click "Sign in with Google" to connect to ChatGPT
+2. **ChatGPT Window**: Opens ChatGPT in a popup for Google OAuth
+3. **Browser Extension**: Install the GPT Bridge extension to detect your ChatGPT login
+4. **Real-time Status**: The UI shows your ChatGPT connection status
+5. **Chat Export**: Use the extension to export chats directly from ChatGPT
+
+**Note**: You must have a ChatGPT subscription to use this system. The system does not scrape ChatGPT - it only serves data you explicitly export.
+
+### Browser Extension (Tampermonkey)
+
+1. Install [Tampermonkey](https://www.tampermonkey.net/) for your browser
+2. Open `gptbridge-provenance.user.js`
+3. Copy the entire script
+4. In Tampermonkey, create a new script and paste
+5. Save
+
+The extension will run on `chat.openai.com` and `chatgpt.com`.
+
+## Usage
+
+### Accessing the Web UI
+
+1. Start the backend server:
+```bash
+cd chat-provenance-api
+docker-compose up -d
+```
+
+2. Open your browser and navigate to:
+   - http://localhost:8000 (auto-redirects to UI)
+   - or http://localhost:8000/static/index.html
+
+3. Register a new account or login
+
+4. Use the browser extension to export chats from ChatGPT
+
+5. View your chats in the web UI
+
+### 1. Register User
+
+```bash
+curl -X POST http://localhost:8000/api/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"email": "user@example.com", "password": "securepassword"}'
+```
+
+### 2. Login
+
+```bash
+curl -X POST http://localhost:8000/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email": "user@example.com", "password": "securepassword"}'
+```
+
+Response:
+```json
+{
+  "access_token": "eyJ...",
+  "refresh_token": "eyJ...",
+  "token_type": "bearer"
+}
+```
+
+### 3. Upload Chat (via Extension)
+
+1. Log in to ChatGPT
+2. Click the GPT Bridge floating button (bottom-right)
+3. Enter your API credentials
+4. Click "Export Current Chat"
+5. Toggle "Make public" if desired
+6. Click "Publish"
+
+### 4. API Endpoints
+
+#### Authentication
+- `POST /api/auth/register` - Register new user
+- `POST /api/auth/login` - Login and get tokens
+- `POST /api/auth/refresh` - Refresh access token
+- `GET /api/auth/me` - Get current user info
+
+#### Chats
+- `POST /api/chats/upload` - Upload chat (requires file)
+- `GET /api/chats` - List your chats (authenticated)
+- `GET /api/chats/public` - List public chats (public)
+- `GET /api/chats/{id}` - Get specific chat
+- `POST /api/chats/{id}/publish` - Toggle public/private
+- `DELETE /api/chats/{id}` - Delete chat
+
+#### System
+- `GET /` - API info
+- `GET /health` - Health check
+- `GET /docs` - Interactive API documentation (Swagger)
+
+## ChatGPT Export Formats
+
+The system auto-detects and normalizes multiple formats:
+
+### GPT Bridge Extension Format (Recommended)
+```json
+{
+  "title": "Chat Title",
+  "model": "GPT-4",
+  "messages": [
+    {"role": "user", "content": "Hello", "timestamp": "2024-01-01T00:00:00Z"},
+    {"role": "assistant", "content": "Hi there!", "timestamp": "2024-01-01T00:00:01Z"}
+  ],
+  "message_count": 2,
+  "timestamp": "2024-01-01T00:00:00Z",
+  "source": "gptbridge-extension"
+}
+```
+
+### ChatGPT Export Format
+```json
+{
+  "mapping": {
+    "node_id": {
+      "message": {
+        "author": {"role": "user"},
+        "content": {
+          "parts": ["text"]
+        }
+      }
+    }
+  }
+}
+```
+
+### Generic Format
+```json
+[
+  {"role": "user", "content": "text"},
+  {"role": "assistant", "content": "text"}
+]
+```
+
+## Browser Extension Features
+
+- **Multi-method extraction**: React Fiber, DOM parsing, fallback methods
+- **Role detection**: User vs assistant identification
+- **Model tracking**: Captures which GPT model was used
+- **Title extraction**: Multiple methods for accurate titles
+- **Timestamp tracking**: When messages were sent
+- **Code block handling**: Preserves code formatting
+- **Real-time updates**: Detects chat changes automatically
+
+## Security
+
+- **User ownership**: JWT authentication required for uploads
+- **Rate limiting**: 100 req/min general, 10 req/min uploads
+- **File size limits**: 50MB max upload
+- **Input validation**: Pydantic schemas
+- **SQL injection prevention**: SQLAlchemy ORM
+- **CORS**: Configurable origins
+
+## Configuration
+
+Environment variables in `.env`:
+
+```bash
+# Database
+DATABASE_URL=postgresql://user:password@localhost:5432/chat_provenance
+REDIS_URL=redis://localhost:6379/0
+
+# Security
+SECRET_KEY=your-secret-key-change-in-production
+JWT_ALGORITHM=HS256
+JWT_ACCESS_TOKEN_EXPIRE_MINUTES=30
+JWT_REFRESH_TOKEN_EXPIRE_DAYS=30
+
+# Rate Limiting
+RATE_LIMIT_PER_MINUTE=100
+UPLOAD_RATE_LIMIT_PER_MINUTE=10
+
+# File Upload
+MAX_UPLOAD_SIZE_MB=50
+ALLOWED_EXTENSIONS=json
+
+# CORS
+CORS_ORIGINS=["http://localhost:3000","http://localhost:8080"]
+```
+
+## Browser Extension Features
+
+- **ChatGPT auth detection**: Uses existing ChatGPT login
+- **Floating UI**: Non-intrusive overlay
+- **Chat extraction**: Auto-extracts current conversation
+- **API integration**: Direct upload to your backend
+- **Publish controls**: Toggle public/private
+- **Chat browsing**: View your chats and public chats
+
+## Project Structure
+
+```
+chat-provenance-api/
+├── app/
+│   ├── api/
+│   │   ├── auth.py          # Authentication endpoints
+│   │   ├── chats.py         # Chat management endpoints
+│   │   └── deps.py          # Dependencies (auth)
+│   ├── core/
+│   │   ├── config.py        # Settings
+│   │   └── security.py      # JWT, password hashing
+│   ├── db/
+│   │   └── base.py          # Database connection
+│   ├── models/
+│   │   ├── user.py          # User model
+│   │   └── chat.py          # Chat model
+│   ├── schemas/
+│   │   ├── user.py          # User schemas
+│   │   └── chat.py          # Chat schemas
+│   ├── services/
+│   │   └── normalizer.py    # Chat normalization
+│   └── main.py              # FastAPI app
+├── docker-compose.yml       # Docker orchestration
+├── Dockerfile               # Container build
+├── requirements.txt         # Python dependencies
+├── .env.example             # Environment template
+└── gptbridge-provenance.user.js  # Browser extension
+```
+
+## Advanced Features (Future)
+
+1. **Semantic indexing**: Embed messages for semantic search
+2. **Monetization**: Lock messages behind paywall
+3. **Identity (KYI)**: Attach chat to verified user
+4. **Version control**: Track chat edits
+5. **Analytics**: View counts, engagement metrics
+
+## Deployment
+
+### Docker (Recommended)
+
+```bash
+docker-compose up -d
+```
+
+### Manual
+
+```bash
+# Start PostgreSQL
+# Start Redis
+# Run migrations (when implemented)
+# Start API
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+### Production Considerations
+
+- Change `SECRET_KEY` in production
+- Enable HTTPS
+- Use environment variables for secrets
+- Set up database backups
+- Configure monitoring
+- Use production-grade PostgreSQL/Redis
+
+## License
+
+MIT
+
+## Philosophy
+
+**Do NOT scrape directly from ChatGPT servers**
+**DO let users upload/export**
+**Serve via your own API**
+
+This ensures:
+- User consent and control
+- Legal compliance
+- Data ownership clarity
+- Scalable architecture
+
+```
+
+requirements-minimal.txt:
+```
+fastapi==0.109.0
+uvicorn==0.27.0
+python-multipart==0.0.6
+sqlalchemy==2.0.25
+pydantic==2.5.3
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+python-dotenv==1.0.0
+aiofiles==23.2.1
+google-auth-oauthlib==1.2.0
+google-api-python-client==2.108.0
+google-auth-httplib2==0.2.0
+
+
+```
+
+.gitignore:
+```
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Environment
+.env
+
+# Database
+*.db
+*.sqlite
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+```
+
+.gitattributes:
+```
+*.7z filter=lfs diff=lfs merge=lfs -text
+*.arrow filter=lfs diff=lfs merge=lfs -text
+*.bin filter=lfs diff=lfs merge=lfs -text
+*.bz2 filter=lfs diff=lfs merge=lfs -text
+*.ckpt filter=lfs diff=lfs merge=lfs -text
+*.ftz filter=lfs diff=lfs merge=lfs -text
+*.gz filter=lfs diff=lfs merge=lfs -text
+*.h5 filter=lfs diff=lfs merge=lfs -text
+*.joblib filter=lfs diff=lfs merge=lfs -text
+*.lfs.* filter=lfs diff=lfs merge=lfs -text
+*.mlmodel filter=lfs diff=lfs merge=lfs -text
+*.model filter=lfs diff=lfs merge=lfs -text
+*.msgpack filter=lfs diff=lfs merge=lfs -text
+*.npy filter=lfs diff=lfs merge=lfs -text
+*.npz filter=lfs diff=lfs merge=lfs -text
+*.onnx filter=lfs diff=lfs merge=lfs -text
+*.ot filter=lfs diff=lfs merge=lfs -text
+*.parquet filter=lfs diff=lfs merge=lfs -text
+*.pb filter=lfs diff=lfs merge=lfs -text
+*.pickle filter=lfs diff=lfs merge=lfs -text
+*.pkl filter=lfs diff=lfs merge=lfs -text
+*.pt filter=lfs diff=lfs merge=lfs -text
+*.pth filter=lfs diff=lfs merge=lfs -text
+*.rar filter=lfs diff=lfs merge=lfs -text
+*.safetensors filter=lfs diff=lfs merge=lfs -text
+saved_model/**/* filter=lfs diff=lfs merge=lfs -text
+*.tar.* filter=lfs diff=lfs merge=lfs -text
+*.tar filter=lfs diff=lfs merge=lfs -text
+*.tflite filter=lfs diff=lfs merge=lfs -text
+*.tgz filter=lfs diff=lfs merge=lfs -text
+*.wasm filter=lfs diff=lfs merge=lfs -text
+*.xz filter=lfs diff=lfs merge=lfs -text
+*.zip filter=lfs diff=lfs merge=lfs -text
+*.zst filter=lfs diff=lfs merge=lfs -text
+*tfevents* filter=lfs diff=lfs merge=lfs -text
+
+```
+
+requirements-sqlite.txt:
+```
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+python-multipart==0.0.6
+sqlalchemy==2.0.25
+alembic==1.13.1
+pydantic==2.5.3
+pydantic-settings==2.1.0
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+python-dotenv==1.0.0
+slowapi==0.1.9
+structlog==24.1.0
+aiofiles==23.2.1
+
+```
+
+docker-compose.yml:
+```
+version: '3.8'
+
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://chat_provenance:chat_provenance_password@db:5432/chat_provenance
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=${SECRET_KEY:-dev-secret-key-change-in-production}
+    depends_on:
+      - db
+      - redis
+    volumes:
+      - ./uploads:/app/uploads
+    restart: unless-stopped
+
+  db:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_USER=chat_provenance
+      - POSTGRES_PASSWORD=chat_provenance_password
+      - POSTGRES_DB=chat_provenance
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+
+```
+
+__init__.py:
+```
+
+```
+
+main.py:
+```
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+import os
+
+from app.core.config import settings
+from app.db.base import Base, engine
+from app.api import auth, chats, google
+
+# Create tables
+Base.metadata.create_all(bind=engine)
+
+# Rate limiter (disabled for minimal setup)
+# limiter = Limiter(key_func=get_remote_address)
+app = FastAPI(title="Chat Provenance API", version="1.0.0")
+# app.state.limiter = limiter
+# app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Mount static files for UI
+static_dir = os.path.join(os.path.dirname(__file__), "..", "static")
+if os.path.exists(static_dir):
+    app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
+# Include routers
+app.include_router(auth.router, prefix="/api/auth", tags=["authentication"])
+app.include_router(chats.router, prefix="/api/chats", tags=["chats"])
+app.include_router(google.router, prefix="/api/google", tags=["google-drive"])
+
+
+@app.get("/")
+def root():
+    # Serve the UI if static files exist
+    ui_path = os.path.join(static_dir, "index.html")
+    if os.path.exists(ui_path):
+        return FileResponse(ui_path)
+    return {
+        "message": "Chat Provenance API",
+        "version": "1.0.0",
+        "docs": "/docs",
+        "ui": "/static/index.html"
+    }
+
+
+@app.get("/health")
+def health():
+    return {"status": "healthy"}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+```
+
+config.py:
+```
+from pydantic_settings import BaseSettings
+from typing import List
+import os
+
+
+class Settings(BaseSettings):
+    # Database
+    DATABASE_URL: str = "postgresql://chat_provenance:chat_provenance_password@localhost:5432/chat_provenance"
+    REDIS_URL: str = "redis://localhost:6379/0"
+
+    # Security
+    SECRET_KEY: str = "dev-secret-key-change-in-production"
+    JWT_ALGORITHM: str = "HS256"
+    JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    JWT_REFRESH_TOKEN_EXPIRE_DAYS: int = 30
+
+    # Rate Limiting
+    RATE_LIMIT_PER_MINUTE: int = 100
+    UPLOAD_RATE_LIMIT_PER_MINUTE: int = 10
+
+    # File Upload
+    MAX_UPLOAD_SIZE_MB: int = 50
+    ALLOWED_EXTENSIONS: List[str] = ["json"]
+
+    # CORS
+    CORS_ORIGINS: List[str] = ["http://localhost:3000", "http://localhost:8080"]
+
+    # Optional: Semantic Search
+    ENABLE_SEMANTIC_SEARCH: bool = False
+    OPENAI_API_KEY: str = ""
+
+    class Config:
+        env_file = ".env"
+        case_sensitive = True
+
+
+settings = Settings()
+
+```
+
+security.py:
+```
+from datetime import datetime, timedelta
+from typing import Optional
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from app.core.config import settings
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+
+def get_password_hash(password: str) -> str:
+    return pwd_context.hash(password)
+
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire, "type": "access"})
+    encoded_jwt = jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+    return encoded_jwt
+
+
+def create_refresh_token(data: dict) -> str:
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(days=settings.JWT_REFRESH_TOKEN_EXPIRE_DAYS)
+    to_encode.update({"exp": expire, "type": "refresh"})
+    encoded_jwt = jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+    return encoded_jwt
+
+
+def decode_token(token: str) -> Optional[dict]:
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
+        return payload
+    except JWTError:
+        return None
+
+```
+
+google_config.py:
+```
+import os
+from google_auth_oauthlib.flow import Flow
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+import json
+
+# Google OAuth Configuration
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8003/api/google/callback")
+
+# OAuth Scopes for Google Drive
+SCOPES = [
+    'https://www.googleapis.com/auth/drive.readonly',
+    'https://www.googleapis.com/auth/drive.metadata.readonly'
+]
+
+def get_oauth_flow():
+    """Create OAuth flow for Google authentication"""
+    flow = Flow.from_client_config(
+        client_config={
+            "web": {
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "redirect_uris": [GOOGLE_REDIRECT_URI]
+            }
+        },
+        scopes=SCOPES
+    )
+    flow.redirect_uri = GOOGLE_REDIRECT_URI
+    return flow
+
+def credentials_from_dict(credentials_dict):
+    """Create Credentials object from dictionary"""
+    return Credentials(
+        token=credentials_dict.get('token'),
+        refresh_token=credentials_dict.get('refresh_token'),
+        token_uri=credentials_dict.get('token_uri'),
+        client_id=credentials_dict.get('client_id'),
+        client_secret=credentials_dict.get('client_secret'),
+        scopes=credentials_dict.get('scopes')
+    )
+
+def credentials_to_dict(credentials):
+    """Convert Credentials object to dictionary"""
+    return {
+        'token': credentials.token,
+        'refresh_token': credentials.refresh_token,
+        'token_uri': credentials.token_uri,
+        'client_id': credentials.client_id,
+        'client_secret': credentials.client_secret,
+        'scopes': credentials.scopes
+    }
+
+def get_drive_service(credentials):
+    """Build Google Drive service from credentials"""
+    return build('drive', 'v3', credentials=credentials)
+
+```
+
+user.py:
+```
+from sqlalchemy import Column, String, DateTime, Boolean
+from sqlalchemy.sql import func
+from app.db.base import Base
+import uuid
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    email = Column(String, unique=True, nullable=False, index=True)
+    hashed_password = Column(String, nullable=False)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+```
+
+__init__.py:
+```
+from app.models.user import User
+from app.models.chat import Chat
+
+__all__ = ["User", "Chat"]
+
+```
+
+chat.py:
+```
+from sqlalchemy import Column, String, DateTime, Boolean, Text, JSON, Integer
+from sqlalchemy.sql import func
+from app.db.base import Base
+import uuid
+
+
+class Chat(Base):
+    __tablename__ = "chats"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String, nullable=False, index=True)
+    title = Column(String, nullable=True)
+    model = Column(String, nullable=True)
+    original_data = Column(JSON, nullable=False)
+    normalized_data = Column(JSON, nullable=False)  # Now stores [{role, content}, ...]
+    original_filename = Column(String, nullable=True)  # Source file name for Google Drive imports
+    is_public = Column(Boolean, default=False)
+    message_count = Column(Integer, default=0)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+```
+
+user.py:
+```
+from pydantic import BaseModel, EmailStr
+from typing import Optional
+
+
+class UserCreate(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class UserResponse(BaseModel):
+    id: str
+    email: str
+    is_active: bool
+
+    class Config:
+        from_attributes = True
+
+
+class Token(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+
+```
+
+__init__.py:
+```
+
+```
+
+chat.py:
+```
+from pydantic import BaseModel
+from typing import Optional, List, Any, Dict
+from datetime import datetime
+
+
+class ChatCreate(BaseModel):
+    title: Optional[str] = None
+
+
+class ChatResponse(BaseModel):
+    id: str
+    user_id: str
+    title: Optional[str]
+    model: Optional[str]
+    is_public: bool
+    message_count: int
+    created_at: datetime
+    updated_at: Optional[datetime]
+
+    class Config:
+        from_attributes = True
+
+
+class ChatDetailResponse(ChatResponse):
+    original_data: Any
+    normalized_data: List[Dict[str, Any]]  # Now [{role, content}, ...]
+
+
+class PublishRequest(BaseModel):
+    is_public: bool
+
+```
+
+base.py:
+```
+from sqlalchemy import create_engine
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+import os
+
+# Use SQLite for development if PostgreSQL not available
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./chat_provenance.db")
+
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+Base = declarative_base()
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+```
+
+auth.py:
+```
+from fastapi import APIRouter, Depends, HTTPException, status, Body
+from sqlalchemy.orm import Session
+from app.db.base import get_db
+from app.models.user import User
+from app.schemas.user import UserCreate, UserResponse, Token
+from app.core.security import get_password_hash, verify_password, create_access_token, create_refresh_token, decode_token
+from app.api.deps import get_current_active_user
+
+router = APIRouter()
+
+
+@router.post("/register", response_model=UserResponse)
+def register(user: UserCreate, db: Session = Depends(get_db)):
+    # Check if user exists
+    existing_user = db.query(User).filter(User.email == user.email).first()
+    if existing_user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email already registered"
+        )
+    
+    # Create new user
+    db_user = User(
+        email=user.email,
+        hashed_password=get_password_hash(user.password)
+    )
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+    
+    return db_user
+
+
+@router.post("/login", response_model=Token)
+def login(user: UserCreate, db: Session = Depends(get_db)):
+    # Authenticate user
+    db_user = db.query(User).filter(User.email == user.email).first()
+    if not db_user or not verify_password(user.password, db_user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password"
+        )
+    
+    if not db_user.is_active:
+        raise HTTPException(status_code=400, detail="Inactive user")
+    
+    # Create tokens
+    access_token = create_access_token(data={"sub": db_user.id})
+    refresh_token = create_refresh_token(data={"sub": db_user.id})
+    
+    return Token(access_token=access_token, refresh_token=refresh_token)
+
+
+@router.post("/refresh", response_model=Token)
+def refresh_token(refresh_token: str = Body(..., embed=True), db: Session = Depends(get_db)):
+    payload = decode_token(refresh_token)
+    if payload is None or payload.get("type") != "refresh":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid refresh token"
+        )
+    
+    user_id = payload.get("sub")
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user or not user.is_active:
+        raise HTTPException(status_code=401, detail="Invalid user")
+    
+    # Create new access token
+    access_token = create_access_token(data={"sub": user.id})
+    new_refresh_token = create_refresh_token(data={"sub": user.id})
+    
+    return Token(access_token=access_token, refresh_token=new_refresh_token)
+
+
+@router.get("/me", response_model=UserResponse)
+def get_me(current_user: User = Depends(get_current_active_user)):
+    return current_user
+
+```
+
+deps.py:
+```
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from sqlalchemy.orm import Session
+from app.db.base import get_db
+from app.core.security import decode_token
+from app.models.user import User
+
+security = HTTPBearer()
+
+
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_db)
+) -> User:
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    
+    token = credentials.credentials
+    payload = decode_token(token)
+    
+    if payload is None:
+        raise credentials_exception
+    
+    user_id: str = payload.get("sub")
+    if user_id is None:
+        raise credentials_exception
+    
+    user = db.query(User).filter(User.id == user_id).first()
+    if user is None:
+        raise credentials_exception
+    
+    if not user.is_active:
+        raise HTTPException(status_code=400, detail="Inactive user")
+    
+    return user
+
+
+async def get_current_active_user(
+    current_user: User = Depends(get_current_user)
+) -> User:
+    if not current_user.is_active:
+        raise HTTPException(status_code=400, detail="Inactive user")
+    return current_user
+
+```
+
+__init__.py:
+```
+from . import auth, chats, google
+
+__all__ = ["auth", "chats", "google"]
+```
+
+google.py:
+```
+from fastapi import APIRouter, HTTPException, Depends
+from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
+from typing import List, Optional
+import httpx
+
+from app.core.google_config import (
+    get_oauth_flow,
+    credentials_from_dict,
+    credentials_to_dict,
+    get_drive_service
+)
+from app.api.deps import get_current_user
+from app.db.base import get_db
+from app.models.user import User
+from app.models.chat import Chat
+from app.services.file_to_chat import FileToChatGenerator
+from sqlalchemy.orm import Session
+
+router = APIRouter()
+
+class GoogleCredentials(BaseModel):
+    credentials: dict
+
+class FileSelection(BaseModel):
+    file_ids: List[str]
+
+@router.get("/auth")
+def google_auth():
+    """Initiate Google OAuth flow"""
+    try:
+        flow = get_oauth_flow()
+        authorization_url, state = flow.authorization_url(
+            access_type='offline',
+            include_granted_scopes='true',
+            prompt='consent'
+        )
+        return {"authorization_url": authorization_url, "state": state}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/callback")
+def google_callback(code: str, state: str):
+    """Handle Google OAuth callback"""
+    try:
+        flow = get_oauth_flow()
+        flow.fetch_token(code=code)
+        credentials = flow.credentials
+        
+        # Return credentials as JSON
+        return {
+            "credentials": credentials_to_dict(credentials),
+            "message": "Successfully authenticated with Google"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/credentials")
+def save_credentials(
+    creds: GoogleCredentials,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Save Google credentials for the current user"""
+    try:
+        # In production, store encrypted in database
+        # For now, return success
+        return {"message": "Credentials saved successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/files")
+def list_drive_files(
+    creds: GoogleCredentials,
+    query: str = "",
+    page_size: int = 50
+):
+    """List files from Google Drive"""
+    try:
+        credentials = credentials_from_dict(creds.credentials)
+        service = get_drive_service(credentials)
+
+        # Build query
+        q = "trashed=false"
+        if query:
+            q += f" and name contains '{query}'"
+
+        results = service.files().list(
+            q=q,
+            pageSize=page_size,
+            fields="nextPageToken, files(id, name, mimeType, size, modifiedTime, webViewLink)"
+        ).execute()
+
+        files = results.get('files', [])
+        return {
+            "files": files,
+            "total": len(files)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/files/{file_id}/metadata")
+def get_file_metadata(
+    file_id: str,
+    creds: GoogleCredentials
+):
+    """Get metadata for a specific file"""
+    try:
+        credentials = credentials_from_dict(creds.credentials)
+        service = get_drive_service(credentials)
+
+        file = service.files().get(
+            fileId=file_id,
+            fields="id, name, mimeType, size, modifiedTime, webViewLink, exportLinks"
+        ).execute()
+
+        return file
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/files/{file_id}/content")
+def download_file_content(
+    file_id: str,
+    creds: GoogleCredentials
+):
+    """Download file content from Google Drive"""
+    try:
+        credentials = credentials_from_dict(creds.credentials)
+        service = get_drive_service(credentials)
+
+        # Get file info first
+        file = service.files().get(fileId=file_id).execute()
+        mime_type = file.get('mimeType')
+
+        # Download content
+        if mime_type == 'application/vnd.google-apps.document':
+            # Export Google Docs as text
+            request = service.files().export_media(
+                fileId=file_id,
+                mimeType='text/plain'
+            )
+        elif mime_type == 'application/vnd.google-apps.spreadsheet':
+            # Export Google Sheets as CSV
+            request = service.files().export_media(
+                fileId=file_id,
+                mimeType='text/csv'
+            )
+        else:
+            # Download regular files
+            request = service.files().get_media(fileId=file_id)
+
+        content = request.execute()
+
+        # Decode if bytes
+        if isinstance(content, bytes):
+            try:
+                content = content.decode('utf-8')
+            except:
+                content = content.decode('latin-1')
+
+        return {
+            "file_id": file_id,
+            "name": file.get('name'),
+            "mime_type": mime_type,
+            "content": content,
+            "size": len(content)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/files/process")
+def process_files_to_chat(
+    request_data: dict,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Process selected Google Drive files into ChatGPT conversations"""
+    try:
+        credentials = credentials_from_dict(request_data.get('credentials'))
+        service = get_drive_service(credentials)
+
+        file_ids = request_data.get('file_ids', [])
+        is_public = request_data.get('is_public', False)
+
+        created_chats = []
+
+        for file_id in file_ids:
+            # Get file info
+            file = service.files().get(fileId=file_id).execute()
+            file_name = file.get('name')
+            mime_type = file.get('mimeType')
+
+            # Download content
+            if mime_type == 'application/vnd.google-apps.document':
+                request = service.files().export_media(fileId=file_id, mimeType='text/plain')
+            elif mime_type == 'application/vnd.google-apps.spreadsheet':
+                request = service.files().export_media(fileId=file_id, mimeType='text/csv')
+            else:
+                request = service.files().get_media(fileId=file_id)
+
+            content = request.execute()
+
+            # Decode if bytes
+            if isinstance(content, bytes):
+                try:
+                    content = content.decode('utf-8')
+                except:
+                    content = content.decode('latin-1')
+
+            # Generate conversation from file
+            generator = FileToChatGenerator(content, file_name, mime_type)
+            conversation = generator.generate_conversation()
+
+            # Create chat record
+            chat = Chat(
+                user_id=current_user.id,
+                title=conversation['title'],
+                model=conversation['model'],
+                normalized_data=conversation['messages'],
+                is_public=is_public,
+                original_filename=file_name
+            )
+
+            db.add(chat)
+            db.commit()
+            db.refresh(chat)
+
+            created_chats.append({
+                "chat_id": chat.id,
+                "title": chat.title,
+                "file_name": file_name,
+                "message_count": len(conversation['messages'])
+            })
+
+        return {
+            "message": f"Successfully processed {len(created_chats)} files",
+            "chats": created_chats
+        }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+```
+
+chats.py:
+```
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
+from sqlalchemy.orm import Session
+from typing import List
+import json
+import uuid
+
+from app.db.base import get_db
+from app.models.chat import Chat
+from app.models.user import User
+from app.schemas.chat import ChatCreate, ChatResponse, ChatDetailResponse, PublishRequest
+from app.services.normalizer import detect_and_normalize
+from app.api.deps import get_current_active_user
+from app.core.config import settings
+
+router = APIRouter()
+
+
+@router.post("/upload", response_model=ChatResponse)
+async def upload_chat(
+    file: UploadFile = File(...),
+    title: str = None,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    # Validate file size
+    content = await file.read()
+    max_size = settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024
+    if len(content) > max_size:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File size exceeds {settings.MAX_UPLOAD_SIZE_MB}MB limit"
+        )
+    
+    # Validate file type
+    if not file.filename.endswith('.json'):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only JSON files are allowed"
+        )
+    
+    # Parse JSON
+    try:
+        chat_data = json.loads(content)
+    except json.JSONDecodeError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid JSON format"
+        )
+    
+    # Extract metadata if present (from GPT Bridge)
+    chat_title = chat_data.get("title") if isinstance(chat_data, dict) else None
+    chat_model = chat_data.get("model") if isinstance(chat_data, dict) else None
+    chat_messages = chat_data.get("messages") if isinstance(chat_data, dict) else chat_data
+    
+    # Normalize chat data
+    normalized_messages = detect_and_normalize(chat_data)
+    
+    if not normalized_messages:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No valid messages found in chat data"
+        )
+    
+    # Create chat record
+    chat = Chat(
+        user_id=current_user.id,
+        title=title or chat_title or file.filename,
+        model=chat_model,
+        original_data=chat_data,
+        normalized_data=normalized_messages,
+        is_public=False,
+        message_count=len(normalized_messages)
+    )
+    db.add(chat)
+    db.commit()
+    db.refresh(chat)
+    
+    return chat
+
+
+@router.get("/", response_model=List[ChatResponse])
+def list_chats(
+    skip: int = 0,
+    limit: int = 100,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    chats = db.query(Chat).filter(
+        Chat.user_id == current_user.id
+    ).order_by(Chat.created_at.desc()).offset(skip).limit(limit).all()
+    return chats
+
+
+@router.get("/public", response_model=List[ChatResponse])
+def list_public_chats(
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db)
+):
+    chats = db.query(Chat).filter(
+        Chat.is_public == True
+    ).order_by(Chat.created_at.desc()).offset(skip).limit(limit).all()
+    return chats
+
+
+@router.get("/{chat_id}", response_model=ChatDetailResponse)
+def get_chat(
+    chat_id: str,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    chat = db.query(Chat).filter(Chat.id == chat_id).first()
+    if not chat:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Chat not found"
+        )
+    
+    # Check ownership or public access
+    if chat.user_id != current_user.id and not chat.is_public:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied"
+        )
+    
+    return chat
+
+
+@router.post("/{chat_id}/publish", response_model=ChatResponse)
+def publish_chat(
+    chat_id: str,
+    publish_request: PublishRequest,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    chat = db.query(Chat).filter(Chat.id == chat_id).first()
+    if not chat:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Chat not found"
+        )
+    
+    # Check ownership
+    if chat.user_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the owner can publish this chat"
+        )
+    
+    chat.is_public = publish_request.is_public
+    db.commit()
+    db.refresh(chat)
+    
+    return chat
+
+
+@router.delete("/{chat_id}")
+def delete_chat(
+    chat_id: str,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    chat = db.query(Chat).filter(Chat.id == chat_id).first()
+    if not chat:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Chat not found"
+        )
+    
+    # Check ownership
+    if chat.user_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the owner can delete this chat"
+        )
+    
+    db.delete(chat)
+    db.commit()
+    
+    return {"message": "Chat deleted successfully"}
+
+```
+
+file_to_chat.py:
+```
+from typing import Dict, List
+import re
+
+class FileToChatGenerator:
+    """Generate ChatGPT conversations from file content"""
+    
+    def __init__(self, file_content: str, file_name: str, file_type: str):
+        self.content = file_content
+        self.file_name = file_name
+        self.file_type = file_type
+    
+    def generate_conversation(self) -> Dict:
+        """Generate a ChatGPT conversation from file content"""
+        
+        # Analyze content
+        analysis = self._analyze_content()
+        
+        # Generate conversation
+        conversation = self._generate_conversation(analysis)
+        
+        return {
+            "title": f"Analysis: {self.file_name}",
+            "model": "gpt-4",
+            "messages": conversation,
+            "metadata": {
+                "source_file": self.file_name,
+                "file_type": self.file_type,
+                "content_length": len(self.content),
+                "analysis": analysis
+            }
+        }
+    
+    def _analyze_content(self) -> Dict:
+        """Analyze the file content"""
+        content = self.content
+        
+        return {
+            "word_count": len(content.split()),
+            "line_count": len(content.split('\n')),
+            "char_count": len(content),
+            "language": self._detect_language(content),
+            "key_topics": self._extract_topics(content),
+            "structure": self._detect_structure(content),
+            "summary": self._generate_summary(content)
+        }
+    
+    def _detect_language(self, text: str) -> str:
+        """Simple language detection"""
+        # This is a simplified detection
+        # In production, use a proper language detection library
+        if re.search(r'[\u4e00-\u9fff]', text):
+            return "Chinese"
+        elif re.search(r'[\u0400-\u04FF]', text):
+            return "Russian"
+        elif re.search(r'[\u0590-\u05FF]', text):
+            return "Hebrew"
+        elif re.search(r'[\u0600-\u06FF]', text):
+            return "Arabic"
+        else:
+            return "English"
+    
+    def _extract_topics(self, text: str) -> List[str]:
+        """Extract key topics from content"""
+        # Simple keyword extraction
+        words = re.findall(r'\b[a-zA-Z]{4,}\b', text.lower())
+        word_freq = {}
+        for word in words:
+            word_freq[word] = word_freq.get(word, 0) + 1
+        
+        # Get top 5 most frequent words
+        sorted_words = sorted(word_freq.items(), key=lambda x: x[1], reverse=True)
+        topics = [word for word, count in sorted_words[:5]]
+        
+        return topics
+    
+    def _detect_structure(self, text: str) -> str:
+        """Detect document structure"""
+        lines = text.split('\n')
+        
+        # Check for code
+        if any(line.strip().startswith(('def ', 'class ', 'function ', 'import ')) for line in lines):
+            return "Code"
+        
+        # Check for markdown
+        if any(line.startswith('#') for line in lines):
+            return "Markdown"
+        
+        # Check for JSON
+        if text.strip().startswith('{') and text.strip().endswith('}'):
+            return "JSON"
+        
+        # Check for CSV
+        if ',' in lines[0] and len(lines) > 1:
+            return "CSV/Tabular"
+        
+        return "Plain Text"
+    
+    def _generate_summary(self, text: str) -> str:
+        """Generate a brief summary of the content"""
+        # Take first 200 characters as summary
+        summary = text[:200].strip()
+        if len(text) > 200:
+            summary += "..."
+        return summary
+    
+    def _generate_conversation(self, analysis: Dict) -> List[Dict]:
+        """Generate a conversation based on file analysis"""
+        
+        messages = []
+        
+        # User uploads file
+        messages.append({
+            "role": "user",
+            "content": f"I've uploaded a file called '{self.file_name}' for analysis. It's a {analysis['structure']} document with {analysis['word_count']} words. Can you help me understand it?"
+        })
+        
+        # Assistant acknowledges
+        messages.append({
+            "role": "assistant",
+            "content": f"I'd be happy to help you analyze '{self.file_name}'. Based on my initial scan, this appears to be a {analysis['structure']} document. Here's what I found:\n\n"
+                      f"- **Language**: {analysis['language']}\n"
+                      f"- **Word Count**: {analysis['word_count']:,}\n"
+                      f"- **Line Count**: {analysis['line_count']:,}\n"
+                      f"- **Key Topics**: {', '.join(analysis['key_topics'])}\n\n"
+                      f"**Summary**: {analysis['summary']}\n\n"
+                      f"Would you like me to dive deeper into any specific aspect of this document?"
+        })
+        
+        # User asks for detailed analysis
+        messages.append({
+            "role": "user",
+            "content": "Yes, please provide a detailed analysis of the content, including the main themes, important points, and any actionable insights."
+        })
+        
+        # Assistant provides detailed analysis
+        messages.append({
+            "role": "assistant",
+            "content": self._generate_detailed_analysis(analysis)
+        })
+        
+        # User asks for recommendations
+        messages.append({
+            "role": "user",
+            "content": "Based on this analysis, what recommendations or next steps would you suggest?"
+        })
+        
+        # Assistant provides recommendations
+        messages.append({
+            "role": "assistant",
+            "content": self._generate_recommendations(analysis)
+        })
+        
+        return messages
+    
+    def _generate_detailed_analysis(self, analysis: Dict) -> str:
+        """Generate detailed analysis response"""
+        
+        content = self.content[:1000]  # Use first 1000 chars for analysis
+        
+        response = f"Here's a detailed analysis of '{self.file_name}':\n\n"
+        
+        response += "## Content Overview\n"
+        response += f"The document contains {analysis['word_count']} words and covers several key topics. "
+        response += f"The primary themes appear to be: {', '.join(analysis['key_topics'][:3])}.\n\n"
+        
+        response += "## Key Points\n"
+        # Extract some sentences
+        sentences = re.split(r'[.!?]+', self.content)
+        important_sentences = [s.strip() for s in sentences if len(s.strip()) > 50][:5]
+        for i, sentence in enumerate(important_sentences, 1):
+            response += f"{i}. {sentence}.\n"
+        
+        response += "\n## Structure Analysis\n"
+        response += f"The document is organized as a {analysis['structure']} file. "
+        response += f"It's written in {analysis['language']} and follows a clear structure.\n\n"
+        
+        response += "## Content Insights\n"
+        response += f"Based on the content, this document appears to focus on {analysis['key_topics'][0] if analysis['key_topics'] else 'various topics'}. "
+        response += "The content suggests a systematic approach to the subject matter.\n\n"
+        
+        return response
+    
+    def _generate_recommendations(self, analysis: Dict) -> str:
+        """Generate recommendations based on analysis"""
+        
+        response = f"Based on my analysis of '{self.file_name}', here are my recommendations:\n\n"
+        
+        response += "## Immediate Actions\n"
+        response += "1. Review the key topics identified and prioritize them based on your goals\n"
+        response += "2. Consider creating a summary document highlighting the main points\n"
+        response += "3. Extract actionable items from the content\n\n"
+        
+        response += "## Further Analysis\n"
+        response += "1. Perform a deeper dive into the most relevant sections\n"
+        response += "2. Cross-reference with related documents or data sources\n"
+        response += "3. Consider additional context or background information\n\n"
+        
+        response += "## Long-term Considerations\n"
+        response += "1. Establish a system for tracking updates or changes to this content\n"
+        response += "2. Create a knowledge base or repository for similar documents\n"
+        response += "3. Set up regular review cycles to ensure the information remains relevant\n\n"
+        
+        response += "Would you like me to elaborate on any of these recommendations or provide specific guidance for any particular aspect?"
+        
+        return response
+
+```
+
+normalizer.py:
+```
+from typing import List, Any, Dict
+
+
+def normalize_chatgpt_export(chat_data: dict) -> List[Dict[str, Any]]:
+    """
+    Normalize ChatGPT export format to structured message list.
+    
+    Expected format:
+    {
+      "mapping": {
+        "node_id": {
+          "message": {
+            "content": {
+              "parts": ["text"]
+            }
+          }
+        }
+      }
+    }
+    
+    Returns:
+        List of message dicts with role and content
+    """
+    messages = []
+    
+    if not isinstance(chat_data, dict):
+        return messages
+    
+    mapping = chat_data.get("mapping", {})
+    
+    if not isinstance(mapping, dict):
+        return messages
+    
+    # Extract messages from nodes
+    for node in mapping.values():
+        if not isinstance(node, dict):
+            continue
+            
+        msg = node.get("message")
+        if not msg or not isinstance(msg, dict):
+            continue
+            
+        # Try to detect role from message metadata
+        role = msg.get("author", {}).get("role", "unknown")
+        
+        content = msg.get("content")
+        if not content or not isinstance(content, dict):
+            continue
+            
+        parts = content.get("parts", [])
+        if not parts or not isinstance(parts, list):
+            continue
+            
+        # Extract text from first part
+        if parts and isinstance(parts[0], str):
+            messages.append({
+                "role": role,
+                "content": parts[0]
+            })
+    
+    return messages
+
+
+def normalize_generic_chat(chat_data: Any) -> List[Dict[str, Any]]:
+    """
+    Normalize generic chat format (array of message objects).
+    
+    Expected format:
+    [
+      {"role": "user", "content": "text"},
+      {"role": "assistant", "content": "text"}
+    ]
+    
+    Or from GPT Bridge extension:
+    {
+      "title": "...",
+      "model": "...",
+      "messages": [
+        {"role": "user", "content": "...", "timestamp": "..."}
+      ]
+    }
+    """
+    messages = []
+    
+    # Handle GPT Bridge format
+    if isinstance(chat_data, dict) and "messages" in chat_data:
+        msg_list = chat_data.get("messages", [])
+        if isinstance(msg_list, list):
+            for msg in msg_list:
+                if isinstance(msg, dict):
+                    role = msg.get("role", "unknown")
+                    content = msg.get("content")
+                    if content:
+                        messages.append({
+                            "role": role,
+                            "content": content
+                        })
+            return messages
+    
+    # Handle array format
+    if not isinstance(chat_data, list):
+        return messages
+    
+    for msg in chat_data:
+        if not isinstance(msg, dict):
+            continue
+            
+        role = msg.get("role", "unknown")
+        content = msg.get("content")
+        
+        if content:
+            messages.append({
+                "role": role,
+                "content": str(content)
+            })
+    
+    return messages
+
+
+def detect_and_normalize(chat_data: Any) -> List[Dict[str, Any]]:
+    """
+    Auto-detect format and normalize accordingly.
+    """
+    if isinstance(chat_data, dict):
+        if "mapping" in chat_data:
+            return normalize_chatgpt_export(chat_data)
+        elif "messages" in chat_data:
+            return normalize_generic_chat(chat_data)
+    elif isinstance(chat_data, list):
+        return normalize_generic_chat(chat_data)
+    
+    # Fallback: try to extract as generic
+    return normalize_generic_chat(chat_data)
+
+```
+
+index.html:
+```
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chat Provenance UI</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        .header {
+            background: white;
+            border-radius: 12px;
+            padding: 24px;
+            margin-bottom: 24px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+        }
+
+        .header h1 {
+            color: #333;
+            font-size: 28px;
+            margin-bottom: 8px;
+        }
+
+        .header p {
+            color: #666;
+            font-size: 14px;
+        }
+
+        .auth-section {
+            background: white;
+            border-radius: 12px;
+            padding: 24px;
+            margin-bottom: 24px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+            display: none;
+        }
+
+        .auth-section.active {
+            display: block;
+        }
+
+        .auth-section input {
+            width: 100%;
+            padding: 12px;
+            margin: 8px 0;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            font-size: 14px;
+        }
+
+        .auth-section button {
+            width: 100%;
+            padding: 12px;
+            margin: 8px 0;
+            border: none;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .auth-section .btn-login {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+
+        .auth-section .btn-register {
+            background: #f7fafc;
+            color: #4a5568;
+            border: 1px solid #e2e8f0;
+        }
+
+        .auth-section .btn-google {
+            width: 100%;
+            padding: 12px;
+            margin: 8px 0;
+            border: 1px solid #dadce0;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.2s;
+            background: white;
+            color: #5f6368;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .auth-section .btn-google:hover {
+            background: #f8f9fa;
+        }
+
+        .auth-section .btn-google span {
+            font-size: 18px;
+            font-weight: bold;
+        }
+
+        .main-section {
+            display: none;
+        }
+
+        .main-section.active {
+            display: block;
+        }
+
+        .tabs {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 24px;
+        }
+
+        .tab {
+            padding: 12px 24px;
+            background: white;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 600;
+            color: #666;
+            transition: all 0.2s;
+        }
+
+        .tab.active {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+
+        .tab:hover:not(.active) {
+            background: #f7fafc;
+        }
+
+        .chats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 16px;
+        }
+
+        .chat-card {
+            background: white;
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+
+        .chat-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 20px rgba(0,0,0,0.15);
+        }
+
+        .chat-card h3 {
+            color: #333;
+            font-size: 16px;
+            margin-bottom: 8px;
+            word-break: break-word;
+        }
+
+        .chat-card .meta {
+            color: #666;
+            font-size: 12px;
+            margin-bottom: 4px;
+        }
+
+        .chat-card .badge {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 600;
+            margin-top: 8px;
+        }
+
+        .chat-card .badge.public {
+            background: #c6f6d5;
+            color: #22543d;
+        }
+
+        .chat-card .badge.private {
+            background: #fed7d7;
+            color: #742a2a;
+        }
+
+        .chat-detail {
+            background: white;
+            border-radius: 12px;
+            padding: 24px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+            display: none;
+        }
+
+        .chat-detail.active {
+            display: block;
+        }
+
+        .chat-detail h2 {
+            color: #333;
+            margin-bottom: 16px;
+        }
+
+        .chat-detail .meta {
+            color: #666;
+            font-size: 14px;
+            margin-bottom: 24px;
+            padding-bottom: 16px;
+            border-bottom: 1px solid #e2e8f0;
+        }
+
+        .message {
+            padding: 16px;
+            margin: 12px 0;
+            border-radius: 8px;
+            background: #f7fafc;
+        }
+
+        .message.user {
+            background: #e3f2fd;
+            margin-left: 40px;
+        }
+
+        .message.assistant {
+            background: #f7fafc;
+            margin-right: 40px;
+        }
+
+        .message .role {
+            font-size: 12px;
+            font-weight: 600;
+            color: #666;
+            margin-bottom: 4px;
+            text-transform: uppercase;
+        }
+
+        .message .content {
+            color: #333;
+            line-height: 1.6;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
+        .back-btn {
+            padding: 8px 16px;
+            background: #f7fafc;
+            border: 1px solid #e2e8f0;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            margin-bottom: 16px;
+        }
+
+        .back-btn:hover {
+            background: #e2e8f0;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: white;
+            font-size: 16px;
+        }
+
+        .error {
+            background: #fed7d7;
+            color: #742a2a;
+            padding: 12px;
+            border-radius: 8px;
+            margin: 16px 0;
+        }
+
+        .success {
+            background: #c6f6d5;
+            color: #22543d;
+            padding: 12px;
+            border-radius: 8px;
+            margin: 16px 0;
+        }
+
+        .user-info {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 24px;
+        }
+
+        .user-info > div:first-child {
+            display: flex;
+            flex-direction: column;
+        }
+
+        .user-info > div:last-child {
+            display: flex;
+            gap: 8px;
+        }
+
+        .user-info span {
+            color: #666;
+            font-size: 14px;
+            font-weight: 600;
+        }
+
+        .user-info button {
+            padding: 8px 16px;
+            background: #fed7d7;
+            color: #742a2a;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            color: white;
+        }
+
+        .empty-state h3 {
+            font-size: 24px;
+            margin-bottom: 8px;
+        }
+
+        .empty-state p {
+            font-size: 14px;
+            opacity: 0.8;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>💬 Chat Provenance</h1>
+            <p>User-controlled ChatGPT conversation management</p>
+        </div>
+
+        <!-- Auth Section -->
+        <div class="auth-section" id="authSection">
+            <h2>Login</h2>
+            <p style="margin-bottom: 16px; color: #666;">Access your chat provenance system</p>
+            
+            <div style="margin-bottom: 24px; padding: 16px; background: #f7fafc; border-radius: 8px; border-left: 4px solid #667eea;">
+                <h3 style="font-size: 16px; color: #333; margin-bottom: 8px;">🔗 Connect with ChatGPT</h3>
+                <p style="font-size: 13px; color: #666; margin-bottom: 12px;">Use your ChatGPT account to export conversations</p>
+                <button class="btn-google" onclick="connectChatGPT()">
+                    <span style="margin-right: 8px;">G</span>
+                    Sign in with Google
+                </button>
+                <div id="chatGPTStatus" style="margin-top: 12px; font-size: 13px; color: #666;"></div>
+            </div>
+
+            <div style="text-align: center; margin: 24px 0; color: #999; font-size: 14px;">— or —</div>
+
+            <p style="margin-bottom: 8px; color: #666; font-size: 14px;">Login with email</p>
+            <input type="email" id="email" placeholder="Email">
+            <input type="password" id="password" placeholder="Password">
+            <button class="btn-login" onclick="login()">Login</button>
+            <button class="btn-register" onclick="register()">Register</button>
+            <div id="authMessage"></div>
+        </div>
+
+        <!-- Main Section -->
+        <div class="main-section" id="mainSection">
+            <div class="user-info">
+                <div>
+                    <span id="userEmail"></span>
+                    <div id="chatGPTConnected" style="font-size: 12px; color: #666; margin-top: 4px;"></div>
+                </div>
+                <div>
+                    <button onclick="connectChatGPT()" style="margin-right: 8px; padding: 8px 16px; background: #f7fafc; border: 1px solid #e2e8f0; border-radius: 6px; cursor: pointer; font-size: 14px;">
+                        🔗 ChatGPT
+                    </button>
+                    <button onclick="logout()">Logout</button>
+                </div>
+            </div>
+
+            <div class="tabs">
+                <button class="tab active" onclick="showTab('my-chats')">My Chats</button>
+                <button class="tab" onclick="showTab('public-chats')">Public Chats</button>
+                <button class="tab" onclick="showTab('google-drive')">📁 Google Drive</button>
+            </div>
+
+            <!-- Chats List -->
+            <div id="chatsList">
+                <div class="chats-grid" id="chatsGrid"></div>
+            </div>
+
+            <!-- Chat Detail -->
+            <div class="chat-detail" id="chatDetail">
+                <button class="back-btn" onclick="backToList()">← Back</button>
+                <h2 id="chatTitle"></h2>
+                <div class="meta" id="chatMeta"></div>
+                <div id="messagesContainer"></div>
+            </div>
+
+            <!-- Google Drive Section -->
+            <div class="google-drive-section" id="googleDriveSection" style="display: none;">
+                <div style="background: white; border-radius: 12px; padding: 24px; margin-bottom: 24px; box-shadow: 0 4px 20px rgba(0,0,0,0.1);">
+                    <h2 style="margin-bottom: 16px;">📁 Google Drive Integration</h2>
+
+                    <!-- Google Auth Status -->
+                    <div id="googleAuthStatus" style="margin-bottom: 24px; padding: 16px; background: #f7fafc; border-radius: 8px;">
+                        <p style="color: #666; margin-bottom: 12px;">Connect your Google Drive to select files and generate ChatGPT conversations</p>
+                        <button id="googleAuthBtn" onclick="googleAuth()" style="padding: 12px 24px; background: #4285f4; color: white; border: none; border-radius: 8px; cursor: pointer; font-size: 14px; font-weight: 600;">
+                            Connect Google Drive
+                        </button>
+                    </div>
+
+                    <!-- File Selection (hidden until authenticated) -->
+                    <div id="fileSelectionSection" style="display: none;">
+                        <div style="margin-bottom: 16px;">
+                            <input type="text" id="fileSearch" placeholder="Search files..." style="width: 100%; padding: 12px; border: 1px solid #e2e8f0; border-radius: 8px; margin-bottom: 12px;">
+                            <button onclick="loadGoogleFiles()" style="padding: 10px 20px; background: #667eea; color: white; border: none; border-radius: 6px; cursor: pointer;">
+                                Refresh Files
+                            </button>
+                        </div>
+
+                        <div id="filesList" style="max-height: 400px; overflow-y: auto; border: 1px solid #e2e8f0; border-radius: 8px; padding: 16px;">
+                            <p style="color: #999; text-align: center;">Click "Refresh Files" to load your Google Drive</p>
+                        </div>
+
+                        <div style="margin-top: 24px; padding: 16px; background: #f7fafc; border-radius: 8px;">
+                            <h3 style="font-size: 16px; margin-bottom: 12px;">Selected Files</h3>
+                            <div id="selectedFiles" style="margin-bottom: 16px;">
+                                <p style="color: #999;">No files selected</p>
+                            </div>
+                            <div style="display: flex; gap: 12px; align-items: center;">
+                                <label style="display: flex; align-items: center; gap: 8px;">
+                                    <input type="checkbox" id="makePublic">
+                                    <span style="font-size: 14px;">Make chats public</span>
+                                </label>
+                                <button onclick="processSelectedFiles()" style="padding: 12px 24px; background: #48bb78; color: white; border: none; border-radius: 8px; cursor: pointer; font-weight: 600;">
+                                    Generate Chats
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="loading" id="loading">Loading...</div>
+    </div>
+
+    <script>
+        const API_BASE = 'http://localhost:8003/api';
+        let token = localStorage.getItem('gptbridge_token');
+        let currentTab = 'my-chats';
+        let googleCredentials = null;
+        let selectedFiles = [];
+
+        // Check auth on load
+        window.addEventListener('load', () => {
+            if (token) {
+                showMainSection();
+                loadChats();
+                checkChatGPTConnection();
+            } else {
+                showAuthSection();
+            }
+        });
+
+        // Listen for messages from browser extension
+        window.addEventListener('message', (event) => {
+            if (event.data && event.data.type === 'GPT_BRIDGE_STATUS') {
+                updateChatGPTStatus(event.data.status);
+            }
+        });
+
+        // Check localStorage for ChatGPT status
+        setInterval(() => {
+            try {
+                const status = localStorage.getItem('gptbridge_status');
+                if (status) {
+                    const data = JSON.parse(status);
+                    // Only update if recent (within 30 seconds)
+                    const age = Date.now() - new Date(data.timestamp).getTime();
+                    if (age < 30000) {
+                        updateChatGPTStatus(data.status);
+                    }
+                }
+            } catch (e) {
+                // Ignore
+            }
+        }, 5000);
+
+        function checkChatGPTConnection() {
+            // Ping the browser extension
+            try {
+                const chatGPTWindow = window.open('https://chat.openai.com', '_blank', 'width=600,height=700');
+                setTimeout(() => {
+                    if (!chatGPTWindow.closed) {
+                        chatGPTWindow.postMessage({ type: 'GPT_BRIDGE_PING' }, '*');
+                    }
+                }, 1000);
+            } catch (e) {
+                console.log('Could not check ChatGPT connection:', e);
+            }
+        }
+
+        function updateChatGPTStatus(status) {
+            const statusEl = document.getElementById('chatGPTConnected');
+            if (statusEl) {
+                if (status === 'connected') {
+                    statusEl.innerHTML = '✅ ChatGPT Connected';
+                    statusEl.style.color = '#48bb78';
+                } else {
+                    statusEl.innerHTML = '⚪ ChatGPT Not Connected';
+                    statusEl.style.color = '#999';
+                }
+            }
+        }
+
+        function showAuthSection() {
+            document.getElementById('authSection').classList.add('active');
+            document.getElementById('mainSection').classList.remove('active');
+            document.getElementById('loading').style.display = 'none';
+        }
+
+        function showMainSection() {
+            document.getElementById('authSection').classList.remove('active');
+            document.getElementById('mainSection').classList.add('active');
+            document.getElementById('loading').style.display = 'none';
+        }
+
+        async function login() {
+            const email = document.getElementById('email').value;
+            const password = document.getElementById('password').value;
+
+            if (!email || !password) {
+                showAuthMessage('Please fill in all fields', 'error');
+                return;
+            }
+
+            document.getElementById('loading').style.display = 'block';
+
+            try {
+                const response = await fetch(`${API_BASE}/auth/login`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ email, password })
+                });
+
+                const data = await response.json();
+
+                if (response.ok) {
+                    token = data.access_token;
+                    localStorage.setItem('gptbridge_token', token);
+                    showMainSection();
+                    loadChats();
+                } else {
+                    showAuthMessage(data.detail || 'Login failed', 'error');
+                }
+            } catch (error) {
+                showAuthMessage('Network error', 'error');
+            }
+
+            document.getElementById('loading').style.display = 'none';
+        }
+
+        async function register() {
+            const email = document.getElementById('email').value;
+            const password = document.getElementById('password').value;
+
+            if (!email || !password) {
+                showAuthMessage('Please fill in all fields', 'error');
+                return;
+            }
+
+            document.getElementById('loading').style.display = 'block';
+
+            try {
+                const response = await fetch(`${API_BASE}/auth/register`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ email, password })
+                });
+
+                const data = await response.json();
+
+                if (response.ok) {
+                    showAuthMessage('Registration successful! Please login.', 'success');
+                } else {
+                    showAuthMessage(data.detail || 'Registration failed', 'error');
+                }
+            } catch (error) {
+                showAuthMessage('Network error', 'error');
+            }
+
+            document.getElementById('loading').style.display = 'none';
+        }
+
+        function logout() {
+            localStorage.removeItem('gptbridge_token');
+            token = null;
+            showAuthSection();
+        }
+
+        function showAuthMessage(message, type) {
+            const div = document.getElementById('authMessage');
+            div.innerHTML = `<div class="${type}">${message}</div>`;
+            setTimeout(() => div.innerHTML = '', 5000);
+        }
+
+        // ChatGPT Connection
+        function connectChatGPT() {
+            const statusEl = document.getElementById('chatGPTStatus');
+            statusEl.textContent = 'Opening ChatGPT...';
+            statusEl.style.color = '#667eea';
+
+            // Open ChatGPT in a new window for Google OAuth
+            const chatGPTWindow = window.open('https://chat.openai.com/auth/login', '_blank', 'width=600,height=700');
+
+            // Poll for auth completion (in a real implementation, you'd use OAuth callbacks)
+            const checkAuth = setInterval(() => {
+                try {
+                    // Check if ChatGPT is logged in by attempting to access the page
+                    if (chatGPTWindow.closed) {
+                        clearInterval(checkAuth);
+                        statusEl.textContent = 'ChatGPT window closed. Please install the browser extension to export chats.';
+                        statusEl.style.color = '#e53e3e';
+                    }
+                } catch (e) {
+                    // Cross-origin error expected
+                }
+            }, 1000);
+
+            // Auto-close after 2 minutes
+            setTimeout(() => {
+                clearInterval(checkAuth);
+                if (!chatGPTWindow.closed) {
+                    chatGPTWindow.close();
+                    statusEl.textContent = 'Session timed out. Please try again.';
+                    statusEl.style.color = '#e53e3e';
+                }
+            }, 120000);
+
+            // Show instructions
+            setTimeout(() => {
+                statusEl.innerHTML = `
+                    <div style="margin-top: 12px;">
+                        <p style="margin-bottom: 8px;">📋 Next steps:</p>
+                        <ol style="margin-left: 20px; font-size: 12px; line-height: 1.6;">
+                            <li>Sign in to ChatGPT with Google in the opened window</li>
+                            <li>Install the <strong>GPT Bridge</strong> browser extension</li>
+                            <li>The extension will detect your ChatGPT login</li>
+                            <li>Export chats from ChatGPT to this system</li>
+                        </ol>
+                        <button onclick="showExtensionInstructions()" style="margin-top: 12px; padding: 8px 16px; background: #667eea; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 12px;">
+                            View Extension Instructions
+                        </button>
+                    </div>
+                `;
+            }, 2000);
+        }
+
+        function showExtensionInstructions() {
+            const instructions = `
+🔧 GPT Bridge Extension Setup
+
+1. Install Tampermonkey:
+   https://www.tampermonkey.net/
+
+2. Open gptbridge-provenance.user.js
+
+3. Copy the entire script
+
+4. In Tampermonkey, create a new script and paste
+
+5. Save the script
+
+6. Go to chat.openai.com
+
+7. Click the floating GPT Bridge button
+
+8. Export your chats to this system
+            `;
+            alert(instructions);
+        }
+
+        function showTab(tab) {
+            currentTab = tab;
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            event.target.classList.add('active');
+            
+            // Hide all sections
+            document.getElementById('chatsList').style.display = 'none';
+            document.getElementById('chatDetail').classList.remove('active');
+            document.getElementById('googleDriveSection').style.display = 'none';
+            
+            // Show selected section
+            if (tab === 'google-drive') {
+                document.getElementById('googleDriveSection').style.display = 'block';
+            } else {
+                document.getElementById('chatsList').style.display = 'block';
+                loadChats();
+            }
+        }
+
+        async function loadChats() {
+            document.getElementById('loading').style.display = 'block';
+            document.getElementById('chatsList').style.display = 'block';
+            document.getElementById('chatDetail').classList.remove('active');
+
+            const endpoint = currentTab === 'my-chats' ? '/chats' : '/chats/public';
+
+            try {
+                const headers = { 'Content-Type': 'application/json' };
+                if (token) {
+                    headers['Authorization'] = `Bearer ${token}`;
+                }
+
+                const response = await fetch(`${API_BASE}${endpoint}`, { headers });
+                const chats = await response.json();
+
+                if (response.ok) {
+                    displayChats(chats);
+                } else {
+                    console.error('Failed to load chats');
+                }
+            } catch (error) {
+                console.error('Network error', error);
+            }
+
+            document.getElementById('loading').style.display = 'none';
+        }
+
+        function displayChats(chats) {
+            const grid = document.getElementById('chatsGrid');
+
+            if (!chats || chats.length === 0) {
+                grid.innerHTML = `
+                    <div class="empty-state" style="grid-column: 1 / -1;">
+                        <h3>No chats found</h3>
+                        <p>Export your first ChatGPT conversation using the browser extension</p>
+                    </div>
+                `;
+                return;
+            }
+
+            grid.innerHTML = chats.map(chat => `
+                <div class="chat-card" onclick="viewChat('${chat.id}')">
+                    <h3>${escapeHtml(chat.title || 'Untitled Chat')}</h3>
+                    <div class="meta">${chat.message_count} messages</div>
+                    ${chat.model ? `<div class="meta">${escapeHtml(chat.model)}</div>` : ''}
+                    <div class="meta">${new Date(chat.created_at).toLocaleDateString()}</div>
+                    <span class="badge ${chat.is_public ? 'public' : 'private'}">
+                        ${chat.is_public ? 'Public' : 'Private'}
+                    </span>
+                </div>
+            `).join('');
+        }
+
+        async function viewChat(chatId) {
+            document.getElementById('loading').style.display = 'block';
+
+            const headers = { 'Content-Type': 'application/json' };
+            if (token) {
+                headers['Authorization'] = `Bearer ${token}`;
+            }
+
+            try {
+                const response = await fetch(`${API_BASE}/chats/${chatId}`, { headers });
+                const chat = await response.json();
+
+                if (response.ok) {
+                    displayChatDetail(chat);
+                } else {
+                    console.error('Failed to load chat');
+                }
+            } catch (error) {
+                console.error('Network error', error);
+            }
+
+            document.getElementById('loading').style.display = 'none';
+        }
+
+        function displayChatDetail(chat) {
+            document.getElementById('chatsList').style.display = 'none';
+            document.getElementById('chatDetail').classList.add('active');
+
+            document.getElementById('chatTitle').textContent = chat.title || 'Untitled Chat';
+            document.getElementById('chatMeta').innerHTML = `
+                ${chat.model ? `Model: ${escapeHtml(chat.model)} | ` : ''}
+                ${chat.message_count} messages | 
+                ${new Date(chat.created_at).toLocaleString()} |
+                ${chat.is_public ? 'Public' : 'Private'}
+            `;
+
+            const container = document.getElementById('messagesContainer');
+
+            if (!chat.normalized_data || chat.normalized_data.length === 0) {
+                container.innerHTML = '<p style="color: #666;">No messages available</p>';
+                return;
+            }
+
+            container.innerHTML = chat.normalized_data.map(msg => `
+                <div class="message ${msg.role || 'unknown'}">
+                    <div class="role">${msg.role || 'unknown'}</div>
+                    <div class="content">${escapeHtml(msg.content || '')}</div>
+                </div>
+            `).join('');
+        }
+
+        function backToList() {
+            document.getElementById('chatDetail').classList.remove('active');
+            document.getElementById('chatsList').style.display = 'block';
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        // Google Drive Integration
+        async function googleAuth() {
+            try {
+                const response = await fetch(`${API_BASE}/google/auth`);
+                const data = await response.json();
+                
+                // Open Google OAuth in popup
+                const width = 500;
+                const height = 600;
+                const left = (screen.width - width) / 2;
+                const top = (screen.height - height) / 2;
+                
+                const popup = window.open(
+                    data.authorization_url,
+                    'Google Auth',
+                    `width=${width},height=${height},left=${left},top=${top}`
+                );
+                
+                // Poll for callback
+                const checkPopup = setInterval(() => {
+                    try {
+                        if (popup.closed) {
+                            clearInterval(checkPopup);
+                            alert('Authentication was cancelled');
+                        }
+                    } catch (e) {
+                        // Cross-origin
+                    }
+                }, 500);
+                
+                // Listen for callback (in real implementation, you'd use a proper OAuth flow)
+                // For now, user will manually paste the credentials
+                setTimeout(() => {
+                    clearInterval(checkPopup);
+                    const credentials = prompt('After authenticating, paste the credentials JSON here:');
+                    if (credentials) {
+                        try {
+                            googleCredentials = JSON.parse(credentials);
+                            document.getElementById('googleAuthStatus').innerHTML = `
+                                <p style="color: #48bb78; margin-bottom: 12px;">✅ Google Drive Connected</p>
+                                <button onclick="googleAuth()" style="padding: 8px 16px; background: #f7fafc; border: 1px solid #e2e8f0; border-radius: 6px; cursor: pointer;">
+                                    Reconnect
+                                </button>
+                            `;
+                            document.getElementById('fileSelectionSection').style.display = 'block';
+                            loadGoogleFiles();
+                        } catch (e) {
+                            alert('Invalid credentials format');
+                        }
+                    }
+                }, 30000);
+                
+            } catch (error) {
+                console.error('Google auth error:', error);
+                alert('Failed to initiate Google authentication');
+            }
+        }
+
+        async function loadGoogleFiles() {
+            if (!googleCredentials) {
+                alert('Please authenticate with Google first');
+                return;
+            }
+
+            try {
+                const query = document.getElementById('fileSearch').value;
+                const response = await fetch(`${API_BASE}/google/files?query=${encodeURIComponent(query)}`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${token}`
+                    },
+                    body: JSON.stringify({ credentials: googleCredentials })
+                });
+
+                const data = await response.json();
+                
+                if (data.files && data.files.length > 0) {
+                    const filesList = document.getElementById('filesList');
+                    filesList.innerHTML = data.files.map(file => `
+                        <div class="file-item" style="padding: 12px; border-bottom: 1px solid #e2e8f0; display: flex; align-items: center; gap: 12px;">
+                            <input type="checkbox" onchange="toggleFileSelection('${file.id}', '${file.name}', this.checked)" style="width: 18px; height: 18px;">
+                            <div style="flex: 1;">
+                                <div style="font-weight: 600; color: #333;">${escapeHtml(file.name)}</div>
+                                <div style="font-size: 12px; color: #666;">
+                                    ${file.mimeType} • ${file.size ? formatFileSize(file.size) : 'N/A'}
+                                </div>
+                            </div>
+                        </div>
+                    `).join('');
+                } else {
+                    document.getElementById('filesList').innerHTML = '<p style="color: #999; text-align: center;">No files found</p>';
+                }
+            } catch (error) {
+                console.error('Error loading files:', error);
+                alert('Failed to load Google Drive files');
+            }
+        }
+
+        function toggleFileSelection(fileId, fileName, isSelected) {
+            if (isSelected) {
+                selectedFiles.push({ id: fileId, name: fileName });
+            } else {
+                selectedFiles = selectedFiles.filter(f => f.id !== fileId);
+            }
+            updateSelectedFilesDisplay();
+        }
+
+        function updateSelectedFilesDisplay() {
+            const container = document.getElementById('selectedFiles');
+            if (selectedFiles.length === 0) {
+                container.innerHTML = '<p style="color: #999;">No files selected</p>';
+            } else {
+                container.innerHTML = selectedFiles.map(file => `
+                    <div style="padding: 8px; background: white; border-radius: 6px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center;">
+                        <span style="font-size: 14px;">${escapeHtml(file.name)}</span>
+                        <button onclick="removeFileSelection('${file.id}')" style="padding: 4px 8px; background: #fed7d7; color: #742a2a; border: none; border-radius: 4px; cursor: pointer; font-size: 12px;">✕</button>
+                    </div>
+                `).join('');
+            }
+        }
+
+        function removeFileSelection(fileId) {
+            selectedFiles = selectedFiles.filter(f => f.id !== fileId);
+            // Uncheck the checkbox
+            const checkboxes = document.querySelectorAll(`input[onchange*="'${fileId}'"]`);
+            checkboxes.forEach(cb => cb.checked = false);
+            updateSelectedFilesDisplay();
+        }
+
+        async function processSelectedFiles() {
+            if (selectedFiles.length === 0) {
+                alert('Please select at least one file');
+                return;
+            }
+
+            if (!googleCredentials) {
+                alert('Please authenticate with Google first');
+                return;
+            }
+
+            try {
+                const isPublic = document.getElementById('makePublic').checked;
+                const response = await fetch(`${API_BASE}/google/files/process?is_public=${isPublic}`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${token}`
+                    },
+                    body: JSON.stringify({
+                        credentials: googleCredentials,
+                        file_ids: selectedFiles.map(f => f.id)
+                    })
+                });
+
+                const data = await response.json();
+                
+                alert(`Successfully processed ${data.chats.length} files into chats!`);
+                
+                // Clear selection
+                selectedFiles = [];
+                updateSelectedFilesDisplay();
+                
+                // Switch to My Chats tab
+                showTab('my-chats');
+                
+            } catch (error) {
+                console.error('Error processing files:', error);
+                alert('Failed to process files');
+            }
+        }
+
+        function formatFileSize(bytes) {
+            if (bytes === 0) return '0 Bytes';
+            const k = 1024;
+            const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
+        }
+    </script>
+</body>
+</html>
+
+```
+
+script.py.mako:
+```
+"""${message}
+
+Revision ID: ${up_revision}
+Revises: ${down_revision | comma,n}
+Create Date: ${create_date}
+
+"""
+from alembic import op
+import sqlalchemy as sa
+${imports if imports else ""}
+
+# revision identifiers, used by Alembic.
+revision = ${repr(up_revision)}
+down_revision = ${repr(down_revision)}
+branch_labels = ${repr(branch_labels)}
+depends_on = ${repr(depends_on)}
+
+
+def upgrade() -> None:
+    ${upgrades if upgrades else "pass"}
+
+
+def downgrade() -> None:
+    ${downgrades if downgrades else "pass"}
+
+```
+
+env.py:
+```
+from logging.config import fileConfig
+from sqlalchemy import engine_from_config
+from sqlalchemy import pool
+from alembic import context
+import sys
+import os
+
+# Add the parent directory to the path
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
+from app.core.config import settings
+from app.db.base import Base
+
+# this is the Alembic Config object
+config = context.config
+
+# Override sqlalchemy.url with the one from settings
+config.set_main_option('sqlalchemy.url', settings.DATABASE_URL)
+
+# Interpret the config file for Python logging.
+if config.config_file_name is not None:
+    fileConfig(config.config_file_name)
+
+# add your model's MetaData object here
+target_metadata = Base.metadata
+
+
+def run_migrations_offline() -> None:
+    """Run migrations in 'offline' mode.
+
+    This configures the context with just a URL
+    and not an Engine, though an Engine is acceptable
+    here as well.  By skipping the Engine creation
+    we don't even need a DBAPI to be available.
+
+    Calls to context.execute() here emit the given string to the
+    script output.
+
+    """
+    url = config.get_main_option("sqlalchemy.url")
+    context.configure(
+        url=url,
+        target_metadata=target_metadata,
+        literal_binds=True,
+        dialect_opts={"paramstyle": "named"},
+    )
+
+    with context.begin_transaction():
+        context.run_migrations()
+
+
+def run_migrations_online() -> None:
+    """Run migrations in 'online' mode.
+
+    In this scenario we need to create an Engine
+    and associate a connection with the context.
+
+    """
+    connectable = engine_from_config(
+        config.get_section(config.config_ini_section, {}),
+        prefix="sqlalchemy.",
+        poolclass=pool.NullPool,
+    )
+
+    with connectable.connect() as connection:
+        context.configure(
+            connection=connection, target_metadata=target_metadata
+        )
+
+        with context.begin_transaction():
+            context.run_migrations()
+
+
+if context.is_offline_mode():
+    run_migrations_offline()
+else:
+    run_migrations_online()
+
+```
+
+.gitkeep:
+```
+
+```

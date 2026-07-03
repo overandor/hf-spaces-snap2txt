@@ -1,0 +1,1085 @@
+Project Structure:
+index.html
+requirements.txt
+Dockerfile
+README.md
+.gitignore
+style.css
+.gitattributes
+app.py
+__pycache__/app.cpython-314.pyc
+ollama_bridge/ui.py
+ollama_bridge/main.py
+ollama_bridge/core/models.py
+ollama_bridge/core/mesh.py
+ollama_bridge/core/storage.py
+ollama_bridge/core/__pycache__/mesh.cpython-314.pyc
+ollama_bridge/core/__pycache__/storage.cpython-314.pyc
+ollama_bridge/core/__pycache__/models.cpython-314.pyc
+ollama_bridge/__pycache__/main.cpython-314.pyc
+ollama_bridge/__pycache__/ui.cpython-314.pyc
+ollama_bridge/phone/sessions.py
+ollama_bridge/phone/relay.py
+ollama_bridge/phone/workers.py
+ollama_bridge/phone/__pycache__/sessions.cpython-314.pyc
+ollama_bridge/phone/__pycache__/relay.cpython-314.pyc
+ollama_bridge/phone/__pycache__/workers.cpython-314.pyc
+ollama_bridge/api/routes_sessions.py
+ollama_bridge/api/routes_mesh.py
+ollama_bridge/api/routes_chat.py
+ollama_bridge/api/__pycache__/routes_sessions.cpython-314.pyc
+ollama_bridge/api/__pycache__/routes_mesh.cpython-314.pyc
+ollama_bridge/api/__pycache__/routes_chat.cpython-314.pyc
+ollama_bridge/pages/landing.py
+ollama_bridge/pages/__pycache__/landing.cpython-314.pyc
+
+File Contents:
+index.html:
+```
+<!doctype html>
+<html>
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width" />
+		<title>My static Space</title>
+		<link rel="stylesheet" href="style.css" />
+	</head>
+	<body>
+		<div class="card">
+			<h1>Welcome to your static Space!</h1>
+			<p>You can modify this app directly by editing <i>index.html</i> in the Files and versions tab.</p>
+			<p>
+				Also don't forget to check the
+				<a href="https://huggingface.co/docs/hub/spaces" target="_blank">Spaces documentation</a>.
+			</p>
+		</div>
+	</body>
+</html>
+
+```
+
+requirements.txt:
+```
+fastapi>=0.109.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.5.0
+httpx>=0.25.2
+websockets>=12.0
+pillow>=10.1.0
+qrcode>=7.4.2
+python-multipart>=0.0.6
+
+```
+
+Dockerfile:
+```
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app.py ./
+COPY ollama_bridge/ ./ollama_bridge/
+
+RUN mkdir -p /app/data/sessions /app/data/receipts /app/ollama_bridge/static
+
+ENV PORT=7860
+EXPOSE 7860
+
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7860"]
+
+```
+
+README.md:
+```
+---
+title: Ollama Bridge
+emoji: 🌉
+colorFrom: blue
+colorTo: green
+sdk: docker
+pinned: false
+---
+
+```
+
+.gitignore:
+```
+__pycache__/
+*.pyc
+data/
+.env
+.DS_Store
+
+```
+
+style.css:
+```
+body {
+	padding: 2rem;
+	font-family: -apple-system, BlinkMacSystemFont, "Arial", sans-serif;
+}
+
+h1 {
+	font-size: 16px;
+	margin-top: 0;
+}
+
+p {
+	color: rgb(107, 114, 128);
+	font-size: 15px;
+	margin-bottom: 10px;
+	margin-top: 5px;
+}
+
+.card {
+	max-width: 620px;
+	margin: 0 auto;
+	padding: 16px;
+	border: 1px solid lightgray;
+	border-radius: 16px;
+}
+
+.card p:last-child {
+	margin-bottom: 0;
+}
+
+```
+
+.gitattributes:
+```
+*.7z filter=lfs diff=lfs merge=lfs -text
+*.arrow filter=lfs diff=lfs merge=lfs -text
+*.bin filter=lfs diff=lfs merge=lfs -text
+*.bz2 filter=lfs diff=lfs merge=lfs -text
+*.ckpt filter=lfs diff=lfs merge=lfs -text
+*.ftz filter=lfs diff=lfs merge=lfs -text
+*.gz filter=lfs diff=lfs merge=lfs -text
+*.h5 filter=lfs diff=lfs merge=lfs -text
+*.joblib filter=lfs diff=lfs merge=lfs -text
+*.lfs.* filter=lfs diff=lfs merge=lfs -text
+*.mlmodel filter=lfs diff=lfs merge=lfs -text
+*.model filter=lfs diff=lfs merge=lfs -text
+*.msgpack filter=lfs diff=lfs merge=lfs -text
+*.npy filter=lfs diff=lfs merge=lfs -text
+*.npz filter=lfs diff=lfs merge=lfs -text
+*.onnx filter=lfs diff=lfs merge=lfs -text
+*.ot filter=lfs diff=lfs merge=lfs -text
+*.parquet filter=lfs diff=lfs merge=lfs -text
+*.pb filter=lfs diff=lfs merge=lfs -text
+*.pickle filter=lfs diff=lfs merge=lfs -text
+*.pkl filter=lfs diff=lfs merge=lfs -text
+*.pt filter=lfs diff=lfs merge=lfs -text
+*.pth filter=lfs diff=lfs merge=lfs -text
+*.rar filter=lfs diff=lfs merge=lfs -text
+*.safetensors filter=lfs diff=lfs merge=lfs -text
+saved_model/**/* filter=lfs diff=lfs merge=lfs -text
+*.tar.* filter=lfs diff=lfs merge=lfs -text
+*.tar filter=lfs diff=lfs merge=lfs -text
+*.tflite filter=lfs diff=lfs merge=lfs -text
+*.tgz filter=lfs diff=lfs merge=lfs -text
+*.wasm filter=lfs diff=lfs merge=lfs -text
+*.xz filter=lfs diff=lfs merge=lfs -text
+*.zip filter=lfs diff=lfs merge=lfs -text
+*.zst filter=lfs diff=lfs merge=lfs -text
+*tfevents* filter=lfs diff=lfs merge=lfs -text
+
+```
+
+app.py:
+```
+from ollama_bridge.main import app
+
+```
+
+app.cpython-314.pyc:
+```
+Error reading file: 'utf-8' codec can't decode byte 0xe3 in position 16: invalid continuation byte
+```
+
+ui.py:
+```
+import io
+import base64
+import qrcode
+
+
+def make_worker_qr_code(url: str) -> str:
+    qr = qrcode.make(url)
+    buf = io.BytesIO()
+    qr.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode()
+
+```
+
+main.py:
+```
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse
+
+from ollama_bridge.core.storage import ensure_storage_dirs
+from ollama_bridge.pages.landing import render_landing
+
+from ollama_bridge.api.routes_sessions import router as sessions_router
+from ollama_bridge.api.routes_mesh import router as mesh_router
+from ollama_bridge.api.routes_chat import router as chat_router
+
+from ollama_bridge.phone.relay import connect_worker_websocket, disconnect_worker, handle_worker_message
+from ollama_bridge.phone.sessions import verify_worker_join_token
+
+app = FastAPI(title="Ollama Bridge", version="0.1.0")
+import os
+_static_dir = os.path.join(os.path.dirname(__file__), "static")
+os.makedirs(_static_dir, exist_ok=True)
+app.mount("/static", StaticFiles(directory=_static_dir, html=True), name="static")
+
+app.include_router(sessions_router)
+app.include_router(mesh_router)
+app.include_router(chat_router)
+
+
+@app.on_event("startup")
+async def startup():
+    ensure_storage_dirs()
+
+
+@app.get("/", response_class=HTMLResponse)
+async def landing(request: Request):
+    return render_landing()
+
+
+@app.websocket("/ws/worker/{session_id}/{worker_id}")
+async def worker_ws(ws: WebSocket, session_id: str, worker_id: str):
+    if not verify_worker_join_token(session_id, ws.query_params.get("token", "")):
+        await ws.close(code=4001, reason="Invalid token")
+        return
+    await connect_worker_websocket(session_id, worker_id, ws)
+    try:
+        while True:
+            msg = await ws.receive_json()
+            await handle_worker_message(session_id, worker_id, msg)
+    except WebSocketDisconnect:
+        await disconnect_worker(session_id, worker_id)
+
+```
+
+models.py:
+```
+from enum import Enum
+from dataclasses import dataclass, field
+from typing import List, Optional, Dict, Any
+import datetime
+
+
+class WorkerRuntimeType(str, Enum):
+    SAFARI_WASM = "safari_wasm"
+    OLLAMA = "ollama"
+
+
+class NodeType(str, Enum):
+    MAC_AGENT = "mac_agent"
+
+
+class MeshNodeStatus(str, Enum):
+    ONLINE = "online"
+    BUSY = "busy"
+    OFFLINE = "offline"
+
+
+@dataclass
+class MeshNode:
+    node_id: str
+    node_type: NodeType
+    runtime_type: WorkerRuntimeType
+    capabilities: List[str] = field(default_factory=list)
+    status: MeshNodeStatus = MeshNodeStatus.ONLINE
+    last_heartbeat: float = field(default_factory=lambda: __import__('time').time())
+    tokens_per_second: float = 0.0
+    ram_used_mb: float = 0.0
+    ram_total_mb: float = 0.0
+    cpu_usage: float = 0.0
+    thermal_state: str = "nominal"
+    battery_level: float = 100.0
+    current_job_id: Optional[str] = None
+    supported_models: List[str] = field(default_factory=list)
+    ollama_public_url: Optional[str] = None
+
+
+@dataclass
+class PhoneSession:
+    session_id: str
+    secret: str
+    owner_label: str
+    status: str = "active"
+    workers: Dict[str, Any] = field(default_factory=dict)
+    created_at: datetime.datetime = field(default_factory=datetime.datetime.utcnow)
+    expires_at: Optional[datetime.datetime] = None
+
+```
+
+mesh.py:
+```
+import time
+from typing import Dict, List, Optional
+from ollama_bridge.core.models import MeshNode, MeshNodeStatus, NodeType, WorkerRuntimeType
+
+
+class MeshRegistry:
+    _nodes: Dict[str, MeshNode] = {}
+
+    @classmethod
+    def register_node(cls, node: MeshNode) -> None:
+        cls._nodes[node.node_id] = node
+
+    @classmethod
+    def update_node_heartbeat(cls, node_id: str, metrics: dict) -> None:
+        node = cls._nodes.get(node_id)
+        if node:
+            node.last_heartbeat = time.time()
+            node.tokens_per_second = metrics.get("tokens_per_second", 0.0)
+            node.ram_used_mb = metrics.get("ram_used_mb", 0.0)
+            node.ram_total_mb = metrics.get("ram_total_mb", 0.0)
+            node.cpu_usage = metrics.get("cpu_usage", 0.0)
+            node.thermal_state = metrics.get("thermal_state", "nominal")
+            node.battery_level = metrics.get("battery_level", 100.0)
+            node.status = MeshNodeStatus.BUSY if metrics.get("is_generating") else MeshNodeStatus.ONLINE
+            if node.current_job_id and not metrics.get("is_generating"):
+                node.current_job_id = None
+
+    @classmethod
+    def set_ollama_url(cls, node_id: str, url: str) -> None:
+        node = cls._nodes.get(node_id)
+        if node:
+            node.ollama_public_url = url
+
+    @classmethod
+    def get_node(cls, node_id: str) -> Optional[MeshNode]:
+        return cls._nodes.get(node_id)
+
+    @classmethod
+    def list_nodes(cls) -> List[MeshNode]:
+        cls._prune_stale()
+        return list(cls._nodes.values())
+
+    @classmethod
+    def get_any_ollama_url(cls) -> Optional[str]:
+        """Return the first available public Ollama URL from any connected node."""
+        cls._prune_stale()
+        for node in cls._nodes.values():
+            if node.ollama_public_url and node.status != MeshNodeStatus.OFFLINE:
+                return node.ollama_public_url
+        return None
+
+    @classmethod
+    def get_combined_stats(cls) -> dict:
+        nodes = cls.list_nodes()
+        return {
+            "nodes_online": len([n for n in nodes if n.status != MeshNodeStatus.OFFLINE]),
+            "nodes_busy": len([n for n in nodes if n.status == MeshNodeStatus.BUSY]),
+            "total_nodes": len(nodes),
+            "combined_tokens_per_second": round(sum(n.tokens_per_second for n in nodes), 1),
+            "combined_ram_used_mb": round(sum(n.ram_used_mb for n in nodes), 0),
+            "combined_ram_total_mb": round(sum(n.ram_total_mb for n in nodes), 0),
+        }
+
+    @classmethod
+    def _prune_stale(cls, timeout: float = 60.0) -> None:
+        now = time.time()
+        for nid, n in list(cls._nodes.items()):
+            if now - n.last_heartbeat > timeout:
+                n.status = MeshNodeStatus.OFFLINE
+
+```
+
+storage.py:
+```
+import os
+
+DATA_DIR = os.getenv("HF_DATA_DIR", "data")
+
+
+def ensure_storage_dirs():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    os.makedirs(os.path.join(DATA_DIR, "sessions"), exist_ok=True)
+    os.makedirs(os.path.join(DATA_DIR, "receipts"), exist_ok=True)
+
+```
+
+mesh.cpython-314.pyc:
+```
+Error reading file: 'utf-8' codec can't decode byte 0xc2 in position 8: invalid continuation byte
+```
+
+storage.cpython-314.pyc:
+```
+Error reading file: 'utf-8' codec can't decode byte 0xc2 in position 8: invalid continuation byte
+```
+
+models.cpython-314.pyc:
+```
+Error reading file: 'utf-8' codec can't decode byte 0xc2 in position 8: invalid continuation byte
+```
+
+main.cpython-314.pyc:
+```
+Error reading file: 'utf-8' codec can't decode byte 0xc2 in position 8: invalid continuation byte
+```
+
+ui.cpython-314.pyc:
+```
+Error reading file: 'utf-8' codec can't decode byte 0xc2 in position 8: invalid continuation byte
+```
+
+sessions.py:
+```
+import uuid
+import datetime
+from typing import Optional, Dict
+from ollama_bridge.core.models import PhoneSession
+
+
+_sessions: Dict[str, PhoneSession] = {}
+
+
+def create_phone_session(owner_label: str = "") -> PhoneSession:
+    sid = f"sess_{uuid.uuid4().hex[:12]}"
+    secret = f"tok_{uuid.uuid4().hex[:16]}"
+    session = PhoneSession(
+        session_id=sid,
+        secret=secret,
+        owner_label=owner_label,
+        expires_at=datetime.datetime.utcnow() + datetime.timedelta(hours=24),
+    )
+    _sessions[sid] = session
+    return session
+
+
+def get_session(session_id: str) -> Optional[PhoneSession]:
+    return _sessions.get(session_id)
+
+
+def verify_worker_join_token(session_id: str, token: str) -> bool:
+    s = _sessions.get(session_id)
+    return s is not None and s.secret == token if s else False
+
+
+def list_all_sessions():
+    return list(_sessions.values())
+
+
+def make_worker_join_url(session_id: str, secret: str) -> str:
+    import os
+    public_url = os.getenv("SPACE_PUBLIC_URL", "")
+    if not public_url:
+        public_url = "https://josephrw-ollama-bridge.hf.space"
+    return f"{public_url}/phone?session={session_id}&token={secret}"
+
+```
+
+relay.py:
+```
+from typing import Dict, Any
+from fastapi import WebSocket
+
+from ollama_bridge.phone.sessions import get_session
+from ollama_bridge.phone.workers import register_worker, get_worker, update_worker_heartbeat, register_capabilities
+from ollama_bridge.core.models import WorkerRuntimeType, MeshNode, NodeType
+from ollama_bridge.core.mesh import MeshRegistry
+
+
+_session_sockets: Dict[str, Dict[str, WebSocket]] = {}
+
+
+async def connect_worker_websocket(session_id: str, worker_id: str, ws: WebSocket) -> None:
+    if session_id not in _session_sockets:
+        _session_sockets[session_id] = {}
+    _session_sockets[session_id][worker_id] = ws
+    await ws.accept()
+
+
+async def disconnect_worker(session_id: str, worker_id: str) -> None:
+    if session_id in _session_sockets and worker_id in _session_sockets[session_id]:
+        del _session_sockets[session_id][worker_id]
+
+
+async def send_to_worker(session_id: str, worker_id: str, message: dict) -> None:
+    ws = _session_sockets.get(session_id, {}).get(worker_id)
+    if ws:
+        await ws.send_json(message)
+
+
+async def broadcast_session_update(session_id: str) -> None:
+    workers = list(_session_sockets.get(session_id, {}).values())
+    for ws in workers:
+        try:
+            await ws.send_json({"op": "session_update"})
+        except Exception:
+            pass
+
+
+async def handle_worker_message(session_id: str, worker_id: str, message: dict) -> None:
+    op = message.get("op")
+    if op == "worker_hello":
+        runtime_str = message.get("runtime_type", "safari_wasm")
+        try:
+            runtime = WorkerRuntimeType(runtime_str)
+        except ValueError:
+            runtime = WorkerRuntimeType.SAFARI_WASM
+        # Ollama-only space: reject non-Mac workers
+        if runtime != WorkerRuntimeType.OLLAMA:
+            await send_to_worker(session_id, worker_id, {
+                "op": "worker_rejected",
+                "reason": "This Space only accepts Mac Agent (Ollama) compute nodes."
+            })
+            return
+        w = register_worker(session_id, worker_id, runtime, message.get("device_public_key"))
+        MeshRegistry.register_node(MeshNode(
+            node_id=worker_id,
+            node_type=NodeType.MAC_AGENT,
+            runtime_type=runtime,
+            capabilities=[],
+        ))
+        if w:
+            w.device_model = message.get("device_model")
+            w.device_imei = message.get("device_imei")
+        await send_to_worker(session_id, worker_id, {"op": "worker_welcome", "worker_id": worker_id})
+
+    elif op == "capabilities":
+        caps = message.get("capabilities", [])
+        register_capabilities(session_id, worker_id, caps)
+        node = MeshRegistry.get_node(worker_id)
+        if node:
+            node.capabilities = [c.get("capability_name", "") for c in caps]
+        await broadcast_session_update(session_id)
+
+    elif op == "heartbeat":
+        update_worker_heartbeat(
+            session_id, worker_id,
+            message.get("battery_level"),
+            message.get("thermal_state"),
+            message.get("cpu_usage"),
+            message.get("ram_used_mb"),
+            message.get("ram_total_mb"),
+            message.get("tokens_per_second")
+        )
+        MeshRegistry.update_node_heartbeat(worker_id, {
+            "tokens_per_second": message.get("tokens_per_second", 0.0),
+            "ram_used_mb": message.get("ram_used_mb", 0.0),
+            "ram_total_mb": message.get("ram_total_mb", 0.0),
+            "cpu_usage": message.get("cpu_usage", 0.0),
+            "thermal_state": message.get("thermal_state", "nominal"),
+            "battery_level": message.get("battery_level", 100.0),
+            "is_generating": message.get("is_generating", False),
+        })
+
+    elif op == "ollama_url":
+        url = message.get("public_url")
+        if url:
+            MeshRegistry.set_ollama_url(worker_id, url)
+        await send_to_worker(session_id, worker_id, {"op": "ollama_url_ack", "received": True})
+
+```
+
+workers.py:
+```
+from typing import Dict, Any, List
+from ollama_bridge.core.models import WorkerRuntimeType
+
+
+class Worker:
+    def __init__(self, worker_id: str, runtime_type: WorkerRuntimeType, public_key: str = None):
+        self.worker_id = worker_id
+        self.runtime_type = runtime_type
+        self.public_key = public_key
+        self.is_connected = True
+        self.tokens_per_second = 0.0
+        self.capabilities: List[Dict[str, Any]] = []
+        self.device_model = None
+        self.device_imei = None
+
+
+_workers_by_session: Dict[str, Dict[str, Worker]] = {}
+
+
+def register_worker(session_id: str, worker_id: str, runtime_type: WorkerRuntimeType, public_key: str = None) -> Worker:
+    if session_id not in _workers_by_session:
+        _workers_by_session[session_id] = {}
+    w = Worker(worker_id, runtime_type, public_key)
+    _workers_by_session[session_id][worker_id] = w
+    return w
+
+
+def get_worker(session_id: str, worker_id: str) -> Worker:
+    return _workers_by_session.get(session_id, {}).get(worker_id)
+
+
+def list_workers_for_session(session_id: str) -> List[Worker]:
+    return list(_workers_by_session.get(session_id, {}).values())
+
+
+def update_worker_heartbeat(session_id: str, worker_id: str, battery: float, thermal: str, cpu: float, ram_used: float, ram_total: float, tps: float):
+    w = get_worker(session_id, worker_id)
+    if w:
+        w.tokens_per_second = tps or 0.0
+
+
+def register_capabilities(session_id: str, worker_id: str, caps: List[dict]):
+    w = get_worker(session_id, worker_id)
+    if w:
+        w.capabilities = caps
+
+```
+
+sessions.cpython-314.pyc:
+```
+Error reading file: 'utf-8' codec can't decode byte 0xc2 in position 8: invalid continuation byte
+```
+
+relay.cpython-314.pyc:
+```
+Error reading file: 'utf-8' codec can't decode byte 0xc2 in position 8: invalid continuation byte
+```
+
+workers.cpython-314.pyc:
+```
+Error reading file: 'utf-8' codec can't decode byte 0xc2 in position 8: invalid continuation byte
+```
+
+routes_sessions.py:
+```
+import uuid
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+from ollama_bridge.phone.sessions import create_phone_session, get_session, make_worker_join_url
+from ollama_bridge.ui import make_worker_qr_code
+
+router = APIRouter(prefix="/api/gbridge")
+
+_ollama_public_urls: dict = {}
+
+
+class CreateSessionRequest(BaseModel):
+    owner_label: str = ""
+
+
+@router.post("/session")
+async def create_session_route(req: CreateSessionRequest):
+    session = create_phone_session(owner_label=req.owner_label)
+    worker_url = make_worker_join_url(session.session_id, session.secret)
+    qr_b64 = make_worker_qr_code(worker_url)
+    return {
+        "session_id": session.session_id,
+        "join_token": session.secret,
+        "space_url": worker_url,
+        "qr_code_base64": qr_b64,
+        "expires_at": session.expires_at.isoformat() if session.expires_at else None,
+    }
+
+
+@router.get("/session/{session_id}")
+async def get_session_route(session_id: str):
+    s = get_session(session_id)
+    if not s:
+        raise HTTPException(status_code=404, detail="Session not found")
+    from ollama_bridge.phone.workers import list_workers_for_session
+    return {
+        "session_id": s.session_id,
+        "status": s.status,
+        "worker_count": len(list_workers_for_session(session_id)),
+        "created_at": s.created_at.isoformat(),
+    }
+
+
+@router.post("/session/{session_id}/ollama-url")
+async def set_ollama_url(session_id: str, payload: dict):
+    s = get_session(session_id)
+    if not s:
+        raise HTTPException(status_code=404, detail="Session not found")
+    url = payload.get("ollama_public_url")
+    if not url:
+        raise HTTPException(status_code=400, detail="Missing ollama_public_url")
+    _ollama_public_urls[session_id] = url
+    return {"status": "ok", "ollama_public_url": url}
+
+
+@router.get("/session/{session_id}/ollama-url")
+async def get_ollama_url(session_id: str):
+    return {"ollama_public_url": _ollama_public_urls.get(session_id)}
+
+```
+
+routes_mesh.py:
+```
+from typing import Dict, Any, List
+from fastapi import APIRouter
+from ollama_bridge.core.mesh import MeshRegistry
+from ollama_bridge.core.models import NodeType
+
+router = APIRouter(prefix="/api/mesh")
+
+
+@router.get("/nodes")
+async def list_nodes() -> List[Dict[str, Any]]:
+    nodes = [n for n in MeshRegistry.list_nodes() if n.node_type == NodeType.MAC_AGENT]
+    return [
+        {
+            "node_id": n.node_id,
+            "node_type": n.node_type.value,
+            "status": n.status.value,
+            "tokens_per_second": n.tokens_per_second,
+            "ram_used_mb": n.ram_used_mb,
+            "ram_total_mb": n.ram_total_mb,
+            "cpu_usage": n.cpu_usage,
+            "thermal_state": n.thermal_state,
+            "battery_level": n.battery_level,
+            "ollama_public_url": n.ollama_public_url,
+        }
+        for n in nodes
+    ]
+
+
+@router.get("/status")
+async def mesh_status() -> Dict[str, Any]:
+    return MeshRegistry.get_combined_stats()
+
+```
+
+routes_chat.py:
+```
+import json
+from typing import AsyncGenerator, Dict, Any, List, Optional
+from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+import httpx
+
+from ollama_bridge.core.mesh import MeshRegistry
+
+router = APIRouter(prefix="/api/chat")
+
+DEFAULT_MODEL = "llama3.2"
+
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+
+class ChatRequest(BaseModel):
+    messages: List[ChatMessage]
+    model: Optional[str] = None
+    temperature: float = 0.7
+    max_tokens: int = 1024
+    stream: bool = True
+
+
+def _build_ollama_payload(request: ChatRequest) -> Dict[str, Any]:
+    return {
+        "model": request.model or DEFAULT_MODEL,
+        "messages": [{"role": m.role, "content": m.content} for m in request.messages],
+        "stream": request.stream,
+        "options": {
+            "temperature": request.temperature,
+            "num_predict": request.max_tokens,
+        },
+    }
+
+
+async def _stream_ollama(payload: Dict[str, Any], base_url: str) -> AsyncGenerator[str, None]:
+    url = f"{base_url.rstrip('/')}/api/chat"
+    headers = {"Content-Type": "application/json"}
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        async with client.stream("POST", url, json=payload, headers=headers) as resp:
+            if resp.status_code != 200:
+                body = await resp.aread()
+                yield f"data: {json.dumps({'error': f'Ollama error {resp.status_code}'})}\n\n"
+                return
+            async for line in resp.aiter_lines():
+                if not line:
+                    continue
+                try:
+                    parsed = json.loads(line)
+                    content = parsed.get("message", {}).get("content", "")
+                    done = parsed.get("done", False)
+                    if content:
+                        yield f"data: {json.dumps({'content': content})}\n\n"
+                    if done:
+                        yield f"data: {json.dumps({'done': True})}\n\n"
+                        break
+                except json.JSONDecodeError:
+                    continue
+
+
+async def _chat_nonstream(payload: Dict[str, Any], base_url: str) -> Dict[str, Any]:
+    url = f"{base_url.rstrip('/')}/api/chat"
+    headers = {"Content-Type": "application/json"}
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        resp = await client.post(url, json=payload, headers=headers)
+        if resp.status_code != 200:
+            raise HTTPException(status_code=resp.status_code, detail=resp.text)
+        return resp.json()
+
+
+@router.post("/completions")
+async def chat_completions(request: ChatRequest):
+    # Ollama-only: discover public URL from mesh, fallback to local Space Ollama
+    public_url = MeshRegistry.get_any_ollama_url()
+    base_url = public_url or "http://localhost:11434"
+
+    payload = _build_ollama_payload(request)
+    if request.stream:
+        return StreamingResponse(
+            _stream_ollama(payload, base_url),
+            media_type="text/event-stream",
+            headers={"X-Ollama-Source": "agent-tunnel" if public_url else "local"},
+        )
+    return await _chat_nonstream(payload, base_url)
+
+```
+
+routes_sessions.cpython-314.pyc:
+```
+Error reading file: 'utf-8' codec can't decode byte 0xc2 in position 8: invalid continuation byte
+```
+
+routes_mesh.cpython-314.pyc:
+```
+Error reading file: 'utf-8' codec can't decode byte 0xc2 in position 8: invalid continuation byte
+```
+
+routes_chat.cpython-314.pyc:
+```
+Error reading file: 'utf-8' codec can't decode byte 0xc2 in position 8: invalid continuation byte
+```
+
+landing.py:
+```
+from fastapi.responses import HTMLResponse
+
+
+def render_landing() -> HTMLResponse:
+    return HTMLResponse(content=_landing_html(), status_code=200)
+
+
+def _landing_html() -> str:
+    return """<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ollama Bridge</title>
+<style>
+:root{--bg:#030305;--surface:#0a0a0f;--surface-2:#12121a;--border:rgba(255,255,255,.06);--text:#f0f0f5;--muted:#6b6b78;--cyan:#00f0ff;--green:#34d399;--red:#f87171;--amber:#fbbf24}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Display',sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
+.nav{position:fixed;top:0;left:0;right:0;z-index:100;display:flex;align-items:center;justify-content:space-between;padding:16px 32px;backdrop-filter:blur(20px);background:rgba(3,3,5,.7);border-bottom:1px solid var(--border)}
+.nav .logo{font-weight:700;font-size:15px;display:flex;align-items:center;gap:10px}
+.nav .logo span{color:var(--cyan);font-size:18px}
+.hero{padding:120px 24px 60px;text-align:center;position:relative;overflow:hidden}
+.hero::before{content:'';position:absolute;inset:0;background:radial-gradient(circle at 50% 30%,rgba(0,240,255,.06) 0%,transparent 50%)}
+.hero h1{font-size:clamp(36px,6vw,64px);font-weight:800;letter-spacing:-2px;line-height:1.05;background:linear-gradient(135deg,#fff 20%,var(--cyan) 80%);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.hero .subtitle{color:var(--muted);max-width:520px;margin:16px auto 32px;font-size:17px;line-height:1.6}
+.tagline{font-family:'SF Mono',monospace;font-size:11px;color:var(--cyan);letter-spacing:3px;text-transform:uppercase;margin-bottom:16px;opacity:.7}
+.btn{padding:10px 20px;border-radius:10px;font-size:13px;font-weight:600;cursor:pointer;border:none;transition:.2s;text-decoration:none;display:inline-flex;align-items:center;gap:6px}
+.btn-primary{background:linear-gradient(135deg,var(--cyan),#00c8d6);color:#000}
+.btn-ghost{background:transparent;color:var(--text);border:1px solid var(--border)}
+.dashboard{max-width:1200px;margin:0 auto;padding:0 24px 40px;display:grid;grid-template-columns:1fr 380px;gap:20px}
+@media(max-width:900px){.dashboard{grid-template-columns:1fr}}
+.panel{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:20px}
+.panel h3{font-size:13px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);margin-bottom:16px;display:flex;align-items:center;gap:8px}
+.panel h3 .dot{width:6px;height:6px;border-radius:50%;background:var(--green);box-shadow:0 0 6px var(--green)}
+.chat-box{display:flex;flex-direction:column;height:420px}
+.chat-messages{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:12px;padding-right:4px;margin-bottom:12px}
+.msg{max-width:85%;padding:10px 14px;border-radius:12px;font-size:13px;line-height:1.5;word-break:break-word}
+.msg.user{align-self:flex-end;background:var(--surface-2);border:1px solid var(--border);border-bottom-right-radius:4px}
+.msg.assistant{align-self:flex-start;background:rgba(0,240,255,.04);border:1px solid rgba(0,240,255,.1);border-bottom-left-radius:4px}
+.msg.error{align-self:flex-start;background:rgba(248,113,113,.08);border:1px solid rgba(248,113,113,.2);color:var(--red)}
+.chat-input{display:flex;gap:8px}
+.chat-input input{flex:1;background:var(--surface-2);border:1px solid var(--border);border-radius:10px;padding:10px 14px;color:var(--text);font-size:13px;outline:none}
+.chat-input input:focus{border-color:var(--cyan)}
+.chat-input button{background:var(--cyan);color:#000;border:none;border-radius:10px;padding:0 16px;font-size:13px;font-weight:600;cursor:pointer}
+.typing{display:flex;gap:4px;align-items:center;padding:8px 14px}
+.typing span{width:6px;height:6px;background:var(--cyan);border-radius:50%;animation:bounce 1.4s infinite}
+.typing span:nth-child(2){animation-delay:.2s}
+.typing span:nth-child(3){animation-delay:.4s}
+@keyframes bounce{0%,80%,100%{transform:scale(0)}40%{transform:scale(1)}}
+.qr-display{text-align:center;padding:20px;background:var(--surface-2);border-radius:12px;border:1px dashed var(--border);min-height:200px;display:flex;flex-direction:column;align-items:center;justify-content:center}
+.qr-display img{width:180px;height:180px;border-radius:8px}
+.mesh-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-top:12px}
+.mesh-node{padding:12px;background:var(--surface-2);border-radius:10px;border:1px solid var(--border);text-align:center}
+.mesh-node .node-icon{font-size:20px;margin-bottom:6px}
+footer{padding:40px 24px;text-align:center;color:var(--muted);font-size:12px;border-top:1px solid var(--border);margin-top:40px}
+</style>
+</head>
+<body>
+<nav class="nav">
+  <div class="logo"><span>&#9670;</span> Ollama Bridge</div>
+</nav>
+
+<section class="hero">
+  <div class="tagline">Local LLM, Global Bridge</div>
+  <h1>Your Ollama. Anywhere.</h1>
+  <p class="subtitle">Connect your Mac's Ollama instance to this Space. Chat, generate, embed — all routed to your local compute. No remote LLMs.</p>
+</section>
+
+<div class="dashboard">
+  <div class="left-col" style="display:flex;flex-direction:column;gap:20px">
+    <div class="panel">
+      <h3><span class="dot"></span>Chat with Your Ollama</h3>
+      <div class="chat-box">
+        <div class="chat-messages scrollbar" id="chatMessages">
+          <div class="msg assistant">Welcome. Connect your Mac via the panel on the right, then type a message to chat with your local Ollama.</div>
+        </div>
+        <div class="chat-input">
+          <input type="text" id="chatInput" placeholder="Message..." onkeydown="if(event.key==='Enter')sendChat()">
+          <button id="chatSend" onclick="sendChat()">Send</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="right-col" style="display:flex;flex-direction:column;gap:20px">
+    <div class="panel">
+      <h3><span class="dot"></span>Connect Your Mac</h3>
+      <div style="display:flex;gap:8px;margin-bottom:12px">
+        <button class="btn btn-primary" style="flex:1" id="createSessionBtn" onclick="createSession()">Create Session</button>
+        <button class="btn btn-ghost" onclick="refreshStatus()">&#8635;</button>
+      </div>
+      <div class="qr-display" id="qrDisplay">
+        <div style="color:var(--muted);font-size:13px">Click "Create Session" for a QR code to connect your Mac app</div>
+      </div>
+      <div class="session-info" id="sessionInfo" style="display:none;margin-top:12px;font-size:11px;color:var(--muted);font-family:monospace;word-break:break-all;background:var(--surface-2);padding:8px;border-radius:8px"></div>
+    </div>
+
+    <div class="panel">
+      <h3><span class="dot" id="meshDot"></span>Ollama Nodes</h3>
+      <div id="meshTopology">
+        <div style="color:var(--muted);font-size:12px;text-align:center;padding:20px">No Ollama nodes connected.</div>
+      </div>
+      <div style="margin-top:12px;padding:10px;background:var(--surface-2);border-radius:8px;font-size:11px;color:var(--muted)">
+        <strong>Combined throughput:</strong> <span id="meshTps" style="color:var(--cyan);font-family:monospace">0</span> t/s
+      </div>
+    </div>
+  </div>
+</div>
+
+<footer>Ollama Bridge &middot; 2026<br><span style="color:var(--muted)">Local inference through your own hardware.</span></footer>
+
+<script>
+let sessionId = '';
+let token = '';
+let history = [];
+
+function escapeHtml(t) { const d = document.createElement('div'); d.textContent = t; return d.innerHTML; }
+
+async function createSession() {
+  const btn = document.getElementById('createSessionBtn');
+  btn.disabled = true; btn.textContent = 'Creating...';
+  try {
+    const r = await fetch('/api/gbridge/session', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});
+    const d = await r.json();
+    sessionId = d.session_id; token = d.join_token;
+    document.getElementById('qrDisplay').innerHTML = '<img src="data:image/png;base64,' + d.qr_code_base64 + '"><div style="font-size:11px;color:var(--muted);margin-top:8px">Scan with Mac app</div>';
+    const info = document.getElementById('sessionInfo');
+    info.style.display = 'block';
+    info.innerHTML = '<strong>Session:</strong> ' + sessionId.slice(0,16) + '...<br><strong>Token:</strong> ' + token.slice(0,16) + '...';
+    refreshStatus();
+  } catch(e) {
+    document.getElementById('qrDisplay').innerHTML = '<div style="color:var(--red)">Failed: ' + e.message + '</div>';
+  } finally { btn.disabled = false; btn.textContent = 'Create Session'; }
+}
+
+async function sendChat() {
+  const input = document.getElementById('chatInput');
+  const btn = document.getElementById('chatSend');
+  const text = input.value.trim();
+  if(!text) return;
+  input.value = ''; btn.disabled = true;
+  const msgs = document.getElementById('chatMessages');
+  msgs.innerHTML += '<div class="msg user">' + escapeHtml(text) + '</div>';
+  msgs.innerHTML += '<div class="msg assistant typing" id="typing"><span></span><span></span><span></span></div>';
+  msgs.scrollTop = msgs.scrollHeight;
+  history.push({role:'user',content:text});
+
+  try {
+    const r = await fetch('/api/chat/completions', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({messages:history,stream:true,max_tokens:512})});
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder();
+    let assistantText = '';
+    let started = false;
+    document.getElementById('typing').remove();
+
+    while(true) {
+      const {value,done} = await reader.read();
+      if(done) break;
+      const chunk = decoder.decode(value,{stream:true});
+      const lines = chunk.split('\\n');
+      for(const line of lines) {
+        if(!line.startsWith('data: ')) continue;
+        const data = line.slice(6).trim();
+        if(!data || data === '[DONE]') continue;
+        try {
+          const obj = JSON.parse(data);
+          if(obj.error) { msgs.innerHTML += '<div class="msg error">Error: ' + escapeHtml(obj.error) + '</div>'; break; }
+          if(obj.done) break;
+          if(obj.content) {
+            if(!started) { msgs.innerHTML += '<div class="msg assistant" id="currentMsg">' + escapeHtml(obj.content) + '</div>'; started = true; }
+            else { const el = document.getElementById('currentMsg'); if(el) el.innerHTML += escapeHtml(obj.content); }
+            assistantText += obj.content;
+          }
+        } catch(e) {}
+      }
+    }
+    history.push({role:'assistant',content:assistantText || '(no response)'});
+  } catch(err) {
+    document.getElementById('typing')?.remove();
+    msgs.innerHTML += '<div class="msg error">Error: ' + escapeHtml(err.message) + '</div>';
+  } finally { btn.disabled = false; msgs.scrollTop = msgs.scrollHeight; }
+}
+
+async function refreshStatus() {
+  try {
+    const r = await fetch('/api/mesh/nodes');
+    const nodes = await r.json();
+    const ms = await fetch('/api/mesh/status');
+    const stats = await ms.json();
+    document.getElementById('meshTps').textContent = stats.combined_tokens_per_second || 0;
+    const mt = document.getElementById('meshTopology');
+    if(nodes.length === 0) {
+      mt.innerHTML = '<div style="color:var(--muted);font-size:12px;text-align:center;padding:20px">No Ollama nodes connected. Create a session and connect your Mac.</div>';
+      document.getElementById('meshDot').style.background = 'var(--muted)';
+    } else {
+      let html = '<div class="mesh-grid">';
+      for(const n of nodes) {
+        const statusColor = n.status === 'online' ? 'var(--green)' : (n.status === 'busy' ? 'var(--amber)' : 'var(--red)');
+        html += '<div class="mesh-node">';
+        html += '<div class="node-icon">&#128187;</div>';
+        html += '<div style="font-size:11px;font-weight:600;margin-bottom:4px">' + escapeHtml(n.node_id.slice(0,12)) + '...</div>';
+        html += '<div style="font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px">mac_agent</div>';
+        html += '<div><span style="width:6px;height:6px;border-radius:50%;display:inline-block;margin-right:4px;background:' + statusColor + '"></span>' + n.status + '</div>';
+        if(n.tokens_per_second > 0) html += '<div style="font-size:10px;color:var(--cyan);font-family:monospace">' + n.tokens_per_second.toFixed(1) + ' t/s</div>';
+        if(n.ollama_public_url) html += '<div style="font-size:9px;color:var(--green);margin-top:4px">&#127758; Public</div>';
+        html += '</div>';
+      }
+      html += '</div>';
+      mt.innerHTML = html;
+      const anyOnline = nodes.some(n => n.status === 'online' || n.status === 'busy');
+      document.getElementById('meshDot').style.background = anyOnline ? 'var(--green)' : 'var(--red)';
+      document.getElementById('meshDot').style.boxShadow = anyOnline ? '0 0 6px var(--green)' : '0 0 6px var(--red)';
+    }
+  } catch(e) { console.error('Mesh error', e); }
+}
+
+refreshStatus();
+setInterval(refreshStatus, 10000);
+</script>
+</body>
+</html>"""
+
+```
+
+landing.cpython-314.pyc:
+```
+Error reading file: 'utf-8' codec can't decode byte 0xc2 in position 8: invalid continuation byte
+```

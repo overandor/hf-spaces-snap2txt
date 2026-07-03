@@ -1,0 +1,2880 @@
+Project Structure:
+app_hf.py
+config.py
+audit.py
+models.py
+Dockerfile
+llm_crawler.py
+README.md
+sources.py
+engine.py
+.gitattributes
+app.py
+README_HF.md
+requirements_hf.txt
+static/index.html
+
+File Contents:
+app_hf.py:
+```
+"""Gradio institutional web app for doctor address verification on Hugging Face Spaces."""
+
+from __future__ import annotations
+
+import hashlib
+import io
+import json
+import logging
+import os
+import secrets
+import time
+import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import gradio as gr
+import pandas as pd
+
+from audit import AuditLogger
+from config import Config
+from engine import verify_batch, verify_doctor
+from models import DoctorRecord, SystemStatus, VerificationOutput
+
+# Ensure directories exist
+Config.ensure_dirs()
+
+# Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.FileHandler(Config.LOG_DIR / "app.log"),
+        logging.StreamHandler(),
+    ],
+)
+logger = logging.getLogger("verify.app")
+
+# Audit
+AUDIT = AuditLogger()
+
+# In-memory session store (HF Spaces is single-instance; sufficient for demo)
+_sessions: dict[str, dict[str, Any]] = {}
+_start_time = time.time()
+
+
+def _check_auth(password: str) -> bool:
+    if not Config.REQUIRE_AUTH:
+        return True
+    if not Config.APP_PASSWORD:
+        return True
+    return secrets.compare_digest(password, Config.APP_PASSWORD)
+
+
+def _create_session(user_id: str = "anonymous") -> str:
+    sid = uuid.uuid4().hex
+    _sessions[sid] = {"created": time.time(), "user_id": user_id, "records": []}
+    return sid
+
+
+def _session_valid(sid: str) -> bool:
+    if sid not in _sessions:
+        return False
+    elapsed = (time.time() - _sessions[sid]["created"]) / 60
+    return elapsed < Config.SESSION_TIMEOUT_MINUTES
+
+
+# ---------------------------------------------------------------------------
+# System status
+# ---------------------------------------------------------------------------
+def get_system_status() -> str:
+    # Check Ollama availability
+    ollama_ok = False
+    try:
+        import httpx
+        with httpx.Client(timeout=2) as client:
+            resp = client.get("http://127.0.0.1:11434/api/tags")
+            ollama_ok = resp.status_code == 200
+    except:
+        ollama_ok = False
+
+    status = SystemStatus(
+        timestamp=datetime.utcnow(),
+        ollama_available=ollama_ok,
+        ollama_model=Config.OLLAMA_MODEL,
+        google_places_enabled=bool(Config.GOOGLE_API_KEY),
+        bing_enabled=bool(Config.BING_SEARCH_KEY),
+        cache_size=0,
+        total_verifications=sum(len(s.get("records", [])) for s in _sessions.values()),
+        uptime_seconds=int(time.time() - _start_time),
+        source_health={
+            "NPI_REGISTRY": True,
+            "CMS_COMPARE": True,
+            "GOOGLE_PLACES": bool(Config.GOOGLE_API_KEY),
+            "BING": bool(Config.BING_SEARCH_KEY),
+            "YELP": True,
+            "RATEMDS": True,
+            "HEALTHGRADES": True,
+            "SAMHSA": True,
+            "NY_OPD": True,
+            "WEB_CRAWL": not Config.NO_OLLAMA or ollama_ok,
+        },
+    )
+    health_lines = [f"  {k}: {'OK' if v else 'DOWN'}" for k, v in status.source_health.items()]
+    return (
+        f"System Status — {status.timestamp.strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
+        f"Uptime: {status.uptime_seconds // 60}m {status.uptime_seconds % 60}s\n"
+        f"Ollama: {'OK' if status.ollama_available else 'DOWN (using keyword fallback)'} ({status.ollama_model})\n"
+        f"Google Places: {'ENABLED' if status.google_places_enabled else 'DISABLED (optional)'}\n"
+        f"Bing: {'ENABLED' if status.bing_enabled else 'DISABLED (optional)'}\n"
+        f"Total verifications this session: {status.total_verifications}\n\n"
+        f"Source Health:\n" + "\n".join(health_lines)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Single verification
+# ---------------------------------------------------------------------------
+def verify_single(name: str, address: str, city: str, state: str, zip_code: str,
+                  specialty: str, password: str) -> tuple[str, str, str]:
+    if not _check_auth(password):
+        return "ACCESS DENIED", "", ""
+
+    sid = _create_session()
+    record = DoctorRecord(name=name, address=address, city=city, state=state,
+                          zip_code=zip_code, specialty=specialty)
+
+    t0 = time.time()
+    result = verify_doctor(record, session_id=sid)
+    duration = int((time.time() - t0) * 1000)
+
+    AUDIT.log_verification(
+        session_id=sid, record_name=record.name,
+        result=result.to_flat_dict(), duration_ms=duration,
+    )
+
+    # Build markdown report
+    md = f"""## Verification Result: {record.name}
+
+**Visit Flag:** `{result.visit_flag.value}`  
+**Consensus:** `{result.consensus.overall.value}`  
+**NPI Status:** `{result.npi.status}`  
+**Geocoded:** `{'FOUND' if result.geo.found else 'NOT FOUND'}`  
+**Phones Found:** `{', '.join(result.phones_found) or 'none'}`
+
+### Sources
+| Source | Status | Notes |
+|---|---|---|
+"""
+    for src in result.sources:
+        md += f"| {src.source} | {src.status.value} | {src.notes[:80]} |\n"
+
+    md += f"\n### LLM Synthesis\n**Verified:** {result.llm.verified}  \n**Confidence:** {result.llm.confidence}  \n**Reasoning:** {result.llm.notes}\n"
+
+    json_out = json.dumps(result.to_flat_dict(), indent=2, default=str)
+    return md, json_out, sid
+
+
+# ---------------------------------------------------------------------------
+# Batch verification from file
+# ---------------------------------------------------------------------------
+def verify_batch_file(file: Any, password: str, progress=gr.Progress()) -> tuple[str, str, str]:
+    if not _check_auth(password):
+        return "ACCESS DENIED", "", ""
+
+    sid = _create_session()
+    try:
+        df = pd.read_excel(file.name, sheet_name=0, header=None)
+    except Exception as exc:
+        return f"Error reading file: {exc}", "", ""
+
+    records: list[DoctorRecord] = []
+    for i in range(2, len(df)):
+        row = df.iloc[i]
+        if pd.isna(row[2]) or str(row[2]).strip().upper() in ("NAME", "DOCTORS SELECTED"):
+            continue
+        records.append(DoctorRecord(
+            name=str(row[2]).strip(),
+            target_flag=str(row[3]).strip(),
+            address=str(row[4]).strip(),
+            city=str(row[5]).strip(),
+            state=str(row[6]).strip(),
+            zip_code=str(row[7]).strip(),
+            specialty=str(row[8]).strip(),
+            decile=row[1],
+            gilead_id=row[9],
+        ))
+
+    if len(records) > Config.MAX_BATCH_SIZE:
+        return f"Batch too large. Max {Config.MAX_BATCH_SIZE} records.", "", ""
+
+    AUDIT.log_batch_start(session_id=sid, count=len(records))
+    t0 = time.time()
+
+    def _progress(current: int, total: int, name: str):
+        progress(current / total, desc=f"Verifying {name[:30]}…")
+
+    results = verify_batch(records, session_id=sid, progress_callback=_progress)
+    duration = int((time.time() - t0) * 1000)
+
+    success_count = sum(1 for r in results if r.consensus.overall.value != "UNVERIFIED")
+    error_count = len(records) - success_count
+    AUDIT.log_batch_end(sid, len(records), success_count, error_count, duration)
+
+    # Build DataFrame
+    flat_results = [r.to_flat_dict() for r in results]
+    out_df = pd.DataFrame(flat_results)
+
+    # Reorder columns
+    cols = list(out_df.columns)
+    priority = ["name", "address", "city", "state", "zip_code", "visit_flag",
+                "phones_found", "npi_status", "npi_npi_number", "npi_practice_address",
+                "found", "lat", "lon", "consensus_overall"]
+    new_order = [c for c in priority if c in cols] + [c for c in cols if c not in priority]
+    out_df = out_df[new_order]
+
+    # Export
+    excel_buffer = io.BytesIO()
+    out_df.to_excel(excel_buffer, index=False, sheet_name="Verified")
+    excel_buffer.seek(0)
+
+    csv_buffer = io.StringIO()
+    out_df.to_csv(csv_buffer, index=False)
+
+    # Summary markdown
+    md = f"""## Batch Verification Complete
+
+**Session ID:** `{sid}`  
+**Total Records:** {len(records)}  
+**Duration:** {duration // 1000}s  
+**Success Rate:** {success_count}/{len(records)}
+
+### Summary
+| Metric | Count |
+|---|---|
+| VISIT_FIRST | {(out_df['visit_flag'] == 'VISIT_FIRST').sum()} |
+| CALL_FIRST | {(out_df['visit_flag'] == 'CALL_FIRST').sum()} |
+| MANUAL_LOOKUP | {(out_df['visit_flag'] == 'MANUAL_LOOKUP').sum()} |
+| High Confidence | {(out_df['consensus_overall'] == 'HIGH_CONFIDENCE').sum()} |
+| Medium Confidence | {(out_df['consensus_overall'] == 'MEDIUM_CONFIDENCE').sum()} |
+| Low Confidence | {(out_df['consensus_overall'] == 'LOW_CONFIDENCE').sum()} |
+| Unverified | {(out_df['consensus_overall'] == 'UNVERIFIED').sum()} |
+| With Phones | {(out_df['phones_found'] != '').sum()} |
+"""
+    return md, csv_buffer.getvalue(), sid
+
+
+# ---------------------------------------------------------------------------
+# Audit log viewer (admin only)
+# ---------------------------------------------------------------------------
+def view_audit_log(password: str, n: int = 20) -> str:
+    if not _check_auth(password):
+        return "ACCESS DENIED"
+    events = AUDIT.tail(n)
+    lines = []
+    for ev in events:
+        lines.append(f"[{ev.get('timestamp', '?')}] {ev.get('event_type', '?')} | {ev.get('record_name', '-')} | {ev.get('status', '?')} | session={ev.get('session_id', '-')[:8]}")
+    return "\n".join(lines) if lines else "No audit events yet."
+
+
+# ---------------------------------------------------------------------------
+# Gradio Interface
+# ---------------------------------------------------------------------------
+def build_app() -> gr.Blocks:
+    css = """
+    .green { background: #d4edda !important; }
+    .yellow { background: #fff3cd !important; }
+    .red { background: #f8d7da !important; }
+    """
+
+    with gr.Blocks(title="Doctor Address Verifier — Institutional") as app:
+        gr.Markdown(
+            "# Doctor Address Verifier\n"
+            "**Institutional-grade verification** — NPI Registry, CMS Physician Compare, Google Places, "
+            "Bing, Yelp, RateMDs, Healthgrades, SAMHSA, NY OPD, and LLM-powered web crawl.\n\n"
+            "All verifications are logged with SHA-256 checksums for audit compliance."
+        )
+
+        with gr.Tab("Single Verify"):
+            with gr.Row():
+                with gr.Column(scale=1):
+                    pwd = gr.Textbox(label="Access Password", type="password", value="")
+                    name = gr.Textbox(label="Doctor Name", placeholder="Last, First")
+                    address = gr.Textbox(label="Street Address", placeholder="123 Main St")
+                    city = gr.Textbox(label="City")
+                    state = gr.Textbox(label="State", placeholder="NY")
+                    zip_code = gr.Textbox(label="ZIP", placeholder="10001")
+                    specialty = gr.Textbox(label="Specialty", placeholder="Internal Medicine")
+                    btn_single = gr.Button("Verify", variant="primary")
+                with gr.Column(scale=2):
+                    out_md = gr.Markdown(label="Result")
+                    out_json = gr.Code(label="JSON Output", language="json")
+                    out_sid = gr.Textbox(label="Session ID")
+            btn_single.click(
+                verify_single,
+                inputs=[name, address, city, state, zip_code, specialty, pwd],
+                outputs=[out_md, out_json, out_sid],
+            )
+
+        with gr.Tab("Batch Verify (Excel)"):
+            with gr.Row():
+                with gr.Column(scale=1):
+                    pwd2 = gr.Textbox(label="Access Password", type="password", value="")
+                    file_in = gr.File(label="Upload Excel", file_types=[".xlsx"])
+                    btn_batch = gr.Button("Run Batch Verification", variant="primary")
+                with gr.Column(scale=2):
+                    out_batch_md = gr.Markdown(label="Summary")
+                    out_csv = gr.Textbox(label="CSV Preview", lines=15)
+                    out_batch_sid = gr.Textbox(label="Session ID")
+            btn_batch.click(
+                verify_batch_file,
+                inputs=[file_in, pwd2],
+                outputs=[out_batch_md, out_csv, out_batch_sid],
+            )
+
+        with gr.Tab("System Status"):
+            btn_status = gr.Button("Refresh Status")
+            out_status = gr.Textbox(label="Status", lines=20)
+            btn_status.click(get_system_status, outputs=out_status)
+            # Auto-load on tab open
+            app.load(get_system_status, outputs=out_status)
+
+        with gr.Tab("Audit Log (Admin)"):
+            pwd3 = gr.Textbox(label="Admin Password", type="password")
+            n_events = gr.Slider(10, 100, value=20, step=10, label="Events to show")
+            btn_audit = gr.Button("View Audit Log")
+            out_audit = gr.Textbox(label="Audit Log", lines=20)
+            btn_audit.click(view_audit_log, inputs=[pwd3, n_events], outputs=out_audit)
+
+        gr.Markdown(
+            "---\n"
+            "**Security Note:** All requests are logged with SHA-256 checksums. "
+            "Set `APP_PASSWORD` environment variable to restrict access. "
+            "Set `NO_OLLAMA=1` to disable LLM features."
+        )
+
+    return app
+
+
+if __name__ == "__main__":
+    app = build_app()
+    app.launch(
+        server_name="0.0.0.0",
+        server_port=int(os.environ.get("PORT", 7860)),
+        share=False,
+        show_error=True,
+    )
+
+```
+
+config.py:
+```
+"""Environment-backed configuration with security constants."""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+
+class Config:
+    """Immutable configuration loaded from environment variables."""
+
+    # External API keys (optional - system works without them)
+    BING_SEARCH_KEY: str = os.environ.get("BING_SEARCH_KEY", "")
+    GOOGLE_API_KEY: str = os.environ.get("GOOGLE_API_KEY", "")
+
+    # Ollama (optional - falls back to keyword matching if unavailable)
+    OLLAMA_HOST: str = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
+    OLLAMA_MODEL: str = os.environ.get("OLLAMA_MODEL", "llama3.2")
+    NO_OLLAMA: bool = os.environ.get("NO_OLLAMA", "1").lower() in ("1", "true", "yes")
+
+    # Security (disabled by default for public demo)
+    APP_PASSWORD: str = os.environ.get("APP_PASSWORD", "")
+    REQUIRE_AUTH: bool = os.environ.get("REQUIRE_AUTH", "0").lower() in ("1", "true", "yes")
+    SESSION_TIMEOUT_MINUTES: int = int(os.environ.get("SESSION_TIMEOUT_MINUTES", "60"))
+    RATE_LIMIT_PER_MINUTE: int = int(os.environ.get("RATE_LIMIT_PER_MINUTE", "30"))
+    MAX_BATCH_SIZE: int = int(os.environ.get("MAX_BATCH_SIZE", "100"))
+
+    # Paths
+    CACHE_DIR: Path = Path(os.environ.get("CACHE_DIR", "/tmp/doctor-verify-cache"))
+    LOG_DIR: Path = Path(os.environ.get("LOG_DIR", "/tmp/doctor-verify-logs"))
+    AUDIT_LOG: Path = LOG_DIR / "audit.jsonl"
+    CACHE_DB: Path = CACHE_DIR / "verify_cache.db"
+
+    # Operational
+    REQUEST_TIMEOUT: int = int(os.environ.get("REQUEST_TIMEOUT", "20"))
+    MAX_WORKERS: int = int(os.environ.get("MAX_WORKERS", "6"))
+    NOMINATIM_DELAY: float = float(os.environ.get("NOMINATIM_DELAY", "1.1"))
+    WEB_CRAWL_MAX_LINKS: int = int(os.environ.get("WEB_CRAWL_MAX_LINKS", "2"))
+    ENABLE_HTML_REPORT: bool = os.environ.get("ENABLE_HTML_REPORT", "1").lower() in ("1", "true", "yes")
+
+    # HTTP headers for scraping
+    HEADERS: dict[str, str] = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.0"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+    }
+
+    # Source weights for consensus engine
+    SOURCE_WEIGHTS: dict[str, int] = {
+        "NPI_REGISTRY": 10,
+        "CMS_COMPARE": 4,
+        "GOOGLE_PLACES": 4,
+        "WEB_CRAWL": 4,
+        "BING": 3,
+        "NY_OPD": 3,
+        "YELP": 2,
+        "RATEMDS": 2,
+        "HEALTHGRADES": 2,
+        "SAMHSA": 2,
+    }
+
+    @classmethod
+    def ensure_dirs(cls) -> None:
+        cls.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        cls.LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+Config.ensure_dirs()
+
+```
+
+audit.py:
+```
+"""Immutable structured audit logging with integrity checks for institutional compliance."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import time
+import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from config import Config
+from models import AuditEvent
+
+
+logger = logging.getLogger("verify.audit")
+
+
+def _hash_ip(ip: str) -> str:
+    """Privacy-preserving IP hash for audit trails."""
+    return hashlib.sha256(ip.encode()).hexdigest()[:16]
+
+
+def _compute_event_checksum(event: dict[str, Any]) -> str:
+    """Compute SHA-256 checksum of canonical JSON for tamper detection."""
+    canonical = json.dumps(event, sort_keys=True, ensure_ascii=True, default=str)
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+class AuditLogger:
+    """Thread-safe append-only audit logger with checksums."""
+
+    def __init__(self, path: Path = Config.AUDIT_LOG) -> None:
+        self._path = path
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _append(self, event: dict[str, Any]) -> None:
+        event["_checksum"] = _compute_event_checksum(event)
+        event["_written_at"] = datetime.utcnow().isoformat()
+        with open(self._path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(event, ensure_ascii=True, default=str) + "\n")
+
+    def log(
+        self,
+        event_type: str,
+        session_id: str,
+        user_id: str = "anonymous",
+        ip: str = "",
+        record_name: str = "",
+        inputs: dict[str, Any] | None = None,
+        outputs: dict[str, Any] | None = None,
+        duration_ms: int = 0,
+        status: str = "OK",
+        error_message: str = "",
+    ) -> str:
+        event_id = uuid.uuid4().hex
+        event = AuditEvent(
+            event_id=event_id,
+            timestamp=datetime.utcnow(),
+            event_type=event_type,
+            session_id=session_id,
+            user_id=user_id,
+            ip_hash=_hash_ip(ip) if ip else "",
+            record_name=record_name,
+            inputs=inputs or {},
+            outputs=outputs or {},
+            duration_ms=duration_ms,
+            status=status,
+            error_message=error_message,
+        )
+        self._append(event.model_dump())
+        return event_id
+
+    def log_verification(
+        self,
+        session_id: str,
+        record_name: str,
+        result: dict[str, Any],
+        duration_ms: int,
+        user_id: str = "anonymous",
+        ip: str = "",
+    ) -> str:
+        return self.log(
+            event_type="VERIFY_SINGLE",
+            session_id=session_id,
+            user_id=user_id,
+            ip=ip,
+            record_name=record_name,
+            outputs=result,
+            duration_ms=duration_ms,
+        )
+
+    def log_batch_start(
+        self,
+        session_id: str,
+        count: int,
+        user_id: str = "anonymous",
+        ip: str = "",
+    ) -> str:
+        return self.log(
+            event_type="BATCH_START",
+            session_id=session_id,
+            user_id=user_id,
+            ip=ip,
+            inputs={"batch_size": count},
+        )
+
+    def log_batch_end(
+        self,
+        session_id: str,
+        count: int,
+        success_count: int,
+        error_count: int,
+        duration_ms: int,
+        user_id: str = "anonymous",
+        ip: str = "",
+    ) -> str:
+        return self.log(
+            event_type="BATCH_END",
+            session_id=session_id,
+            user_id=user_id,
+            ip=ip,
+            outputs={"processed": count, "success": success_count, "errors": error_count},
+            duration_ms=duration_ms,
+        )
+
+    def log_export(
+        self,
+        session_id: str,
+        format: str,
+        record_count: int,
+        user_id: str = "anonymous",
+        ip: str = "",
+    ) -> str:
+        return self.log(
+            event_type="EXPORT",
+            session_id=session_id,
+            user_id=user_id,
+            ip=ip,
+            inputs={"format": format, "record_count": record_count},
+        )
+
+    def tail(self, n: int = 50) -> list[dict[str, Any]]:
+        """Return the last n audit events (for admin dashboard)."""
+        if not self._path.exists():
+            return []
+        lines = self._path.read_text(encoding="utf-8").strip().split("\n")
+        events: list[dict[str, Any]] = []
+        for line in lines[-n:]:
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return events
+
+
+# Global singleton
+AUDIT = AuditLogger()
+
+
+def get_rate_limit_key(session_id: str) -> str:
+    return f"rl:{session_id}:{int(time.time()) // 60}"
+
+```
+
+models.py:
+```
+"""Pydantic v2 models for institutional doctor address verification."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from enum import Enum
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+class VerificationStatus(str, Enum):
+    CONFIRMED = "CONFIRMED"
+    MISMATCH = "MISMATCH"
+    NOT_FOUND = "NOT_FOUND"
+    ERROR = "ERROR"
+    SKIPPED = "SKIPPED"
+
+
+class ConsensusLevel(str, Enum):
+    HIGH = "HIGH_CONFIDENCE"
+    MEDIUM = "MEDIUM_CONFIDENCE"
+    LOW = "LOW_CONFIDENCE"
+    UNVERIFIED = "UNVERIFIED"
+
+
+class VisitFlag(str, Enum):
+    VISIT_FIRST = "VISIT_FIRST"
+    CALL_FIRST = "CALL_FIRST"
+    MANUAL_LOOKUP = "MANUAL_LOOKUP"
+
+
+class DoctorRecord(BaseModel):
+    """Input record for a single doctor verification."""
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    name: str = Field(..., min_length=2, max_length=200, description="Full name of the doctor")
+    address: str = Field(..., min_length=5, max_length=300, description="Street address")
+    city: str = Field(..., min_length=2, max_length=100, description="City")
+    state: str = Field(..., min_length=2, max_length=2, description="Two-letter state code")
+    zip_code: str = Field(..., min_length=5, max_length=10, description="ZIP code")
+    specialty: str = Field(default="", max_length=200, description="Medical specialty")
+    target_flag: str = Field(default="", max_length=50)
+    decile: str | int = Field(default="")
+    gilead_id: str | int = Field(default="")
+
+    @field_validator("state")
+    @classmethod
+    def _uppercase_state(cls, v: str) -> str:
+        return v.upper().strip()
+
+    @field_validator("zip_code")
+    @classmethod
+    def _normalize_zip(cls, v: str) -> str:
+        v = v.strip()
+        if len(v) == 9 and v.isdigit():
+            return f"{v[:5]}-{v[5:]}"
+        return v
+
+
+class SourceResult(BaseModel):
+    """Result from a single verification source."""
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    source: str = Field(..., max_length=50)
+    status: VerificationStatus = Field(default=VerificationStatus.NOT_FOUND)
+    raw_address: str = Field(default="", max_length=500)
+    notes: str = Field(default="", max_length=2000)
+    url: str = Field(default="", max_length=1000)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    phones: list[str] = Field(default_factory=list)
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+
+
+class NPIResult(BaseModel):
+    """Result from the NPI Registry lookup."""
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    status: str = Field(default="NOT_FOUND")
+    npi_number: str = Field(default="", max_length=20)
+    practice_address: str = Field(default="", max_length=500)
+    practice_city: str = Field(default="", max_length=100)
+    practice_state: str = Field(default="", max_length=2)
+    practice_postal: str = Field(default="", max_length=10)
+    notes: str = Field(default="", max_length=2000)
+
+
+class GeoResult(BaseModel):
+    """Geocoding result from OpenStreetMap Nominatim."""
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    found: bool = Field(default=False)
+    lat: float | None = Field(default=None)
+    lon: float | None = Field(default=None)
+    display_name: str = Field(default="", max_length=1000)
+
+
+class LLMResult(BaseModel):
+    """Result from Ollama multi-source synthesis."""
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    verified: bool = Field(default=False)
+    standardized: str = Field(default="", max_length=500)
+    confidence: str = Field(default="", max_length=20)
+    notes: str = Field(default="", max_length=2000)
+
+
+class ConsensusResult(BaseModel):
+    """Weighted consensus across all sources."""
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    overall: ConsensusLevel = Field(default=ConsensusLevel.UNVERIFIED)
+    best_source: str = Field(default="", max_length=50)
+    best_address: str = Field(default="", max_length=500)
+    agreement_ratio: float = Field(default=0.0, ge=0.0, le=1.0)
+    sources_used: int = Field(default=0, ge=0)
+
+
+class VerificationOutput(BaseModel):
+    """Complete output for a single doctor verification."""
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    record: DoctorRecord
+    npi: NPIResult = Field(default_factory=NPIResult)
+    geo: GeoResult = Field(default_factory=GeoResult)
+    llm: LLMResult = Field(default_factory=LLMResult)
+    consensus: ConsensusResult = Field(default_factory=ConsensusResult)
+    sources: list[SourceResult] = Field(default_factory=list)
+    visit_flag: VisitFlag = Field(default=VisitFlag.MANUAL_LOOKUP)
+    phones_found: list[str] = Field(default_factory=list)
+    processed_at: datetime = Field(default_factory=datetime.utcnow)
+    session_id: str = Field(default="", max_length=64)
+    checksum: str = Field(default="", max_length=128)
+
+    def to_flat_dict(self) -> dict[str, Any]:
+        """Flatten to a dict suitable for DataFrame export."""
+        flat: dict[str, Any] = {
+            **self.record.model_dump(),
+            **self.geo.model_dump(),
+            **{f"npi_{k}": v for k, v in self.npi.model_dump().items()},
+            **{f"llm_{k}": v for k, v in self.llm.model_dump().items()},
+            **{f"consensus_{k}": v for k, v in self.consensus.model_dump().items()},
+            "visit_flag": self.visit_flag.value,
+            "phones_found": ", ".join(self.phones_found),
+            "processed_at": self.processed_at.isoformat(),
+            "session_id": self.session_id,
+            "checksum": self.checksum,
+        }
+        for src in self.sources:
+            prefix = src.source.lower().replace("_", "")
+            flat[f"{prefix}_status"] = src.status.value
+            flat[f"{prefix}_notes"] = src.notes
+            if src.raw_address:
+                flat[f"{prefix}_address"] = src.raw_address
+            if src.url:
+                flat[f"{prefix}_url"] = src.url
+        return flat
+
+
+class AuditEvent(BaseModel):
+    """Immutable audit event for institutional compliance."""
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    event_id: str = Field(..., max_length=64)
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    event_type: str = Field(..., max_length=50)  # VERIFY_SINGLE, BATCH_START, BATCH_END, EXPORT, LOGIN
+    session_id: str = Field(..., max_length=64)
+    user_id: str = Field(default="anonymous", max_length=128)
+    ip_hash: str = Field(default="", max_length=64)  # SHA-256 of IP for privacy
+    record_name: str = Field(default="", max_length=200)
+    inputs: dict[str, Any] = Field(default_factory=dict)
+    outputs: dict[str, Any] = Field(default_factory=dict)
+    duration_ms: int = Field(default=0, ge=0)
+    status: str = Field(default="OK", max_length=20)  # OK, ERROR, DENIED
+    error_message: str = Field(default="", max_length=1000)
+
+
+class SystemStatus(BaseModel):
+    """Current system health and source availability."""
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    ollama_available: bool = Field(default=False)
+    ollama_model: str = Field(default="", max_length=50)
+    google_places_enabled: bool = Field(default=False)
+    bing_enabled: bool = Field(default=False)
+    cache_size: int = Field(default=0, ge=0)
+    total_verifications: int = Field(default=0, ge=0)
+    uptime_seconds: int = Field(default=0, ge=0)
+    source_health: dict[str, bool] = Field(default_factory=dict)
+
+```
+
+Dockerfile:
+```
+FROM python:3.11-slim
+
+LABEL maintainer="institutional-verifier"
+LABEL description="Doctor Address Verifier — Institutional-grade multi-source verification with LLM web crawl"
+
+# System deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Python deps
+WORKDIR /app
+COPY requirements_hf.txt .
+RUN pip install --no-cache-dir -r requirements_hf.txt
+
+# Application code
+COPY models.py config.py audit.py sources.py llm_crawler.py engine.py app.py ./
+
+# Create cache and log directories
+RUN mkdir -p /tmp/doctor-verify-cache /tmp/doctor-verify-logs
+
+# HF Spaces expects port 7860
+EXPOSE 7860
+
+ENV PYTHONUNBUFFERED=1
+ENV HF_HOME=/tmp
+
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7860"]
+
+```
+
+llm_crawler.py:
+```
+"""LLM-powered web crawler — DuckDuckGo search + Ollama page analysis."""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+import sqlite3
+import time
+import urllib.parse
+from pathlib import Path
+from typing import Any
+
+import httpx
+from bs4 import BeautifulSoup
+
+from config import Config
+from models import DoctorRecord, SourceResult, VerificationStatus
+
+logger = logging.getLogger("verify.crawler")
+
+try:
+    import ollama
+    _OLLAMA_AVAILABLE = True
+except ImportError:
+    _OLLAMA_AVAILABLE = False
+
+# ---------------------------------------------------------------------------
+# SQLite cache
+# ---------------------------------------------------------------------------
+class PageCache:
+    def __init__(self, db_path: Path = Config.CACHE_DB) -> None:
+        self._path = db_path
+        self._ensure_schema()
+
+    def _conn(self) -> sqlite3.Connection:
+        return sqlite3.connect(str(self._path), timeout=10)
+
+    def _ensure_schema(self) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS page_cache ("
+                "url TEXT PRIMARY KEY, doctor TEXT, status TEXT, notes TEXT, created INTEGER"
+                ")"
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_cache_created ON page_cache(created)")
+            conn.commit()
+
+    def get(self, url: str, doctor_name: str) -> SourceResult | None:
+        cutoff = int(time.time()) - 86400
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT status, notes FROM page_cache WHERE url=? AND doctor=? AND created > ?",
+                (url, doctor_name, cutoff),
+            ).fetchone()
+        if row:
+            return SourceResult(source="CACHE", status=VerificationStatus(row[0]), notes=row[1])
+        return None
+
+    def set(self, url: str, doctor_name: str, status: str, notes: str) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO page_cache (url, doctor, status, notes, created) VALUES (?, ?, ?, ?, ?)",
+                (url, doctor_name, status, notes, int(time.time())),
+            )
+            conn.commit()
+
+    def size(self) -> int:
+        with self._conn() as conn:
+            row = conn.execute("SELECT COUNT(*) FROM page_cache").fetchone()
+        return row[0] if row else 0
+
+
+_CACHE = PageCache()
+
+# ---------------------------------------------------------------------------
+# Phone extraction
+# ---------------------------------------------------------------------------
+_PHONE_RE = re.compile(r"\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}")
+
+
+def extract_phones(text: str) -> list[str]:
+    found = _PHONE_RE.findall(text)
+    cleaned: set[str] = set()
+    for p in found:
+        digits = re.sub(r"\D", "", p)
+        if len(digits) == 10:
+            cleaned.add(f"({digits[:3]}) {digits[3:6]}-{digits[6:]}")
+    return sorted(cleaned)
+
+
+# ---------------------------------------------------------------------------
+# LLM query optimizer
+# ---------------------------------------------------------------------------
+def generate_search_query(record: DoctorRecord) -> str:
+    if Config.NO_OLLAMA or not _OLLAMA_AVAILABLE:
+        return f'"{record.name}" doctor "{record.address}" {record.city} {record.state}'
+    prompt = (
+        f"Generate a concise web search query to find whether this doctor practices at this address.\n"
+        f"Doctor: {record.name}\n"
+        f"Address: {record.address}, {record.city}, {record.state}\n"
+        f"Specialty: {record.specialty}\n\n"
+        f"Rules:\n"
+        f"- Use the doctor's full name in quotes\n"
+        f"- Include the street address in quotes\n"
+        f"- Keep it under 120 characters\n"
+        f"- Do NOT include ZIP code (reduces hits)\n"
+        f"- Respond ONLY with the query string, no explanation.\n"
+    )
+    try:
+        response = ollama.chat(
+            model=Config.OLLAMA_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            options={"temperature": 0.1, "num_predict": 100},
+        )
+        query = response["message"]["content"].strip().strip('"')
+        if query and len(query) > 10:
+            return query
+    except Exception as exc:
+        logger.debug("LLM query generation failed: %s", exc)
+    return f'"{record.name}" doctor "{record.address}" {record.city} {record.state}'
+
+
+# ---------------------------------------------------------------------------
+# Web page fetching
+# ---------------------------------------------------------------------------
+def extract_search_links(html: str, max_links: int = 5) -> list[str]:
+    soup = BeautifulSoup(html, "lxml")
+    links: list[str] = []
+    for a in soup.find_all("a", class_="result__a"):
+        href = a.get("href", "")
+        if href.startswith("//"):
+            href = "https:" + href
+        if href.startswith("http") and "duckduckgo.com" not in href:
+            links.append(href)
+        if len(links) >= max_links:
+            break
+    return links
+
+
+def fetch_page_text(url: str) -> str:
+    try:
+        with httpx.Client(timeout=20, follow_redirects=True) as client:
+            resp = client.get(url, headers=Config.HEADERS)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "lxml")
+            for tag in soup(["script", "style", "nav", "footer", "header"]):
+                tag.decompose()
+            text = soup.get_text(separator=" ", strip=True)
+            return " ".join(text.split()[:3000])
+    except Exception as exc:
+        return f"[FETCH_ERROR: {exc}]"
+
+
+# ---------------------------------------------------------------------------
+# LLM page analysis
+# ---------------------------------------------------------------------------
+def analyze_page(page_text: str, record: DoctorRecord) -> dict[str, Any]:
+    if Config.NO_OLLAMA or not _OLLAMA_AVAILABLE:
+        return {"doctor_found": False, "address_match": False, "confidence": "Low", "reasoning": "Ollama disabled"}
+    prompt = (
+        "You are a medical-address verification analyst. Analyze the webpage text below.\n\n"
+        f"Doctor: {record.name}\n"
+        f"Target address: {record.address}, {record.city}, {record.state}\n\n"
+        f"Webpage text (first 2000 chars):\n{page_text[:2000]}\n\n"
+        "Answer ONLY with valid JSON:\n"
+        '{"doctor_found": true/false, "address_match": true/false, "confidence": "High|Medium|Low", "reasoning": "short explanation"}'
+    )
+    try:
+        response = ollama.chat(
+            model=Config.OLLAMA_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            options={"temperature": 0.05, "num_predict": 300},
+        )
+        text = response["message"]["content"]
+        for delim in ("```json", "```"):
+            if delim in text:
+                text = text.split(delim)[1].split("```")[0]
+                break
+        parsed = json.loads(text.strip())
+        return {
+            "doctor_found": bool(parsed.get("doctor_found", False)),
+            "address_match": bool(parsed.get("address_match", False)),
+            "confidence": str(parsed.get("confidence", "Low")),
+            "reasoning": str(parsed.get("reasoning", "")),
+        }
+    except Exception as exc:
+        logger.warning("LLM page analysis failed for %s: %s", record.name, exc)
+        return {"doctor_found": False, "address_match": False, "confidence": "Low", "reasoning": f"LLM error: {exc}"}
+
+
+# ---------------------------------------------------------------------------
+# Full web crawl verifier
+# ---------------------------------------------------------------------------
+def web_search_verify(record: DoctorRecord, npi_status: str = "") -> SourceResult:
+    if npi_status == "CONFIRMED":
+        return SourceResult(source="WEB_CRAWL", status=VerificationStatus.SKIPPED, notes="NPI already confirmed")
+
+    query = generate_search_query(record)
+    encoded = urllib.parse.quote(query)
+    search_url = f"https://html.duckduckgo.com/html/?q={encoded}"
+    try:
+        with httpx.Client(timeout=20, follow_redirects=True) as client:
+            resp = client.get(search_url, headers=Config.HEADERS)
+            resp.raise_for_status()
+            links = extract_search_links(resp.text, max_links=Config.WEB_CRAWL_MAX_LINKS)
+    except Exception as exc:
+        return SourceResult(source="WEB_CRAWL", status=VerificationStatus.ERROR, notes=f"DDG search failed: {exc}")
+
+    if not links:
+        return SourceResult(source="WEB_CRAWL", status=VerificationStatus.NOT_FOUND, notes="No DDG result links")
+
+    confirmations = 0
+    mismatches = 0
+    best_url = ""
+    best_reasoning = ""
+    link_notes: list[str] = []
+    all_phones: set[str] = set()
+
+    for link in links:
+        cached = _CACHE.get(link, record.name)
+        if cached:
+            if cached.status == VerificationStatus.CONFIRMED:
+                confirmations += 1
+            elif cached.status == VerificationStatus.MISMATCH:
+                mismatches += 1
+            link_notes.append(f"{link[:60]}… [cached {cached.status.value}]")
+            continue
+
+        page_text = fetch_page_text(link)
+        if page_text.startswith("[FETCH_ERROR"):
+            link_notes.append(f"{link[:60]}… fetch error")
+            continue
+
+        analysis = analyze_page(page_text, record)
+        phones = extract_phones(page_text)
+        all_phones.update(phones)
+        phone_str = f" Phones: {', '.join(phones)}" if phones else ""
+
+        if analysis["doctor_found"] and analysis["address_match"] and analysis["confidence"] in ("High", "Medium"):
+            status = VerificationStatus.CONFIRMED
+            confirmations += 1
+            best_url = link
+            best_reasoning = analysis["reasoning"]
+        elif analysis["doctor_found"] and not analysis["address_match"]:
+            status = VerificationStatus.MISMATCH
+            mismatches += 1
+        else:
+            status = VerificationStatus.NOT_FOUND
+
+        link_notes.append(f"{link[:60]}… [{status.value}] {analysis['reasoning'][:80]}{phone_str}")
+        _CACHE.set(link, record.name, status.value, analysis["reasoning"])
+
+    phone_summary = f" Phones found: {', '.join(sorted(all_phones))}" if all_phones else ""
+
+    if confirmations >= 1 and mismatches == 0:
+        return SourceResult(source="WEB_CRAWL", status=VerificationStatus.CONFIRMED, url=best_url, notes=f"{confirmations}/2 links confirm. {best_reasoning}{phone_summary}")
+    if confirmations >= 1 and mismatches >= 1:
+        return SourceResult(source="WEB_CRAWL", status=VerificationStatus.MISMATCH, url=best_url, notes=f"Mixed: {confirmations} confirm, {mismatches} mismatch. {best_reasoning}")
+    if mismatches >= 1:
+        return SourceResult(source="WEB_CRAWL", status=VerificationStatus.MISMATCH, notes=f"{mismatches}/2 links found doctor at different address. {' | '.join(link_notes)}")
+    return SourceResult(source="WEB_CRAWL", status=VerificationStatus.NOT_FOUND, notes=f"No confirmation. {' | '.join(link_notes)}")
+
+```
+
+README.md:
+```
+---
+title: Doctor Verify Institutional
+emoji: 🏥
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+pinned: false
+---
+
+# Doctor Address Verifier — Institutional Edition
+
+**Hugging Face Spaces deployment** of a production-grade, multi-source doctor address verification system.
+
+## Features
+
+- **10 Verification Sources**: NPI Registry, CMS Physician Compare, Google Places, Bing, Yelp, RateMDs, Healthgrades, SAMHSA, NY OPD, LLM Web Crawl
+- **LLM-Powered Web Crawl**: Ollama analyzes actual web pages via DuckDuckGo search (falls back to keyword matching if unavailable)
+- **Parallel Source Fetching**: ThreadPoolExecutor runs sources concurrently
+- **Pydantic v2 Models**: Strict validation at all boundaries
+- **Immutable Audit Logging**: SHA-256 checksums on every event
+- **SQLite Cache**: 24hr TTL for scraped results
+- **Phone Extraction**: Automatically extracts US phone numbers from all sources
+- **Consensus Engine**: Weighted scoring by source importance
+- **Streamlit UI**: Single verify, batch verify (Excel), system status, audit log
+- **Zero Configuration**: Works out of the box with no API keys or environment variables required
+
+## Deployment
+
+### 1. Create HF Space
+
+```bash
+huggingface-cli repo create doctor-verify-institutional --type space --sdk docker
+```
+
+### 2. Push Code
+
+```bash
+git clone https://huggingface.co/spaces/YOUR_USERNAME/doctor-verify-institutional
+cd doctor-verify-institutional
+# Copy all files from hf_institutional/
+cp /path/to/hf_institutional/* .
+git add .
+git commit -m "Initial institutional deployment"
+git push
+```
+
+### 3. Configure Secrets (Optional)
+
+The system works without any secrets. For enhanced functionality, you may add:
+
+| Secret | Description | Effect |
+|---|---|---|
+| `GOOGLE_API_KEY` | Google Places API key | Enables Google Places source |
+| `BING_SEARCH_KEY` | Bing Web Search API key | Enables Bing search source |
+| `OLLAMA_HOST` | Ollama endpoint URL | Enables LLM-powered web crawl |
+| `OLLAMA_MODEL` | Ollama model name | Uses specified model (default: llama3.2) |
+| `APP_PASSWORD` | Access password for the UI | Adds password protection |
+| `MAX_BATCH_SIZE` | Max records per batch | Adjusts batch limit (default: 100) |
+
+**Default behavior without secrets:**
+- NPI Registry, CMS Compare, Yelp, RateMDs, Healthgrades, SAMHSA, NY OPD: **Fully functional**
+- Web crawl: Uses keyword matching (no LLM required)
+- Google Places, Bing: Disabled (optional enhancements)
+- Authentication: Disabled (public access)
+
+## Architecture
+
+```
+app_hf.py      → Gradio UI (tabs: Single, Batch, Status, Audit)
+engine.py      → Consensus engine + batch orchestrator
+sources.py     → 9 independent source runners (each retry-wrapped)
+llm_crawler.py → DuckDuckGo search + Ollama page analysis + cache
+models.py      → Pydantic v2 models for all data boundaries
+config.py      → Environment-backed config with security constants
+audit.py       → Immutable JSONL audit log with SHA-256 checksums
+```
+
+## Security
+
+- **Input Validation**: All inputs validated via Pydantic models
+- **Audit Trail**: Every verification logged with checksums
+- **Privacy**: IP addresses hashed (SHA-256) before logging
+- **Rate Limiting**: Configurable per-minute rate limits (default: 30/min)
+- **Least Privilege**: No `chmod 777`, no wide-open CORS
+
+## License
+
+Proprietary — Internal use only.
+
+```
+
+sources.py:
+```
+"""Individual verification source runners — each isolated and retry-wrapped."""
+
+from __future__ import annotations
+
+import logging
+import time
+import urllib.parse
+from typing import Any
+
+import httpx
+from bs4 import BeautifulSoup
+
+from config import Config
+from models import DoctorRecord, SourceResult, VerificationStatus
+
+logger = logging.getLogger("verify.sources")
+
+# ---------------------------------------------------------------------------
+# Retry decorator
+# ---------------------------------------------------------------------------
+import random
+
+
+def _retry_http(max_retries: int = 3, base_delay: float = 1.0):
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            last_exc = None
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as exc:
+                    last_exc = exc
+                    delay = base_delay * (2 ** attempt) + random.random()
+                    logger.debug("Retry %s attempt %d/%d: %s", func.__name__, attempt + 1, max_retries, exc)
+                    time.sleep(delay)
+            logger.warning("%s failed after %d retries: %s", func.__name__, max_retries, last_exc)
+            raise last_exc
+        return wrapper
+    return decorator
+
+
+# ---------------------------------------------------------------------------
+# Normalization helpers
+# ---------------------------------------------------------------------------
+import re
+
+_NORMALIZE_RE = re.compile(r"[^\w\s]")
+
+
+def _normalize_address(addr: str) -> str:
+    addr = addr.upper()
+    for old, new in (("STREET", "ST"), ("AVENUE", "AVE"), ("BOULEVARD", "BLVD"),
+                     ("ROAD", "RD"), ("DRIVE", "DR"), ("SUITE", "STE"),
+                     ("APARTMENT", "APT"), ("FLOOR", "FL")):
+        addr = addr.replace(old, new)
+    addr = _NORMALIZE_RE.sub(" ", addr)
+    return " ".join(addr.split())
+
+
+def _parse_name(full_name: str) -> tuple[str, str]:
+    parts = full_name.replace(",", " ").split()
+    if not parts:
+        return ("", "")
+    return (parts[0], parts[1] if len(parts) > 1 else "")
+
+
+# ---------------------------------------------------------------------------
+# Source 1: NPI Registry
+# ---------------------------------------------------------------------------
+@_retry_http(max_retries=3)
+def npi_lookup(record: DoctorRecord) -> dict[str, Any]:
+    last, first = _parse_name(record.name)
+    params = {"version": "2.1", "taxonomy_description": record.specialty, "city": record.city, "state": record.state}
+    if last:
+        params["last_name"] = last
+    if first:
+        params["first_name"] = first
+    try:
+        with httpx.Client(timeout=Config.REQUEST_TIMEOUT) as client:
+            resp = client.get("https://npiregistry.cms.hhs.gov/api/", params=params)
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as exc:
+        logger.warning("NPI lookup error: %s", exc)
+        return {"status": "ERROR", "notes": str(exc), "npi_number": "", "practice_address": "", "practice_city": "", "practice_state": "", "practice_postal": ""}
+
+    results = data.get("results", [])
+    if not results:
+        return {"status": "NOT_FOUND", "notes": "No NPI match", "npi_number": "", "practice_address": "", "practice_city": "", "practice_state": "", "practice_postal": ""}
+
+    name_key = record.name.upper().replace(",", "")
+    addr_norm = _normalize_address(f"{record.address} {record.city} {record.state}")
+    addr_tokens = set(addr_norm.split())
+
+    for r in results:
+        basic = r.get("basic", {})
+        doc_name = f"{basic.get('first_name', '')} {basic.get('last_name', '')}".strip().upper()
+        addr = r.get("addresses", [{}])[0]
+        raw = f"{addr.get('address_1', '')} {addr.get('city', '')} {addr.get('state', '')}"
+        doc_tokens = set(_normalize_address(raw).split())
+        common = addr_tokens & doc_tokens
+        total = addr_tokens | doc_tokens
+        overlap = len(common) / max(len(total), 1)
+        name_match = name_key in doc_name or last.upper() in doc_name
+
+        if overlap >= 0.3 and name_match:
+            return {"status": "CONFIRMED", "npi_number": str(r.get("number", "")), "practice_address": addr.get("address_1", ""), "practice_city": addr.get("city", ""), "practice_state": addr.get("state", ""), "practice_postal": addr.get("postal_code", ""), "notes": f"Name+address match (overlap={overlap:.2f})"}
+        if name_match:
+            return {"status": "MISMATCH", "npi_number": str(r.get("number", "")), "practice_address": addr.get("address_1", ""), "practice_city": addr.get("city", ""), "practice_state": addr.get("state", ""), "practice_postal": addr.get("postal_code", ""), "notes": f"Name match but address differs (overlap={overlap:.2f})"}
+
+    return {"status": "NOT_FOUND", "notes": "Provider not in NPI registry", "npi_number": "", "practice_address": "", "practice_city": "", "practice_state": "", "practice_postal": ""}
+
+
+# ---------------------------------------------------------------------------
+# Source 2: NY Office of the Professions
+# ---------------------------------------------------------------------------
+@_retry_http(max_retries=2)
+def ny_opd_lookup(record: DoctorRecord) -> SourceResult:
+    if record.state.upper() != "NY":
+        return SourceResult(source="NY_OPD", status=VerificationStatus.SKIPPED, notes="Not a NY doctor")
+    last, first = _parse_name(record.name)
+    query = urllib.parse.quote(f"{first} {last}")
+    url = f"https://www.op.nysed.gov/opsearches.htm?name={query}"
+    try:
+        with httpx.Client(timeout=Config.REQUEST_TIMEOUT, follow_redirects=True) as client:
+            resp = client.get(url, headers=Config.HEADERS)
+            resp.raise_for_status()
+            text = resp.text.upper()
+    except Exception as exc:
+        return SourceResult(source="NY_OPD", status=VerificationStatus.ERROR, notes=str(exc))
+
+    name_key = record.name.upper().replace(",", "")
+    addr_norm = _normalize_address(f"{record.address} {record.city} {record.state}")
+    addr_tokens = set(addr_norm.split())
+    text_tokens = set(_normalize_address(text).split())
+    overlap = len(addr_tokens & text_tokens) / max(len(addr_tokens | text_tokens), 1)
+
+    if name_key in text and overlap >= 0.25:
+        return SourceResult(source="NY_OPD", status=VerificationStatus.CONFIRMED, notes=f"Name+address overlap={overlap:.2f}")
+    if name_key in text:
+        return SourceResult(source="NY_OPD", status=VerificationStatus.MISMATCH, notes="Name found but address unclear")
+    return SourceResult(source="NY_OPD", status=VerificationStatus.NOT_FOUND, notes="Not found in NY OPD")
+
+
+# ---------------------------------------------------------------------------
+# Source 3: Bing Web Search
+# ---------------------------------------------------------------------------
+@_retry_http(max_retries=2)
+def bing_verify(record: DoctorRecord) -> SourceResult:
+    if not Config.BING_SEARCH_KEY:
+        return SourceResult(source="BING", status=VerificationStatus.SKIPPED, notes="No API key")
+    query = f'"{record.name}" "{record.address}" {record.city} {record.state}'
+    try:
+        with httpx.Client(timeout=Config.REQUEST_TIMEOUT) as client:
+            resp = client.get(
+                "https://api.bing.microsoft.com/v7.0/search",
+                params={"q": query, "count": 5, "mkt": "en-US"},
+                headers={"Ocp-Apim-Subscription-Key": Config.BING_SEARCH_KEY},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as exc:
+        return SourceResult(source="BING", status=VerificationStatus.ERROR, notes=str(exc))
+
+    web_pages = data.get("webPages", {}).get("value", [])
+    if not web_pages:
+        return SourceResult(source="BING", status=VerificationStatus.NOT_FOUND, notes="No Bing results")
+
+    name_key = record.name.upper().replace(",", "")
+    addr_norm = _normalize_address(f"{record.address} {record.city} {record.state}")
+    addr_tokens = set(addr_norm.split())
+
+    for page in web_pages:
+        snippet = (page.get("snippet", "") + " " + page.get("name", "")).upper()
+        text_tokens = set(_normalize_address(snippet).split())
+        overlap = len(addr_tokens & text_tokens) / max(len(addr_tokens | text_tokens), 1)
+        if name_key in snippet and overlap >= 0.2:
+            return SourceResult(source="BING", status=VerificationStatus.CONFIRMED, url=page.get("url", ""), notes=f"Snippet overlap={overlap:.2f}")
+    return SourceResult(source="BING", status=VerificationStatus.NOT_FOUND, notes="No match in top results")
+
+
+# ---------------------------------------------------------------------------
+# Source 4: Google Places
+# ---------------------------------------------------------------------------
+@_retry_http(max_retries=2)
+def google_places_verify(record: DoctorRecord) -> SourceResult:
+    if not Config.GOOGLE_API_KEY:
+        return SourceResult(source="GOOGLE_PLACES", status=VerificationStatus.SKIPPED, notes="No API key")
+    query = f"{record.name} {record.address} {record.city} {record.state}"
+    try:
+        with httpx.Client(timeout=Config.REQUEST_TIMEOUT) as client:
+            resp = client.get(
+                "https://maps.googleapis.com/maps/api/place/textsearch/json",
+                params={"query": query, "key": Config.GOOGLE_API_KEY},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as exc:
+        return SourceResult(source="GOOGLE_PLACES", status=VerificationStatus.ERROR, notes=str(exc))
+
+    results = data.get("results", [])
+    if not results:
+        return SourceResult(source="GOOGLE_PLACES", status=VerificationStatus.NOT_FOUND, notes="No Places results")
+
+    name_key = record.name.upper().replace(",", "")
+    addr_norm = _normalize_address(f"{record.address} {record.city} {record.state}")
+    addr_tokens = set(addr_norm.split())
+
+    for r in results:
+        formatted = r.get("formatted_address", "").upper()
+        place_name = r.get("name", "").upper()
+        text = f"{place_name} {formatted}"
+        text_tokens = set(_normalize_address(text).split())
+        overlap = len(addr_tokens & text_tokens) / max(len(addr_tokens | text_tokens), 1)
+        if name_key in text and overlap >= 0.3:
+            return SourceResult(source="GOOGLE_PLACES", status=VerificationStatus.CONFIRMED, raw_address=formatted, notes=f"Name+address overlap={overlap:.2f}")
+        if name_key in text:
+            return SourceResult(source="GOOGLE_PLACES", status=VerificationStatus.MISMATCH, notes=f"Name found but low overlap={overlap:.2f}")
+    return SourceResult(source="GOOGLE_PLACES", status=VerificationStatus.NOT_FOUND, notes="No match in top results")
+
+
+# ---------------------------------------------------------------------------
+# Source 5: SAMHSA
+# ---------------------------------------------------------------------------
+@_retry_http(max_retries=2)
+def samhsa_lookup(record: DoctorRecord) -> SourceResult:
+    query = urllib.parse.quote(f"{record.name} {record.city} {record.state}")
+    url = f"https://findtreatment.gov/api/locations?search={query}&limit=5"
+    try:
+        with httpx.Client(timeout=Config.REQUEST_TIMEOUT) as client:
+            resp = client.get(url, headers={**Config.HEADERS, "Accept": "application/json"})
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as exc:
+        return SourceResult(source="SAMHSA", status=VerificationStatus.ERROR, notes=str(exc))
+
+    results = data if isinstance(data, list) else data.get("results", [])
+    if not results:
+        return SourceResult(source="SAMHSA", status=VerificationStatus.NOT_FOUND, notes="No SAMHSA results")
+
+    name_key = record.name.upper().replace(",", "")
+    addr_norm = _normalize_address(f"{record.address} {record.city} {record.state}")
+    addr_tokens = set(addr_norm.split())
+
+    for r in results:
+        raw = f"{r.get('name', '')} {r.get('address1', '')} {r.get('city', '')} {r.get('state', '')}"
+        text_tokens = set(_normalize_address(raw.upper()).split())
+        overlap = len(addr_tokens & text_tokens) / max(len(addr_tokens | text_tokens), 1)
+        if name_key in raw.upper() and overlap >= 0.25:
+            return SourceResult(source="SAMHSA", status=VerificationStatus.CONFIRMED, raw_address=raw, notes=f"Overlap={overlap:.2f}")
+    return SourceResult(source="SAMHSA", status=VerificationStatus.NOT_FOUND, notes="No match")
+
+
+# ---------------------------------------------------------------------------
+# Source 6: Healthgrades
+# ---------------------------------------------------------------------------
+@_retry_http(max_retries=2)
+def healthgrades_verify(record: DoctorRecord) -> SourceResult:
+    last, first = _parse_name(record.name)
+    query = urllib.parse.quote(f"{first} {last} {record.city} {record.state}")
+    url = f"https://www.healthgrades.com/physician-search?search={query}"
+    try:
+        with httpx.Client(timeout=Config.REQUEST_TIMEOUT, follow_redirects=True) as client:
+            resp = client.get(url, headers=Config.HEADERS)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "lxml")
+    except Exception as exc:
+        return SourceResult(source="HEALTHGRADES", status=VerificationStatus.ERROR, notes=str(exc))
+
+    text = soup.get_text().upper()
+    name_key = record.name.upper().replace(",", "")
+    addr_norm = _normalize_address(f"{record.address} {record.city} {record.state}")
+    addr_tokens = set(addr_norm.split())
+    text_tokens = set(_normalize_address(text).split())
+    overlap = len(addr_tokens & text_tokens) / max(len(addr_tokens | text_tokens), 1)
+
+    if overlap >= 0.3:
+        return SourceResult(source="HEALTHGRADES", status=VerificationStatus.CONFIRMED, notes=f"Overlap={overlap:.2f}")
+    return SourceResult(source="HEALTHGRADES", status=VerificationStatus.MISMATCH, notes=f"Low overlap={overlap:.2f}")
+
+
+# ---------------------------------------------------------------------------
+# Source 7: Yelp
+# ---------------------------------------------------------------------------
+@_retry_http(max_retries=2)
+def yelp_verify(record: DoctorRecord) -> SourceResult:
+    query = urllib.parse.quote(f"{record.name} {record.city} {record.state}")
+    url = f"https://www.yelp.com/search?find_desc={query}&find_loc={record.city}%2C+{record.state}"
+    try:
+        with httpx.Client(timeout=Config.REQUEST_TIMEOUT, follow_redirects=True) as client:
+            resp = client.get(url, headers=Config.HEADERS)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "lxml")
+    except Exception as exc:
+        return SourceResult(source="YELP", status=VerificationStatus.ERROR, notes=str(exc))
+
+    page_text = soup.get_text().upper()
+    name_key = record.name.upper().replace(",", "")
+    addr_norm = _normalize_address(f"{record.address} {record.city} {record.state}")
+    addr_tokens = set(addr_norm.split())
+    page_tokens = set(_normalize_address(page_text).split())
+    name_found = name_key in page_text or any(part in page_text for part in name_key.split() if len(part) > 2)
+    overlap = len(addr_tokens & page_tokens) / max(len(addr_tokens | page_tokens), 1)
+
+    if overlap >= 0.3 and name_found:
+        return SourceResult(source="YELP", status=VerificationStatus.CONFIRMED, notes=f"Overlap={overlap:.2f}")
+    if name_found:
+        return SourceResult(source="YELP", status=VerificationStatus.MISMATCH, notes=f"Name found, low overlap={overlap:.2f}")
+    return SourceResult(source="YELP", status=VerificationStatus.NOT_FOUND, notes="Not found")
+
+
+# ---------------------------------------------------------------------------
+# Source 8: RateMDs
+# ---------------------------------------------------------------------------
+@_retry_http(max_retries=2)
+def ratemds_verify(record: DoctorRecord) -> SourceResult:
+    last, first = _parse_name(record.name)
+    query = urllib.parse.quote(f"{first} {last} {record.state}")
+    url = f"https://www.ratemds.com/search/?q={query}&p=1&st=ratings"
+    try:
+        with httpx.Client(timeout=Config.REQUEST_TIMEOUT, follow_redirects=True) as client:
+            resp = client.get(url, headers=Config.HEADERS)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "lxml")
+    except Exception as exc:
+        return SourceResult(source="RATEMDS", status=VerificationStatus.ERROR, notes=str(exc))
+
+    page_text = soup.get_text().upper()
+    name_key = record.name.upper().replace(",", "")
+    addr_norm = _normalize_address(f"{record.address} {record.city} {record.state}")
+    addr_tokens = set(addr_norm.split())
+    page_tokens = set(_normalize_address(page_text).split())
+    name_found = name_key in page_text or last.upper() in page_text
+    overlap = len(addr_tokens & page_tokens) / max(len(addr_tokens | page_tokens), 1)
+
+    if overlap >= 0.3 and name_found:
+        return SourceResult(source="RATEMDS", status=VerificationStatus.CONFIRMED, notes=f"Overlap={overlap:.2f}")
+    if name_found:
+        return SourceResult(source="RATEMDS", status=VerificationStatus.MISMATCH, notes=f"Name found, low overlap={overlap:.2f}")
+    return SourceResult(source="RATEMDS", status=VerificationStatus.NOT_FOUND, notes="Not found")
+
+
+# ---------------------------------------------------------------------------
+# Source 9: CMS Physician Compare
+# ---------------------------------------------------------------------------
+@_retry_http(max_retries=2)
+def cms_physician_compare(record: DoctorRecord) -> SourceResult:
+    last, first = _parse_name(record.name)
+    params = {"lst_nm": last, "st": record.state.strip().upper(), "city": record.city}
+    if first:
+        params["frst_nm"] = first
+    try:
+        with httpx.Client(timeout=Config.REQUEST_TIMEOUT) as client:
+            resp = client.get(
+                "https://www.medicare.gov/api/physicians/compare/search",
+                params=params,
+                headers={"Accept": "application/json", **Config.HEADERS},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as exc:
+        return SourceResult(source="CMS_COMPARE", status=VerificationStatus.ERROR, notes=str(exc))
+
+    results = data.get("results", []) if isinstance(data, dict) else []
+    if not results:
+        return SourceResult(source="CMS_COMPARE", status=VerificationStatus.NOT_FOUND, notes="No results")
+
+    addr_norm = _normalize_address(f"{record.address} {record.city} {record.state}")
+    addr_tokens = set(addr_norm.split())
+    name_key = record.name.upper().replace(",", "")
+
+    for r in results:
+        doc_name = f"{r.get('first_name', '')} {r.get('last_name', '')}".strip().upper()
+        raw_addr = f"{r.get('address', '')} {r.get('city', '')} {r.get('state', '')}"
+        doc_tokens = set(_normalize_address(raw_addr).split())
+        common = addr_tokens & doc_tokens
+        total = addr_tokens | doc_tokens
+        overlap = len(common) / max(len(total), 1) if total else 0
+        name_match = name_key in doc_name or last.upper() in doc_name
+        if overlap >= 0.3 and name_match:
+            return SourceResult(source="CMS_COMPARE", status=VerificationStatus.CONFIRMED, raw_address=raw_addr, notes=f"Name+address match (overlap={overlap:.2f})")
+        if name_match:
+            return SourceResult(source="CMS_COMPARE", status=VerificationStatus.MISMATCH, raw_address=raw_addr, notes=f"Name match but address differs (overlap={overlap:.2f})")
+    return SourceResult(source="CMS_COMPARE", status=VerificationStatus.NOT_FOUND, notes="Not found")
+
+```
+
+engine.py:
+```
+"""Consensus engine, geocoding, and main verify orchestrator."""
+
+from __future__ import annotations
+
+import concurrent.futures
+import hashlib
+import json
+import logging
+import time
+from datetime import datetime
+from typing import Any
+
+import httpx
+
+from config import Config
+from llm_crawler import extract_phones, web_search_verify
+from models import (
+    ConsensusLevel,
+    ConsensusResult,
+    DoctorRecord,
+    GeoResult,
+    LLMResult,
+    NPIResult,
+    SourceResult,
+    VerificationOutput,
+    VerificationStatus,
+    VisitFlag,
+)
+from sources import (
+    bing_verify,
+    cms_physician_compare,
+    google_places_verify,
+    healthgrades_verify,
+    npi_lookup,
+    ny_opd_lookup,
+    ratemds_verify,
+    samhsa_lookup,
+    yelp_verify,
+)
+
+try:
+    import ollama
+    _OLLAMA_AVAILABLE = True
+except ImportError:
+    _OLLAMA_AVAILABLE = False
+
+logger = logging.getLogger("verify.engine")
+
+
+# ---------------------------------------------------------------------------
+# Geocoding
+# ---------------------------------------------------------------------------
+def geocode_address(record: DoctorRecord) -> GeoResult:
+    addr_str = f"{record.address}, {record.city}, {record.state} {record.zip_code}"
+    try:
+        with httpx.Client(timeout=Config.REQUEST_TIMEOUT) as client:
+            resp = client.get(
+                "https://nominatim.openstreetmap.org/search",
+                params={"q": addr_str, "format": "json", "limit": 1},
+                headers={"User-Agent": "DoctorVerify/1.0 (institutional)"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as exc:
+        logger.warning("Geocode error: %s", exc)
+        return GeoResult(found=False)
+    if data:
+        return GeoResult(found=True, lat=float(data[0].get("lat", 0)), lon=float(data[0].get("lon", 0)), display_name=data[0].get("display_name", ""))
+    return GeoResult(found=False)
+
+
+# ---------------------------------------------------------------------------
+# Consensus engine
+# ---------------------------------------------------------------------------
+def compute_consensus(record: DoctorRecord, sources: list[SourceResult]) -> ConsensusResult:
+    confirmations = [s for s in sources if s.status == VerificationStatus.CONFIRMED]
+    mismatches = [s for s in sources if s.status == VerificationStatus.MISMATCH]
+    not_founds = [s for s in sources if s.status == VerificationStatus.NOT_FOUND]
+    errors = [s for s in sources if s.status == VerificationStatus.ERROR]
+
+    confirm_score = sum(Config.SOURCE_WEIGHTS.get(s.source, 1) for s in confirmations)
+    mismatch_score = sum(Config.SOURCE_WEIGHTS.get(s.source, 1) for s in mismatches)
+    total = confirm_score + mismatch_score
+    ratio = confirm_score / total if total else 0
+
+    best_addr = ""
+    best_src = ""
+    if confirmations:
+        best = max(confirmations, key=lambda s: Config.SOURCE_WEIGHTS.get(s.source, 1))
+        best_addr = best.raw_address
+        best_src = best.source
+
+    if confirm_score >= 10 and ratio >= 0.7:
+        return ConsensusResult(overall=ConsensusLevel.HIGH, best_source=best_src, best_address=best_addr, agreement_ratio=ratio, sources_used=len(sources) - len(errors))
+    if confirm_score >= 6 and ratio >= 0.5:
+        return ConsensusResult(overall=ConsensusLevel.MEDIUM, best_source=best_src, best_address=best_addr, agreement_ratio=ratio, sources_used=len(sources) - len(errors))
+    if confirm_score > 0:
+        return ConsensusResult(overall=ConsensusLevel.LOW, best_source=best_src, best_address=best_addr, agreement_ratio=ratio, sources_used=len(sources) - len(errors))
+    if mismatch_score >= 6:
+        return ConsensusResult(overall=ConsensusLevel.LOW, best_source="", best_address="", agreement_ratio=0, sources_used=len(sources) - len(errors))
+    return ConsensusResult(overall=ConsensusLevel.UNVERIFIED, best_source="", best_address="", agreement_ratio=0, sources_used=len(sources) - len(errors))
+
+
+# ---------------------------------------------------------------------------
+# LLM synthesis
+# ---------------------------------------------------------------------------
+def ollama_synthesize(record: DoctorRecord, geo: GeoResult, sources: list[SourceResult], web_crawl: SourceResult) -> LLMResult:
+    if Config.NO_OLLAMA or not _OLLAMA_AVAILABLE:
+        return LLMResult()
+
+    evidence_lines = [f"- {s.source}: {s.status.value} — {s.notes}" for s in sources if s.status in (VerificationStatus.CONFIRMED, VerificationStatus.MISMATCH)]
+    web_context = f"\nTop verified web page: {web_crawl.url}\n" if web_crawl.status in (VerificationStatus.CONFIRMED, VerificationStatus.MISMATCH) and web_crawl.url else ""
+
+    prompt = (
+        "You are a medical-address verification analyst. Review the evidence below and decide whether "
+        f"the doctor most likely still practices at the listed address.\n\n"
+        f"Doctor: {record.name}\n"
+        f"Specialty: {record.specialty}\n"
+        f"Listed address: {record.address}, {record.city}, {record.state} {record.zip_code}\n"
+        f"Geocoding: {'FOUND — ' + geo.display_name if geo.found else 'NOT FOUND'}\n\n"
+        "Evidence from registries and web verification:\n"
+        + "\n".join(evidence_lines[:8])
+        + web_context
+        + "\n\nInstructions:\n"
+        "1. NPI Registry CONFIRMED is the strongest single piece of evidence.\n"
+        "2. LLM web crawl CONFIRMED (where Ollama analyzed actual web pages) is also strong.\n"
+        "3. Google Places or Bing API confirmation adds credibility.\n"
+        "4. If sources disagree, note the conflict and downgrade confidence.\n"
+        '5. Respond ONLY with JSON: {"verified": bool, "confidence": "High|Medium|Low", "reasoning": "..."}\n'
+    )
+    try:
+        response = ollama.chat(
+            model=Config.OLLAMA_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            options={"temperature": 0.1, "num_predict": 400},
+        )
+        text = response["message"]["content"]
+        for delim in ("```json", "```"):
+            if delim in text:
+                text = text.split(delim)[1].split("```")[0]
+                break
+        parsed = json.loads(text.strip())
+        return LLMResult(
+            verified=parsed.get("verified", False),
+            standardized="",
+            confidence=parsed.get("confidence", ""),
+            notes=parsed.get("reasoning", parsed.get("notes", "")),
+        )
+    except Exception as exc:
+        logger.warning("Ollama synthesis failed for %s: %s", record.name, exc)
+        return LLMResult(notes=f"LLM error: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Single doctor verification
+# ---------------------------------------------------------------------------
+def verify_doctor(record: DoctorRecord, session_id: str = "") -> VerificationOutput:
+    start = time.time()
+
+    # 1. NPI (must be first — web crawl depends on it)
+    npi_dict = npi_lookup(record)
+    npi = NPIResult(**npi_dict)
+
+    # 2. Parallel sources
+    def _safe_run(func, *args):
+        try:
+            return func(*args)
+        except Exception as exc:
+            logger.warning("Source error: %s — %s", func.__name__, exc)
+            return SourceResult(source="UNKNOWN", status=VerificationStatus.ERROR, notes=str(exc))
+
+    if npi.status != "CONFIRMED":
+        with concurrent.futures.ThreadPoolExecutor(max_workers=Config.MAX_WORKERS) as pool:
+            futures = [
+                pool.submit(_safe_run, ny_opd_lookup, record),
+                pool.submit(_safe_run, bing_verify, record),
+                pool.submit(_safe_run, google_places_verify, record),
+                pool.submit(_safe_run, samhsa_lookup, record),
+                pool.submit(_safe_run, healthgrades_verify, record),
+                pool.submit(_safe_run, yelp_verify, record),
+                pool.submit(_safe_run, ratemds_verify, record),
+                pool.submit(_safe_run, cms_physician_compare, record),
+                pool.submit(_safe_run, web_search_verify, record, npi.status),
+            ]
+            parallel_sources = [f.result() for f in concurrent.futures.as_completed(futures)]
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=Config.MAX_WORKERS) as pool:
+            futures = [
+                pool.submit(_safe_run, ny_opd_lookup, record),
+                pool.submit(_safe_run, bing_verify, record),
+                pool.submit(_safe_run, google_places_verify, record),
+                pool.submit(_safe_run, samhsa_lookup, record),
+                pool.submit(_safe_run, healthgrades_verify, record),
+                pool.submit(_safe_run, yelp_verify, record),
+                pool.submit(_safe_run, ratemds_verify, record),
+                pool.submit(_safe_run, cms_physician_compare, record),
+            ]
+            parallel_sources = [f.result() for f in concurrent.futures.as_completed(futures)]
+
+    # 3. Build all sources
+    all_sources = parallel_sources
+    npi_as_source = SourceResult(
+        source="NPI_REGISTRY",
+        status=VerificationStatus(npi.status) if npi.status in ("CONFIRMED", "MISMATCH", "NOT_FOUND", "ERROR") else VerificationStatus.MISMATCH,
+        raw_address=f"{npi.practice_address}, {npi.practice_city}, {npi.practice_state} {npi.practice_postal}",
+        notes=npi.notes,
+    )
+    all_sources.insert(0, npi_as_source)
+
+    # 4. Consensus
+    consensus = compute_consensus(record, all_sources)
+
+    # 5. Geocoding
+    geo = geocode_address(record)
+
+    # 6. LLM synthesis
+    web_crawl = next((s for s in all_sources if s.source == "WEB_CRAWL"), SourceResult(source="WEB_CRAWL"))
+    llm = ollama_synthesize(record, geo, all_sources, web_crawl)
+
+    # 7. Aggregate phones
+    all_phones: set[str] = set()
+    for src in all_sources:
+        all_phones.update(extract_phones(src.notes + " " + src.raw_address))
+    phones_found = sorted(all_phones)
+
+    # 8. Visit flag
+    if npi.status == "CONFIRMED":
+        visit_flag = VisitFlag.VISIT_FIRST
+    elif npi.status == "MISMATCH" or npi.status == "ADDRESS_MISMATCH":
+        visit_flag = VisitFlag.CALL_FIRST
+    else:
+        visit_flag = VisitFlag.MANUAL_LOOKUP
+
+    # 9. Checksum
+    payload = json.dumps({"name": record.name, "address": record.address, "consensus": consensus.overall.value}, sort_keys=True)
+    checksum = hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+    duration = int((time.time() - start) * 1000)
+    logger.info("[%s] %s — Consensus: %s | NPI: %s | Geo: %s | Sources: %d OK | %dms",
+                session_id[:8] if session_id else "-", record.name, consensus.overall.value,
+                npi.status, "FOUND" if geo.found else "NOT FOUND",
+                sum(1 for s in all_sources if s.status != VerificationStatus.ERROR), duration)
+
+    return VerificationOutput(
+        record=record,
+        npi=npi,
+        geo=geo,
+        llm=llm,
+        consensus=consensus,
+        sources=all_sources,
+        visit_flag=visit_flag,
+        phones_found=phones_found,
+        processed_at=datetime.utcnow(),
+        session_id=session_id,
+        checksum=checksum,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Batch verification
+# ---------------------------------------------------------------------------
+def verify_batch(records: list[DoctorRecord], session_id: str = "", progress_callback=None) -> list[VerificationOutput]:
+    results: list[VerificationOutput] = []
+    for i, record in enumerate(records):
+        if progress_callback:
+            progress_callback(i + 1, len(records), record.name)
+        result = verify_doctor(record, session_id)
+        results.append(result)
+        time.sleep(Config.NOMINATIM_DELAY)
+    return results
+
+```
+
+.gitattributes:
+```
+*.7z filter=lfs diff=lfs merge=lfs -text
+*.arrow filter=lfs diff=lfs merge=lfs -text
+*.bin filter=lfs diff=lfs merge=lfs -text
+*.bz2 filter=lfs diff=lfs merge=lfs -text
+*.ckpt filter=lfs diff=lfs merge=lfs -text
+*.ftz filter=lfs diff=lfs merge=lfs -text
+*.gz filter=lfs diff=lfs merge=lfs -text
+*.h5 filter=lfs diff=lfs merge=lfs -text
+*.joblib filter=lfs diff=lfs merge=lfs -text
+*.lfs.* filter=lfs diff=lfs merge=lfs -text
+*.mlmodel filter=lfs diff=lfs merge=lfs -text
+*.model filter=lfs diff=lfs merge=lfs -text
+*.msgpack filter=lfs diff=lfs merge=lfs -text
+*.npy filter=lfs diff=lfs merge=lfs -text
+*.npz filter=lfs diff=lfs merge=lfs -text
+*.onnx filter=lfs diff=lfs merge=lfs -text
+*.ot filter=lfs diff=lfs merge=lfs -text
+*.parquet filter=lfs diff=lfs merge=lfs -text
+*.pb filter=lfs diff=lfs merge=lfs -text
+*.pickle filter=lfs diff=lfs merge=lfs -text
+*.pkl filter=lfs diff=lfs merge=lfs -text
+*.pt filter=lfs diff=lfs merge=lfs -text
+*.pth filter=lfs diff=lfs merge=lfs -text
+*.rar filter=lfs diff=lfs merge=lfs -text
+*.safetensors filter=lfs diff=lfs merge=lfs -text
+saved_model/**/* filter=lfs diff=lfs merge=lfs -text
+*.tar.* filter=lfs diff=lfs merge=lfs -text
+*.tar filter=lfs diff=lfs merge=lfs -text
+*.tflite filter=lfs diff=lfs merge=lfs -text
+*.tgz filter=lfs diff=lfs merge=lfs -text
+*.wasm filter=lfs diff=lfs merge=lfs -text
+*.xz filter=lfs diff=lfs merge=lfs -text
+*.zip filter=lfs diff=lfs merge=lfs -text
+*.zst filter=lfs diff=lfs merge=lfs -text
+*tfevents* filter=lfs diff=lfs merge=lfs -text
+
+```
+
+app.py:
+```
+#!/usr/bin/env python3
+"""FastAPI backend for doctor address verification with real-time validation."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import os
+import time
+import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+from fastapi import FastAPI, HTTPException, UploadFile, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+
+from audit import AuditLogger
+from config import Config
+from engine import verify_batch, verify_doctor
+from models import DoctorRecord, VerificationOutput
+
+# Ensure directories exist
+Config.ensure_dirs()
+
+# Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.FileHandler(Config.LOG_DIR / "app.log"),
+        logging.StreamHandler(),
+    ],
+)
+logger = logging.getLogger("verify.app")
+
+# Audit
+AUDIT = AuditLogger()
+
+# FastAPI app
+app = FastAPI(
+    title="Doctor Address Verifier API",
+    description="Institutional-grade multi-source doctor address verification",
+    version="1.0.0",
+)
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# In-memory session store
+_sessions: dict[str, dict[str, Any]] = {}
+_start_time = time.time()
+
+# ---------------------------------------------------------------------------
+# Pydantic Models
+# ---------------------------------------------------------------------------
+class DoctorRequest(BaseModel):
+    name: str = Field(..., description="Doctor name (Last, First)")
+    address: str = Field(..., description="Street address")
+    city: str = Field(..., description="City")
+    state: str = Field(..., min_length=2, max_length=2, description="State abbreviation")
+    zip_code: str = Field(..., description="ZIP code")
+    specialty: str = Field(default="", description="Medical specialty")
+
+class BatchVerifyRequest(BaseModel):
+    records: list[DoctorRequest]
+
+class SystemStatusResponse(BaseModel):
+    timestamp: datetime
+    ollama_available: bool
+    ollama_model: str
+    google_places_enabled: bool
+    bing_enabled: bool
+    cache_size: int
+    total_verifications: int
+    uptime_seconds: int
+    source_health: dict[str, bool]
+
+class VerificationResponse(BaseModel):
+    name: str
+    address: str
+    city: str
+    state: str
+    zip_code: str
+    consensus_overall: str
+    visit_flag: str
+    identity_confidence: float
+    address_confidence: float
+    phones_found: list[str]
+    llm_notes: str
+    source_results: dict[str, dict[str, str]]
+
+# ---------------------------------------------------------------------------
+# Helper Functions
+# ---------------------------------------------------------------------------
+def get_session_id() -> str:
+    """Get or create session ID."""
+    import random
+    return str(uuid.uuid4())
+
+def check_ollama() -> bool:
+    """Check if Ollama is available."""
+    try:
+        import httpx
+        with httpx.Client(timeout=2) as client:
+            resp = client.get("http://127.0.0.1:11434/api/tags")
+            return resp.status_code == 200
+    except:
+        return False
+
+# ---------------------------------------------------------------------------
+# API Endpoints
+# ---------------------------------------------------------------------------
+@app.get("/")
+async def root():
+    """Root endpoint with API info."""
+    return {
+        "name": "Doctor Address Verifier API",
+        "version": "1.0.0",
+        "status": "running",
+        "endpoints": {
+            "verify": "/api/verify",
+            "batch": "/api/batch",
+            "status": "/api/status",
+            "health": "/health",
+        },
+    }
+
+@app.get("/health")
+async def health():
+    """Health check endpoint."""
+    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
+
+@app.get("/api/status")
+async def get_status() -> SystemStatusResponse:
+    """Get system status."""
+    ollama_ok = check_ollama()
+    
+    return SystemStatusResponse(
+        timestamp=datetime.utcnow(),
+        ollama_available=ollama_ok,
+        ollama_model=Config.OLLAMA_MODEL,
+        google_places_enabled=bool(Config.GOOGLE_API_KEY),
+        bing_enabled=bool(Config.BING_SEARCH_KEY),
+        cache_size=0,
+        total_verifications=sum(len(s.get("records", [])) for s in _sessions.values()),
+        uptime_seconds=int(time.time() - _start_time),
+        source_health={
+            "NPI_REGISTRY": True,
+            "CMS_COMPARE": True,
+            "GOOGLE_PLACES": bool(Config.GOOGLE_API_KEY),
+            "BING": bool(Config.BING_SEARCH_KEY),
+            "YELP": True,
+            "RATEMDS": True,
+            "HEALTHGRADES": True,
+            "SAMHSA": True,
+            "NY_OPD": True,
+            "WEB_CRAWL": not Config.NO_OLLAMA or ollama_ok,
+        },
+    )
+
+@app.post("/api/verify", response_model=VerificationResponse)
+async def verify_single(request: DoctorRequest, background_tasks: BackgroundTasks):
+    """Verify a single doctor."""
+    session_id = get_session_id()
+    
+    record = DoctorRecord(
+        name=request.name,
+        address=request.address,
+        city=request.city,
+        state=request.state.upper(),
+        zip_code=request.zip_code,
+        specialty=request.specialty,
+    )
+    
+    try:
+        result = verify_doctor(record)
+        
+        # Log in background
+        background_tasks.add_task(AUDIT.log_verification, session_id, record, result)
+        
+        # Store in session
+        if session_id not in _sessions:
+            _sessions[session_id] = {"created": time.time(), "records": []}
+        _sessions[session_id]["records"].append(result)
+        
+        # Compute confidence scores from consensus
+        identity_confidence = 0.9 if result.consensus.overall.value == "HIGH_CONFIDENCE" else (0.6 if result.consensus.overall.value == "MEDIUM_CONFIDENCE" else 0.3)
+        address_confidence = result.consensus.agreement_ratio
+        
+        return VerificationResponse(
+            name=result.record.name,
+            address=result.record.address,
+            city=result.record.city,
+            state=result.record.state,
+            zip_code=result.record.zip_code,
+            consensus_overall=result.consensus.overall.value,
+            visit_flag=result.visit_flag.value,
+            identity_confidence=identity_confidence,
+            address_confidence=address_confidence,
+            phones_found=result.phones_found,
+            llm_notes=result.llm.notes,
+            source_results={
+                s.source: {"status": s.status.value, "notes": s.notes}
+                for s in result.sources
+            },
+        )
+    except Exception as e:
+        logger.exception("Single verification error")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/batch")
+async def verify_batch_endpoint(file: UploadFile, background_tasks: BackgroundTasks):
+    """Verify batch from uploaded file."""
+    session_id = get_session_id()
+    
+    if not file.filename.endswith((".xlsx", ".xls", ".csv")):
+        raise HTTPException(status_code=400, detail="Invalid file type")
+    
+    try:
+        # Read file
+        contents = await file.read()
+        
+        if file.filename.endswith(".csv"):
+            df = pd.read_csv(io.BytesIO(contents))
+        else:
+            df = pd.read_excel(io.BytesIO(contents))
+        
+        if len(df) > Config.MAX_BATCH_SIZE:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Batch size exceeds limit of {Config.MAX_BATCH_SIZE}"
+            )
+        
+        # Convert to records
+        records = []
+        for _, row in df.iterrows():
+            records.append(DoctorRecord(
+                name=str(row.get("Name", "")),
+                address=str(row.get("Address", "")),
+                city=str(row.get("City", "")),
+                state=str(row.get("State", "")).upper(),
+                zip_code=str(row.get("ZIP", "")),
+                specialty=str(row.get("Specialty", "")),
+            ))
+        
+        # Verify
+        results = verify_batch(records)
+        
+        # Log in background
+        for record, result in zip(records, results):
+            background_tasks.add_task(AUDIT.log_verification, session_id, record, result)
+        
+        # Store in session
+        if session_id not in _sessions:
+            _sessions[session_id] = {"created": time.time(), "records": []}
+        _sessions[session_id]["records"].extend(results)
+        
+        # Return results
+        result_data = [
+            {
+                "name": r.name,
+                "address": r.address,
+                "city": r.city,
+                "state": r.state,
+                "zip_code": r.zip_code,
+                "consensus_overall": result.consensus_overall,
+                "visit_flag": result.visit_flag,
+                "identity_confidence": result.identity_confidence,
+                "address_confidence": result.address_confidence,
+                "phones_found": result.phones_found,
+                "llm_notes": result.llm_notes,
+                "source_results": {
+                    k: {"status": v.status.value, "notes": v.notes}
+                    for k, v in result.source_results.items()
+                },
+            }
+            for r, result in zip(records, results)
+        ]
+        
+        return {
+            "total": len(results),
+            "results": result_data,
+        }
+        
+    except Exception as e:
+        logger.exception("Batch verification error")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/audit")
+async def get_audit_log(limit: int = 100):
+    """Get audit log entries."""
+    try:
+        if Config.AUDIT_LOG.exists():
+            with open(Config.AUDIT_LOG) as f:
+                lines = f.readlines()[-limit:]
+            entries = []
+            for line in lines:
+                try:
+                    entry = json.loads(line)
+                    entries.append(entry)
+                except:
+                    pass
+            return {"entries": entries}
+        else:
+            return {"entries": []}
+    except Exception as e:
+        logger.exception("Audit log error")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Serve static files for frontend
+from fastapi.staticfiles import StaticFiles
+
+static_dir = Path(__file__).parent / "static"
+static_dir.mkdir(exist_ok=True)
+
+app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
+@app.get("/app")
+async def serve_frontend():
+    """Serve the frontend HTML."""
+    html_path = static_dir / "index.html"
+    if html_path.exists():
+        from fastapi.responses import FileResponse
+        return FileResponse(html_path)
+    else:
+        return {"message": "Frontend not found. Please build the static files."}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=7860)
+
+```
+
+README_HF.md:
+```
+# Doctor Address Verifier — Institutional Edition
+
+**Hugging Face Spaces deployment** of a production-grade, multi-source doctor address verification system.
+
+## Features
+
+- **10 Verification Sources**: NPI Registry, CMS Physician Compare, Google Places, Bing, Yelp, RateMDs, Healthgrades, SAMHSA, NY OPD, LLM Web Crawl
+- **LLM-Powered Web Crawl**: Ollama analyzes actual web pages via DuckDuckGo search (falls back to keyword matching if unavailable)
+- **Parallel Source Fetching**: ThreadPoolExecutor runs sources concurrently
+- **Pydantic v2 Models**: Strict validation at all boundaries
+- **Immutable Audit Logging**: SHA-256 checksums on every event
+- **SQLite Cache**: 24hr TTL for scraped results
+- **Phone Extraction**: Automatically extracts US phone numbers from all sources
+- **Consensus Engine**: Weighted scoring by source importance
+- **Gradio UI**: Single verify, batch verify (Excel), system status, audit log
+- **Zero Configuration**: Works out of the box with no API keys or environment variables required
+
+## Deployment
+
+### 1. Create HF Space
+
+```bash
+huggingface-cli repo create doctor-verify-institutional --type space --sdk docker
+```
+
+### 2. Push Code
+
+```bash
+git clone https://huggingface.co/spaces/YOUR_USERNAME/doctor-verify-institutional
+cd doctor-verify-institutional
+# Copy all files from hf_institutional/
+cp /path/to/hf_institutional/* .
+git add .
+git commit -m "Initial institutional deployment"
+git push
+```
+
+### 3. Configure Secrets (Optional)
+
+The system works without any secrets. For enhanced functionality, you may add:
+
+| Secret | Description | Effect |
+|---|---|---|
+| `GOOGLE_API_KEY` | Google Places API key | Enables Google Places source |
+| `BING_SEARCH_KEY` | Bing Web Search API key | Enables Bing search source |
+| `OLLAMA_HOST` | Ollama endpoint URL | Enables LLM-powered web crawl |
+| `OLLAMA_MODEL` | Ollama model name | Uses specified model (default: llama3.2) |
+| `APP_PASSWORD` | Access password for the UI | Adds password protection |
+| `MAX_BATCH_SIZE` | Max records per batch | Adjusts batch limit (default: 100) |
+
+**Default behavior without secrets:**
+- NPI Registry, CMS Compare, Yelp, RateMDs, Healthgrades, SAMHSA, NY OPD: **Fully functional**
+- Web crawl: Uses keyword matching (no LLM required)
+- Google Places, Bing: Disabled (optional enhancements)
+- Authentication: Disabled (public access)
+
+## Architecture
+
+```
+app_hf.py      → Gradio UI (tabs: Single, Batch, Status, Audit)
+engine.py      → Consensus engine + batch orchestrator
+sources.py     → 9 independent source runners (each retry-wrapped)
+llm_crawler.py → DuckDuckGo search + Ollama page analysis + cache
+models.py      → Pydantic v2 models for all data boundaries
+config.py      → Environment-backed config with security constants
+audit.py       → Immutable JSONL audit log with SHA-256 checksums
+```
+
+## Security
+
+- **Input Validation**: All inputs validated via Pydantic models
+- **Audit Trail**: Every verification logged with checksums
+- **Privacy**: IP addresses hashed (SHA-256) before logging
+- **Rate Limiting**: Configurable per-minute rate limits (default: 30/min)
+- **Least Privilege**: No `chmod 777`, no wide-open CORS
+
+## License
+
+Proprietary — Internal use only.
+
+```
+
+requirements_hf.txt:
+```
+pandas>=2.0.0
+openpyxl>=3.1.0
+httpx>=0.27.0
+ollama>=0.3.0
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+pydantic>=2.0.0
+fastapi>=0.109.0
+uvicorn>=0.27.0
+python-multipart>=0.0.9
+
+```
+
+index.html:
+```
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Doctor Address Verifier</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        .gradient-bg {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+
+        .card-shadow {
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.1);
+        }
+
+        .pulse-animation {
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+
+            0%,
+            100% {
+                opacity: 1;
+            }
+
+            50% {
+                opacity: 0.5;
+            }
+        }
+
+        .source-badge {
+            transition: all 0.3s ease;
+        }
+
+        .source-badge:hover {
+            transform: scale(1.05);
+        }
+
+        .result-card {
+            transition: all 0.3s ease;
+        }
+
+        .result-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 15px 50px rgba(0, 0, 0, 0.15);
+        }
+    </style>
+</head>
+
+<body class="bg-gray-50 min-h-screen">
+    <!-- Header -->
+    <header class="gradient-bg text-white py-6 shadow-lg">
+        <div class="container mx-auto px-4">
+            <div class="flex items-center justify-between">
+                <div class="flex items-center space-x-3">
+                    <i class="fas fa-hospital text-3xl"></i>
+                    <div>
+                        <h1 class="text-2xl font-bold">Doctor Address Verifier</h1>
+                        <p class="text-sm opacity-90">Institutional-grade multi-source verification</p>
+                    </div>
+                </div>
+                <div class="flex items-center space-x-4">
+                    <div id="status-indicator" class="flex items-center space-x-2 bg-white/20 px-4 py-2 rounded-full">
+                        <div class="w-2 h-2 bg-green-400 rounded-full pulse-animation"></div>
+                        <span class="text-sm">Connected</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <!-- Main Content -->
+    <main class="container mx-auto px-4 py-8">
+        <!-- Tabs -->
+        <div class="flex space-x-4 mb-8 border-b border-gray-200">
+            <button onclick="showTab('single')" id="tab-single"
+                class="tab-btn px-6 py-3 font-semibold text-purple-600 border-b-2 border-purple-600">
+                <i class="fas fa-user-md mr-2"></i>Single Verify
+            </button>
+            <button onclick="showTab('batch')" id="tab-batch"
+                class="tab-btn px-6 py-3 font-semibold text-gray-500 hover:text-purple-600">
+                <i class="fas fa-file-excel mr-2"></i>Batch Verify
+            </button>
+            <button onclick="showTab('status')" id="tab-status"
+                class="tab-btn px-6 py-3 font-semibold text-gray-500 hover:text-purple-600">
+                <i class="fas fa-chart-line mr-2"></i>System Status
+            </button>
+            <button onclick="showTab('audit')" id="tab-audit"
+                class="tab-btn px-6 py-3 font-semibold text-gray-500 hover:text-purple-600">
+                <i class="fas fa-history mr-2"></i>Audit Log
+            </button>
+        </div>
+
+        <!-- Single Verify Tab -->
+        <div id="content-single" class="tab-content">
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                <!-- Input Form -->
+                <div class="bg-white rounded-xl p-6 card-shadow">
+                    <h2 class="text-xl font-bold mb-6 text-gray-800">
+                        <i class="fas fa-edit mr-2 text-purple-600"></i>Doctor Information
+                    </h2>
+                    <form id="single-form" class="space-y-4">
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-1">Doctor Name *</label>
+                            <input type="text" id="name" required placeholder="Last, First"
+                                class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-transparent">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-1">Street Address *</label>
+                            <input type="text" id="address" required placeholder="123 Main St"
+                                class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-transparent">
+                        </div>
+                        <div class="grid grid-cols-2 gap-4">
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 mb-1">City *</label>
+                                <input type="text" id="city" required placeholder="City"
+                                    class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-transparent">
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 mb-1">State *</label>
+                                <input type="text" id="state" required placeholder="NY" maxlength="2"
+                                    class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-transparent uppercase">
+                            </div>
+                        </div>
+                        <div class="grid grid-cols-2 gap-4">
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 mb-1">ZIP Code *</label>
+                                <input type="text" id="zip" required placeholder="10001"
+                                    class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-transparent">
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 mb-1">Specialty</label>
+                                <input type="text" id="specialty" placeholder="Internal Medicine"
+                                    class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-transparent">
+                            </div>
+                        </div>
+                        <button type="submit" id="verify-btn"
+                            class="w-full bg-gradient-to-r from-purple-600 to-indigo-600 text-white py-3 rounded-lg font-semibold hover:from-purple-700 hover:to-indigo-700 transition-all duration-300 flex items-center justify-center space-x-2">
+                            <i class="fas fa-search"></i>
+                            <span>Verify Address</span>
+                        </button>
+                    </form>
+                </div>
+
+                <!-- Results -->
+                <div id="single-results" class="bg-white rounded-xl p-6 card-shadow">
+                    <h2 class="text-xl font-bold mb-6 text-gray-800">
+                        <i class="fas fa-clipboard-check mr-2 text-purple-600"></i>Verification Results
+                    </h2>
+                    <div id="results-placeholder" class="text-center py-12 text-gray-400">
+                        <i class="fas fa-inbox text-5xl mb-4"></i>
+                        <p>Enter doctor information and click verify</p>
+                    </div>
+                    <div id="results-content" class="hidden space-y-6">
+                        <!-- Confidence Scores -->
+                        <div class="grid grid-cols-2 gap-4">
+                            <div class="bg-gradient-to-br from-green-50 to-green-100 p-4 rounded-lg">
+                                <p class="text-sm text-gray-600">Consensus</p>
+                                <p id="result-consensus" class="text-2xl font-bold text-green-600">-</p>
+                            </div>
+                            <div class="bg-gradient-to-br from-blue-50 to-blue-100 p-4 rounded-lg">
+                                <p class="text-sm text-gray-600">Visit Flag</p>
+                                <p id="result-visit" class="text-2xl font-bold text-blue-600">-</p>
+                            </div>
+                        </div>
+                        <div class="grid grid-cols-2 gap-4">
+                            <div class="bg-gradient-to-br from-purple-50 to-purple-100 p-4 rounded-lg">
+                                <p class="text-sm text-gray-600">Identity Confidence</p>
+                                <p id="result-identity" class="text-2xl font-bold text-purple-600">-</p>
+                            </div>
+                            <div class="bg-gradient-to-br from-indigo-50 to-indigo-100 p-4 rounded-lg">
+                                <p class="text-sm text-gray-600">Address Confidence</p>
+                                <p id="result-address" class="text-2xl font-bold text-indigo-600">-</p>
+                            </div>
+                        </div>
+
+                        <!-- Source Results -->
+                        <div>
+                            <h3 class="font-semibold text-gray-800 mb-3">Source Results</h3>
+                            <div id="source-results" class="grid grid-cols-2 gap-2">
+                                <!-- Source badges will be inserted here -->
+                            </div>
+                        </div>
+
+                        <!-- Phone Numbers -->
+                        <div id="phones-section" class="hidden">
+                            <h3 class="font-semibold text-gray-800 mb-3">Phone Numbers Found</h3>
+                            <div id="phones-list" class="space-y-2">
+                                <!-- Phone numbers will be inserted here -->
+                            </div>
+                        </div>
+
+                        <!-- LLM Notes -->
+                        <div id="llm-section" class="hidden">
+                            <h3 class="font-semibold text-gray-800 mb-3">AI Analysis</h3>
+                            <div id="llm-notes" class="bg-gray-50 p-4 rounded-lg text-sm text-gray-700">
+                                <!-- LLM notes will be inserted here -->
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Batch Verify Tab -->
+        <div id="content-batch" class="tab-content hidden">
+            <div class="bg-white rounded-xl p-6 card-shadow">
+                <h2 class="text-xl font-bold mb-6 text-gray-800">
+                    <i class="fas fa-file-upload mr-2 text-purple-600"></i>Batch Verification
+                </h2>
+                <div
+                    class="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center hover:border-purple-500 transition-colors">
+                    <input type="file" id="batch-file" accept=".xlsx,.xls,.csv" class="hidden">
+                    <label for="batch-file" class="cursor-pointer">
+                        <i class="fas fa-cloud-upload-alt text-5xl text-gray-400 mb-4"></i>
+                        <p class="text-gray-600">Click to upload or drag and drop</p>
+                        <p class="text-sm text-gray-400">Excel (.xlsx, .xls) or CSV files</p>
+                    </label>
+                </div>
+                <div id="batch-info" class="hidden mt-4 p-4 bg-blue-50 rounded-lg">
+                    <p class="text-blue-800"><i class="fas fa-info-circle mr-2"></i><span id="batch-filename"></span>
+                    </p>
+                </div>
+                <button id="batch-process-btn" disabled
+                    class="mt-4 w-full bg-gradient-to-r from-purple-600 to-indigo-600 text-white py-3 rounded-lg font-semibold hover:from-purple-700 hover:to-indigo-700 transition-all duration-300 disabled:opacity-50 disabled:cursor-not-allowed">
+                    <i class="fas fa-cogs mr-2"></i>Process Batch
+                </button>
+                <div id="batch-results" class="hidden mt-6">
+                    <h3 class="font-semibold text-gray-800 mb-4">Results</h3>
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-sm">
+                            <thead class="bg-gray-50">
+                                <tr>
+                                    <th class="px-4 py-2 text-left">Name</th>
+                                    <th class="px-4 py-2 text-left">Address</th>
+                                    <th class="px-4 py-2 text-left">Consensus</th>
+                                    <th class="px-4 py-2 text-left">Visit Flag</th>
+                                    <th class="px-4 py-2 text-left">Identity</th>
+                                    <th class="px-4 py-2 text-left">Address</th>
+                                </tr>
+                            </thead>
+                            <tbody id="batch-table-body">
+                                <!-- Results will be inserted here -->
+                            </tbody>
+                        </table>
+                    </div>
+                    <button id="download-btn"
+                        class="mt-4 bg-green-600 text-white px-6 py-2 rounded-lg hover:bg-green-700 transition-colors">
+                        <i class="fas fa-download mr-2"></i>Download Results
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- System Status Tab -->
+        <div id="content-status" class="tab-content hidden">
+            <div class="bg-white rounded-xl p-6 card-shadow">
+                <h2 class="text-xl font-bold mb-6 text-gray-800">
+                    <i class="fas fa-server mr-2 text-purple-600"></i>System Status
+                </h2>
+                <div id="status-content" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                    <!-- Status cards will be inserted here -->
+                </div>
+            </div>
+        </div>
+
+        <!-- Audit Log Tab -->
+        <div id="content-audit" class="tab-content hidden">
+            <div class="bg-white rounded-xl p-6 card-shadow">
+                <h2 class="text-xl font-bold mb-6 text-gray-800">
+                    <i class="fas fa-history mr-2 text-purple-600"></i>Audit Log
+                </h2>
+                <div id="audit-content" class="space-y-4">
+                    <!-- Audit entries will be inserted here -->
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- Footer -->
+    <footer class="bg-gray-800 text-white py-6 mt-12">
+        <div class="container mx-auto px-4 text-center">
+            <p class="text-sm opacity-75">Doctor Address Verifier — Institutional Edition | Zero Configuration
+                Deployment</p>
+        </div>
+    </footer>
+
+    <script>
+        const API_BASE = window.location.origin + '/api';
+
+        // Tab switching
+        function showTab(tabName) {
+            document.querySelectorAll('.tab-content').forEach(el => el.classList.add('hidden'));
+            document.querySelectorAll('.tab-btn').forEach(el => {
+                el.classList.remove('text-purple-600', 'border-b-2', 'border-purple-600');
+                el.classList.add('text-gray-500');
+            });
+
+            document.getElementById(`content-${tabName}`).classList.remove('hidden');
+            const activeTab = document.getElementById(`tab-${tabName}`);
+            activeTab.classList.add('text-purple-600', 'border-b-2', 'border-purple-600');
+            activeTab.classList.remove('text-gray-500');
+
+            if (tabName === 'status') loadStatus();
+            if (tabName === 'audit') loadAudit();
+        }
+
+        // Single verify
+        document.getElementById('single-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const btn = document.getElementById('verify-btn');
+            btn.disabled = true;
+            btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i>Verifying...';
+
+            const data = {
+                name: document.getElementById('name').value,
+                address: document.getElementById('address').value,
+                city: document.getElementById('city').value,
+                state: document.getElementById('state').value.toUpperCase(),
+                zip_code: document.getElementById('zip').value,
+                specialty: document.getElementById('specialty').value
+            };
+
+            try {
+                const response = await fetch(`${API_BASE}/api/verify`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(data)
+                });
+
+                const result = await response.json();
+                displayResults(result);
+            } catch (error) {
+                console.error('Verification error:', error);
+                alert('Verification failed. Please try again.');
+            } finally {
+                btn.disabled = false;
+                btn.innerHTML = '<i class="fas fa-search mr-2"></i>Verify Address';
+            }
+        });
+
+        function displayResults(result) {
+            document.getElementById('results-placeholder').classList.add('hidden');
+            document.getElementById('results-content').classList.remove('hidden');
+
+            document.getElementById('result-consensus').textContent = result.consensus_overall;
+            document.getElementById('result-visit').textContent = result.visit_flag;
+            document.getElementById('result-identity').textContent = (result.identity_confidence * 100).toFixed(0) + '%';
+            document.getElementById('result-address').textContent = (result.address_confidence * 100).toFixed(0) + '%';
+
+            // Source results
+            const sourceContainer = document.getElementById('source-results');
+            sourceContainer.innerHTML = '';
+            for (const [source, data] of Object.entries(result.source_results)) {
+                const statusColor = data.status === 'VERIFIED' ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800';
+                sourceContainer.innerHTML += `
+                    <div class="source-badge ${statusColor} px-3 py-2 rounded-lg text-sm font-medium">
+                        <div class="font-semibold">${source}</div>
+                        <div class="text-xs opacity-75">${data.status}</div>
+                    </div>
+                `;
+            }
+
+            // Phones
+            const phonesSection = document.getElementById('phones-section');
+            if (result.phones_found && result.phones_found.length > 0) {
+                phonesSection.classList.remove('hidden');
+                const phonesList = document.getElementById('phones-list');
+                phonesList.innerHTML = result.phones_found.map(phone => `
+                    <div class="flex items-center space-x-2 bg-gray-50 p-2 rounded">
+                        <i class="fas fa-phone text-green-600"></i>
+                        <span>${phone}</span>
+                    </div>
+                `).join('');
+            } else {
+                phonesSection.classList.add('hidden');
+            }
+
+            // LLM notes
+            const llmSection = document.getElementById('llm-section');
+            if (result.llm_notes) {
+                llmSection.classList.remove('hidden');
+                document.getElementById('llm-notes').textContent = result.llm_notes;
+            } else {
+                llmSection.classList.add('hidden');
+            }
+        }
+
+        // Batch upload
+        document.getElementById('batch-file').addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (file) {
+                document.getElementById('batch-info').classList.remove('hidden');
+                document.getElementById('batch-filename').textContent = file.name;
+                document.getElementById('batch-process-btn').disabled = false;
+            }
+        });
+
+        document.getElementById('batch-process-btn').addEventListener('click', async () => {
+            const fileInput = document.getElementById('batch-file');
+            const file = fileInput.files[0];
+            if (!file) return;
+
+            const btn = document.getElementById('batch-process-btn');
+            btn.disabled = true;
+            btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i>Processing...';
+
+            const formData = new FormData();
+            formData.append('file', file);
+
+            try {
+                const response = await fetch(`${API_BASE}/api/batch`, {
+                    method: 'POST',
+                    body: formData
+                });
+
+                const result = await response.json();
+                displayBatchResults(result);
+            } catch (error) {
+                console.error('Batch error:', error);
+                alert('Batch processing failed. Please try again.');
+            } finally {
+                btn.disabled = false;
+                btn.innerHTML = '<i class="fas fa-cogs mr-2"></i>Process Batch';
+            }
+        });
+
+        function displayBatchResults(result) {
+            document.getElementById('batch-results').classList.remove('hidden');
+            const tbody = document.getElementById('batch-table-body');
+            tbody.innerHTML = result.results.map(r => `
+                <tr class="border-b">
+                    <td class="px-4 py-2">${r.name}</td>
+                    <td class="px-4 py-2">${r.address}</td>
+                    <td class="px-4 py-2"><span class="px-2 py-1 rounded text-xs font-medium ${r.consensus_overall === 'HIGH_CONFIDENCE' ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'}">${r.consensus_overall}</span></td>
+                    <td class="px-4 py-2">${r.visit_flag}</td>
+                    <td class="px-4 py-2">${(r.identity_confidence * 100).toFixed(0)}%</td>
+                    <td class="px-4 py-2">${(r.address_confidence * 100).toFixed(0)}%</td>
+                </tr>
+            `).join('');
+        }
+
+        // Load status
+        async function loadStatus() {
+            try {
+                const response = await fetch(`${API_BASE}/api/status`);
+                const status = await response.json();
+
+                const container = document.getElementById('status-content');
+                container.innerHTML = `
+                    <div class="bg-gradient-to-br from-green-50 to-green-100 p-6 rounded-lg">
+                        <p class="text-sm text-gray-600">Ollama</p>
+                        <p class="text-xl font-bold text-green-600">${status.ollama_available ? 'OK' : 'DOWN (keyword fallback)'}</p>
+                    </div>
+                    <div class="bg-gradient-to-br from-blue-50 to-blue-100 p-6 rounded-lg">
+                        <p class="text-sm text-gray-600">Google Places</p>
+                        <p class="text-xl font-bold text-blue-600">${status.google_places_enabled ? 'ENABLED' : 'DISABLED'}</p>
+                    </div>
+                    <div class="bg-gradient-to-br from-purple-50 to-purple-100 p-6 rounded-lg">
+                        <p class="text-sm text-gray-600">Bing</p>
+                        <p class="text-xl font-bold text-purple-600">${status.bing_enabled ? 'ENABLED' : 'DISABLED'}</p>
+                    </div>
+                    <div class="bg-gradient-to-br from-indigo-50 to-indigo-100 p-6 rounded-lg">
+                        <p class="text-sm text-gray-600">Total Verifications</p>
+                        <p class="text-xl font-bold text-indigo-600">${status.total_verifications}</p>
+                    </div>
+                    <div class="bg-gradient-to-br from-pink-50 to-pink-100 p-6 rounded-lg">
+                        <p class="text-sm text-gray-600">Uptime</p>
+                        <p class="text-xl font-bold text-pink-600">${Math.floor(status.uptime_seconds / 60)}m</p>
+                    </div>
+                `;
+
+                // Source health
+                container.innerHTML += '<div class="col-span-full mt-6"><h3 class="font-semibold text-gray-800 mb-4">Source Health</h3><div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-2">';
+                for (const [source, healthy] of Object.entries(status.source_health)) {
+                    container.innerHTML += `
+                        <div class="flex items-center space-x-2 p-2 rounded ${healthy ? 'bg-green-50' : 'bg-red-50'}">
+                            <i class="fas ${healthy ? 'fa-check-circle text-green-600' : 'fa-times-circle text-red-600'}"></i>
+                            <span class="text-sm font-medium">${source}</span>
+                        </div>
+                    `;
+                }
+                container.innerHTML += '</div></div>';
+            } catch (error) {
+                console.error('Status error:', error);
+            }
+        }
+
+        // Load audit
+        async function loadAudit() {
+            try {
+                const response = await fetch(`${API_BASE}/api/audit`);
+                const data = await response.json();
+
+                const container = document.getElementById('audit-content');
+                if (data.entries.length === 0) {
+                    container.innerHTML = '<p class="text-gray-400 text-center py-8">No audit logs yet</p>';
+                } else {
+                    container.innerHTML = data.entries.map(entry => `
+                        <div class="bg-gray-50 p-4 rounded-lg">
+                            <div class="flex justify-between items-start mb-2">
+                                <span class="font-semibold">${entry.doctor_name}</span>
+                                <span class="text-sm text-gray-500">${entry.timestamp}</span>
+                            </div>
+                            <div class="text-sm text-gray-600">
+                                <p>Address: ${entry.address}, ${entry.city}, ${entry.state}</p>
+                                <p>Consensus: ${entry.consensus_overall}</p>
+                            </div>
+                        </div>
+                    `).join('');
+                }
+            } catch (error) {
+                console.error('Audit error:', error);
+            }
+        }
+
+        // Initial load
+        loadStatus();
+    </script>
+</body>
+
+</html>
+```

@@ -1,0 +1,573 @@
+Project Structure:
+requirements.txt
+Dockerfile
+README.md
+.gitattributes
+app.py
+mcp_client.py
+
+File Contents:
+requirements.txt:
+```
+flask>=2.3
+huggingface-hub>=0.20
+gunicorn>=21.0
+
+```
+
+Dockerfile:
+```
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+EXPOSE 7860
+
+ENV PORT=7860
+ENV PYTHONUNBUFFERED=1
+
+CMD ["python", "app.py"]
+
+```
+
+README.md:
+```
+---
+title: HF Repo Scanner
+emoji: 🔍
+colorFrom: red
+colorTo: yellow
+sdk: docker
+pinned: false
+license: mit
+---
+
+# HF Repo Scanner
+
+Scan every line of code in every file across all Hugging Face repos for a given username.
+
+## Features
+
+- **Security Pattern Detection**: Scans for hardcoded secrets, private keys, SQL injection risks, eval/exec usage, and more
+- **Multi-Repo Support**: Scans models, datasets, and spaces
+- **Real-time Progress**: Background scanning with status polling
+- **Detailed Findings**: Line-by-line findings with severity levels (critical, warning, info)
+
+## Usage
+
+1. Enter a Hugging Face username
+2. Select repo type (All, Spaces only, Models only, Datasets only)
+3. Click "Start Scan"
+4. View results as they are discovered
+
+## Environment Variables
+
+- `HF_TOKEN`: Optional Hugging Face API token for private repos
+
+## License
+
+MIT
+
+```
+
+.gitattributes:
+```
+*.7z filter=lfs diff=lfs merge=lfs -text
+*.arrow filter=lfs diff=lfs merge=lfs -text
+*.bin filter=lfs diff=lfs merge=lfs -text
+*.bz2 filter=lfs diff=lfs merge=lfs -text
+*.ckpt filter=lfs diff=lfs merge=lfs -text
+*.ftz filter=lfs diff=lfs merge=lfs -text
+*.gz filter=lfs diff=lfs merge=lfs -text
+*.h5 filter=lfs diff=lfs merge=lfs -text
+*.joblib filter=lfs diff=lfs merge=lfs -text
+*.lfs.* filter=lfs diff=lfs merge=lfs -text
+*.mlmodel filter=lfs diff=lfs merge=lfs -text
+*.model filter=lfs diff=lfs merge=lfs -text
+*.msgpack filter=lfs diff=lfs merge=lfs -text
+*.npy filter=lfs diff=lfs merge=lfs -text
+*.npz filter=lfs diff=lfs merge=lfs -text
+*.onnx filter=lfs diff=lfs merge=lfs -text
+*.ot filter=lfs diff=lfs merge=lfs -text
+*.parquet filter=lfs diff=lfs merge=lfs -text
+*.pb filter=lfs diff=lfs merge=lfs -text
+*.pickle filter=lfs diff=lfs merge=lfs -text
+*.pkl filter=lfs diff=lfs merge=lfs -text
+*.pt filter=lfs diff=lfs merge=lfs -text
+*.pth filter=lfs diff=lfs merge=lfs -text
+*.rar filter=lfs diff=lfs merge=lfs -text
+*.safetensors filter=lfs diff=lfs merge=lfs -text
+saved_model/**/* filter=lfs diff=lfs merge=lfs -text
+*.tar.* filter=lfs diff=lfs merge=lfs -text
+*.tar filter=lfs diff=lfs merge=lfs -text
+*.tflite filter=lfs diff=lfs merge=lfs -text
+*.tgz filter=lfs diff=lfs merge=lfs -text
+*.wasm filter=lfs diff=lfs merge=lfs -text
+*.xz filter=lfs diff=lfs merge=lfs -text
+*.zip filter=lfs diff=lfs merge=lfs -text
+*.zst filter=lfs diff=lfs merge=lfs -text
+*tfevents* filter=lfs diff=lfs merge=lfs -text
+
+```
+
+app.py:
+```
+"""
+HF Repo Scanner — Scan every line of code in every file across all HF repos for a given user.
+"""
+import os, re, json, time, threading, base64, traceback
+import logging
+from pathlib import Path
+from datetime import datetime
+from typing import Any
+from urllib.parse import unquote
+
+from flask import Flask, request, jsonify, render_template_string
+from huggingface_hub import HfApi, hf_hub_download, list_repo_tree
+from huggingface_hub.utils import EntryNotFoundError
+
+app = Flask(__name__)
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# ── Config ──────────────────────────────────────────────────────
+DEFAULT_CHECKS = [
+    {"id": "hardcoded_secret", "name": "Hardcoded Secret", "severity": "critical", "pattern": r'(?i)(api[_-]?key|token|password|secret)[\s]*[:=][\s]*["\'][^"\']{8,}["\']'},
+    {"id": "private_key", "name": "Private Key", "severity": "critical", "pattern": r'-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----'},
+    {"id": "todo_fixme", "name": "TODO / FIXME", "severity": "info", "pattern": r'(?i)#?\s*(TODO|FIXME|HACK|XXX|BUG)'},
+    {"id": "debug_print", "name": "Debug Print / Console Log", "severity": "warning", "pattern": r'(?i)(console\.log|print\(|debug\(|alert\()'},
+    {"id": "http_not_https", "name": "HTTP instead of HTTPS", "severity": "warning", "pattern": r'http://[^\s\"\']+'},
+    {"id": "sql_injection_risk", "name": "SQL Injection Risk", "severity": "critical", "pattern": r'(?i)(execute\s*\(.*%s|cursor\.execute\s*\(.*\+|f["\'].*?SELECT.*?FROM.*?)'},
+    {"id": "eval_exec", "name": "Eval / Exec", "severity": "critical", "pattern": r'(?i)\b(eval|exec|compile)\s*\('},
+    {"id": "disabled_verification", "name": "Disabled Verification", "severity": "critical", "pattern": r'(?i)(verify\s*=\s*False|ssl_verify\s*=\s*False|insecure|disable.*check)'},
+    {"id": "sensitive_env", "name": "Sensitive Env Exposure", "severity": "warning", "pattern": r'(?i)(os\.environ\.get|process\.env)\s*\[["\'][^"\']*(KEY|TOKEN|SECRET|PASS)["\']\]'},
+    {"id": "dangerous_deserialization", "name": "Dangerous Deserialization", "severity": "critical", "pattern": r'(?i)(pickle\.loads|yaml\.load\(|marshal\.loads|eval\()'},
+]
+
+SCAN_RESULTS: dict[str, Any] = {}
+ACTIVE_SCANS: set[str] = set()
+
+# ── Templates ───────────────────────────────────────────────────
+PAGE = """
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HF Repo Scanner</title>
+<style>
+  :root { --bg:#0b0c15; --card:#131420; --accent:#60a5fa; --crit:#ef4444; --warn:#f59e0b; --info:#22c55e; --text:#e2e8f0; --muted:#94a3b8; }
+  * { box-sizing:border-box; }
+  body { font-family: system-ui, sans-serif; background:var(--bg); color:var(--text); margin:0; padding:2rem; }
+  h1 { margin:0 0 .5rem; }
+  .sub { color:var(--muted); margin-bottom:1.5rem; }
+  form { display:flex; gap:.5rem; flex-wrap:wrap; margin-bottom:2rem; }
+  input, select, button { padding:.6rem .9rem; border-radius:.4rem; border:1px solid #1f2937; background:#1e2030; color:var(--text); font-size:1rem; }
+  input { flex:1; min-width:220px; }
+  button { background:var(--accent); color:#0b0c15; border:none; cursor:pointer; font-weight:600; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  .grid { display:grid; gap:1rem; grid-template-columns:repeat(auto-fill,minmax(320px,1fr)); }
+  .card { background:var(--card); border:1px solid #1f2937; border-radius:.6rem; padding:1rem; }
+  .card h3 { margin:.2rem 0 .6rem; font-size:1.05rem; }
+  .badge { font-size:.72rem; padding:.15rem .4rem; border-radius:.3rem; font-weight:600; text-transform:uppercase; }
+  .badge.critical { background:rgba(239,68,68,.15); color:var(--crit); }
+  .badge.warning { background:rgba(245,158,11,.15); color:var(--warn); }
+  .badge.info { background:rgba(34,197,94,.15); color:var(--info); }
+  .meta { color:var(--muted); font-size:.85rem; margin-bottom:.6rem; }
+  .finding { padding:.5rem; border-radius:.35rem; background:#0f1120; margin:.35rem 0; font-size:.85rem; }
+  .finding .loc { color:var(--muted); font-size:.78rem; }
+  .finding pre { margin:.25rem 0 0; white-space:pre-wrap; word-break:break-all; background:#0b0c15; padding:.4rem; border-radius:.25rem; font-size:.8rem; }
+  .stats { display:flex; gap:1rem; margin-bottom:1.5rem; flex-wrap:wrap; }
+  .stat { background:var(--card); padding:.8rem 1.2rem; border-radius:.5rem; border:1px solid #1f2937; }
+  .stat b { display:block; font-size:1.3rem; }
+  .status { color:var(--muted); font-size:.9rem; margin-top:.5rem; }
+  a { color:var(--accent); }
+</style>
+</head>
+<body>
+<h1>🔍 HF Repo Scanner</h1>
+<p class="sub">Scan every line of code in every file across all Hugging Face repos for a given username.</p>
+
+<form id="scanForm" onsubmit="return startScan()">
+  <input type="text" id="username" placeholder="HF username (e.g. josephrw)" value="{{ username or '' }}" required>
+  <select id="repo_type">
+    <option value="all">All Repos</option>
+    <option value="space">Spaces only</option>
+    <option value="model">Models only</option>
+    <option value="dataset">Datasets only</option>
+  </select>
+  <button type="submit" id="btn">Start Scan</button>
+</form>
+
+{% if scan_id %}
+<div class="status" id="pollArea">
+  Scanning <b>{{ username }}</b>… <span id="pollStatus">checking…</span>
+</div>
+{% endif %}
+
+{% if results %}
+<div class="stats">
+  <div class="stat"><b>{{ results.total_repos }}</b> repos scanned</div>
+  <div class="stat"><b>{{ results.total_files }}</b> files scanned</div>
+  <div class="stat"><b>{{ results.total_lines }}</b> lines scanned</div>
+  <div class="stat" style="color:var(--crit)"><b>{{ results.findings | length }}</b> findings</div>
+</div>
+
+<div class="grid">
+{% for f in results.findings %}
+  <div class="card">
+    <h3><span class="badge {{ f.severity }}">{{ f.severity }}</span> {{ f.check_name }}</h3>
+    <div class="meta">
+      <a href="https://huggingface.co/{{ f.repo_id }}" target="_blank">{{ f.repo_id }}</a> &middot;
+      <code>{{ f.file_path }}</code> &middot; line {{ f.line_number }}
+    </div>
+    <div class="finding">
+      <div class="loc">Line {{ f.line_number }}</div>
+      <pre>{{ f.line_text }}</pre>
+    </div>
+  </div>
+{% endfor %}
+</div>
+{% endif %}
+
+<script>
+async function startScan() {
+  const u = document.getElementById('username').value.trim();
+  const t = document.getElementById('repo_type').value;
+  if (!u) return false;
+  document.getElementById('btn').disabled = true;
+  document.getElementById('btn').textContent = 'Starting…';
+  const r = await fetch('/api/scan', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({username: u, repo_type: t})
+  });
+  const j = await r.json();
+  if (j.scan_id) {
+    location.href = '/?scan_id=' + j.scan_id + '&username=' + encodeURIComponent(u);
+  } else {
+    alert(j.error || 'Scan failed');
+    document.getElementById('btn').disabled = false;
+    document.getElementById('btn').textContent = 'Start Scan';
+  }
+  return false;
+}
+
+{% if scan_id %}
+const scanId = '{{ scan_id }}';
+async function poll() {
+  const r = await fetch('/api/scan/' + scanId);
+  const j = await r.json();
+  document.getElementById('pollStatus').textContent = j.status;
+  if (j.status === 'done') {
+    location.reload();
+  } else if (j.status === 'error') {
+    document.getElementById('pollStatus').textContent = 'error: ' + (j.error || 'unknown');
+  } else {
+    setTimeout(poll, 2000);
+  }
+}
+poll();
+{% endif %}
+</script>
+</body>
+</html>
+"""
+
+# ── Helpers ─────────────────────────────────────────────────────
+def _get_api():
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_TOKEN")
+    return HfApi(token=token)
+
+
+def _fetch_file_content(repo_id: str, path: str, repo_type: str, api: HfApi) -> str | None:
+    """Download and decode a file from HF. Returns None for binary or too large."""
+    try:
+        # Skip binary / media / archive files
+        skip_ext = {".png", ".jpg", ".jpeg", ".gif", ".mp4", ".mp3", ".wav", ".zip", ".tar", ".gz", ".tgz", ".bz2", ".7z", ".rar", ".exe", ".dll", ".so", ".dylib", ".bin", ".onnx", ".pt", ".pth", ".safetensors", ".ckpt", ".h5", ".pb", ".pbtxt", ".pbtxt", ".npy", ".npz", ".parquet", ".arrow", ".orc", ".avro", ".msgpack", ".pickle", ".pkl", ".joblib", ".pkl", ".feather", ".db", ".sqlite", ".sqlite3", ".woff", ".woff2", ".ttf", ".eot", ".ico", ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx"}
+        if Path(path).suffix.lower() in skip_ext:
+            return None
+        if Path(path).name.lower() in {"license", "license.txt", "copying", "authors", "changelog", "news", "readme", "readme.md", ".gitignore", ".gitattributes", ".dockerignore"}:
+            return None
+
+        local = hf_hub_download(repo_id=repo_id, filename=path, repo_type=repo_type, local_dir=None)
+        # hf_hub_download returns path — but for spaces with no token may fail. Fallback to API.
+        if local and Path(local).exists():
+            try:
+                return Path(local).read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                return None
+    except EntryNotFoundError:
+        return None
+    except Exception:
+        # Fallback: try raw download via API
+        try:
+            from huggingface_hub import hf_hub_url, cached_download
+            url = hf_hub_url(repo_id=repo_id, filename=path, repo_type=repo_type)
+            data = cached_download(url, force_download=False)
+            return Path(data).read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            return None
+    return None
+
+
+def _scan_text(text: str, checks: list[dict]) -> list[dict]:
+    findings = []
+    for line_no, line in enumerate(text.splitlines(), 1):
+        for check in checks:
+            if re.search(check["pattern"], line):
+                findings.append({
+                    "line_number": line_no,
+                    "line_text": line[:500],
+                    "check_id": check["id"],
+                    "check_name": check["name"],
+                    "severity": check["severity"],
+                })
+    return findings
+
+
+def _scan_worker(scan_id: str, username: str, repo_filter: str):
+    """Background thread that performs the scan."""
+    api = _get_api()
+    result = {
+        "scan_id": scan_id,
+        "username": username,
+        "started_at": datetime.utcnow().isoformat(),
+        "status": "running",
+        "total_repos": 0,
+        "total_files": 0,
+        "total_lines": 0,
+        "findings": [],
+        "error": None,
+    }
+    SCAN_RESULTS[scan_id] = result
+
+    try:
+        # Collect repo list
+        repos = []
+        if repo_filter in ("all", "model"):
+            repos += [(m.id, "model") for m in api.list_models(author=username)]
+        if repo_filter in ("all", "dataset"):
+            repos += [(d.id, "dataset") for d in api.list_datasets(author=username)]
+        if repo_filter in ("all", "space"):
+            repos += [(s.id, "space") for s in api.list_spaces(author=username)]
+
+        result["total_repos"] = len(repos)
+
+        for repo_id, rtype in repos:
+            try:
+                files = list_repo_tree(repo_id=repo_id, repo_type=rtype)
+                for entry in files:
+                    if entry.type != "file":
+                        continue
+                    path = entry.path
+                    content = _fetch_file_content(repo_id, path, rtype, api)
+                    if content is None:
+                        continue
+                    result["total_files"] += 1
+                    lines = content.splitlines()
+                    result["total_lines"] += len(lines)
+                    findings = _scan_text(content, DEFAULT_CHECKS)
+                    for f in findings:
+                        f["repo_id"] = repo_id
+                        f["repo_type"] = rtype
+                        f["file_path"] = path
+                        result["findings"].append(f)
+            except Exception as e:
+                # Log per-repo errors but continue
+                result.setdefault("repo_errors", []).append({"repo": repo_id, "error": str(e)})
+
+        result["status"] = "done"
+        result["finished_at"] = datetime.utcnow().isoformat()
+    except Exception as e:
+        result["status"] = "error"
+        result["error"] = str(e)
+        traceback.print_exc()
+    finally:
+        ACTIVE_SCANS.discard(scan_id)
+
+# ── Routes ──────────────────────────────────────────────────────
+@app.route("/")
+def index():
+    scan_id = request.args.get("scan_id")
+    username = request.args.get("username", "")
+    results = SCAN_RESULTS.get(scan_id) if scan_id else None
+    return render_template_string(PAGE, scan_id=scan_id, username=username, results=results)
+
+
+@app.route("/api/scan", methods=["POST"])
+def api_scan():
+    data = request.get_json(force=True) or {}
+    username = (data.get("username") or "").strip().lower()
+    repo_type = (data.get("repo_type") or "all").strip().lower()
+    if not username:
+        return jsonify({"error": "username required"}), 400
+
+    scan_id = f"{username}_{int(time.time() * 1000)}"
+    ACTIVE_SCANS.add(scan_id)
+    t = threading.Thread(target=_scan_worker, args=(scan_id, username, repo_type), daemon=True)
+    t.start()
+    return jsonify({"scan_id": scan_id, "status": "started"})
+
+
+@app.route("/api/scan/<scan_id>")
+def api_scan_status(scan_id: str):
+    res = SCAN_RESULTS.get(scan_id)
+    if not res:
+        return jsonify({"scan_id": scan_id, "status": "not_found"}), 404
+    return jsonify({"scan_id": scan_id, "status": res["status"], "error": res.get("error")})
+
+
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok"})
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 7860))
+    logger.info(f"Starting HF Repo Scanner on port {port}")
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
+
+```
+
+mcp_client.py:
+```
+"""
+HF MCP Client — Minimal SSE-based MCP client for Hugging Face.
+
+Endpoints (from .env):
+  HF_MCP_LOGIN_URL=https://huggingface.co/mcp?login
+  HF_MCP_ENDPOINT=https://huggingface.co/mcp
+"""
+import os
+import json
+import uuid
+import logging
+import requests
+from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_MCP_URL = os.environ.get("HF_MCP_ENDPOINT", "https://huggingface.co/mcp")
+DEFAULT_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_TOKEN")
+
+
+class HfMcpClient:
+    """Minimal MCP client using SSE + HTTP POST (Hugging Face MCP)."""
+
+    def __init__(self, endpoint: Optional[str] = None, token: Optional[str] = None):
+        self.endpoint = endpoint or DEFAULT_MCP_URL
+        self.token = token or DEFAULT_TOKEN
+        self.session = requests.Session()
+        self.message_endpoint: Optional[str] = None
+        self._headers = {"Accept": "text/event-stream"}
+        if self.token:
+            self._headers["Authorization"] = f"Bearer {self.token}"
+
+    def connect(self, timeout: int = 30) -> str:
+        """
+        Connect via SSE and capture the message POST endpoint.
+        Returns the discovered message endpoint URL.
+        """
+        resp = self.session.get(
+            self.endpoint,
+            headers=self._headers,
+            stream=True,
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+
+        # Parse first SSE events to find endpoint
+        for line in resp.iter_lines(decode_unicode=True):
+            if line is None:
+                continue
+            if line.startswith("event: endpoint"):
+                # Next line should be data: <url>
+                continue
+            if line.startswith("data: ") and self.message_endpoint is None:
+                data = line[6:].strip()
+                if data.startswith("http"):
+                    self.message_endpoint = data
+                    logger.info("MCP message endpoint: %s", self.message_endpoint)
+                    break
+
+        if not self.message_endpoint:
+            # Fallback: assume same endpoint for POST
+            self.message_endpoint = self.endpoint
+        return self.message_endpoint
+
+    def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Call an MCP tool by name with JSON arguments."""
+        if not self.message_endpoint:
+            self.connect()
+
+        payload = {
+            "jsonrpc": "2.0",
+            "id": str(uuid.uuid4()),
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments},
+        }
+        headers = {"Content-Type": "application/json"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+
+        resp = self.session.post(
+            self.message_endpoint,
+            headers=headers,
+            json=payload,
+            timeout=60,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def list_tools(self) -> list[dict[str, Any]]:
+        """List available MCP tools."""
+        if not self.message_endpoint:
+            self.connect()
+
+        payload = {
+            "jsonrpc": "2.0",
+            "id": str(uuid.uuid4()),
+            "method": "tools/list",
+            "params": {},
+        }
+        headers = {"Content-Type": "application/json"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+
+        resp = self.session.post(
+            self.message_endpoint,
+            headers=headers,
+            json=payload,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+        return result.get("result", {}).get("tools", [])
+
+
+def get_client() -> HfMcpClient:
+    """Factory: returns a configured HfMcpClient."""
+    return HfMcpClient()
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    client = get_client()
+    try:
+        tools = client.list_tools()
+        print("Available tools:", json.dumps(tools, indent=2))
+    except Exception as e:
+        print("Error:", e)
+
+```

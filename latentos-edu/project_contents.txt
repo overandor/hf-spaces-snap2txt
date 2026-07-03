@@ -1,0 +1,904 @@
+Project Structure:
+requirements.txt
+Dockerfile
+README.md
+.gitignore
+.gitattributes
+app.py
+
+File Contents:
+requirements.txt:
+```
+fastapi
+uvicorn
+pydantic
+python-multipart
+
+```
+
+Dockerfile:
+```
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+EXPOSE 7860
+
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7860"]
+
+```
+
+README.md:
+```
+---
+title: LatentOS EDU
+emoji: 🎓
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+app_port: 7860
+pinned: false
+license: mit
+---
+
+# LatentOS EDU — Academic Signal Liquidity Endpoint
+
+**Liquidifies academic progress, not academic privacy.**
+
+Converts consented academic credentials into scholarship, credit, staking, prediction, and opportunity settlement without exposing raw student records.
+
+## Protocol
+
+```
+Student Work → Grade/Skill/Credit Event → Issuer-Signed Credential → Risk Score → EDU Mint Capacity → Stake/Back/Predict/Fund → Credential-Settled Outcome
+```
+
+## AntiZK/ARROW Framing
+
+Reveal the minimum academic receipt required to settle value without liquidating the student's full private educational record.
+
+## Endpoints
+
+```
+POST /v1/academic/liquidify           — Main endpoint: full valuation + settlement readiness
+POST /v1/academic/score               — Academic liquidity score
+POST /v1/academic/credential/verify   — Verify issuer-signed credential
+POST /v1/academic/privacy/grade       — FERPA/privacy compliance check
+POST /v1/academic/mint-cap            — EDU mint capacity calculation
+POST /v1/academic/prediction/settle   — Settle prediction based on credential
+POST /v1/academic/scholarship/match   — Match to scholarship routes
+POST /v1/academic/risk-score          — Risk scores (privacy, fraud, dropout, compliance)
+POST /v1/academic/proof-profile       — Proof-of-Scholarship Profile
+GET  /health                          — Health check
+GET  /api/help                        — API help listing
+GET  /receipts                        — List all receipts
+```
+
+## Doctrine
+
+```
+A grade is private.
+A credential is permissioned.
+A claim is not proof.
+A student is not collateral.
+A transcript is not a token.
+Liquidify the proof, not the student.
+```
+
+## Scoring Formula
+
+```
+SACV = Verified Performance × Completion Probability × Skill Scarcity × Institution Trust × Counterparty Acceptance × Improvement Trajectory × Time-to-Outcome Discount − Privacy Risk − Fraud Risk − Dropout Risk − Compliance Risk
+```
+
+## Proof-of-Scholarship Score
+
+```
+PoS = 0.20(Verified Claims) + 0.16(Issuer Trust) + 0.14(Credential Status) + 0.12(Completion Trajectory) + 0.10(Skill Scarcity) + 0.10(Evidence Quality) + 0.08(Prediction History) + 0.06(Counterparty Acceptance) + 0.04(Privacy Minimization)
+```
+
+## Connection to CSC Engine
+
+- **csc-engine** = Cognition Compression → Artifact → Receipt (proof-of-instrumentation)
+- **systemlake-underwriter** = Receipt → Valuation → Settlement
+- **LatentOS EDU** = Academic vertical of the same Event → Evidence → Verification → Valuation → Settlement pipeline
+
+## Blocked
+
+No public raw grade markets. No doxxing transcripts. No selling FERPA-protected records without consent. No unverified self-claim minting. No coercive staking.
+
+```
+
+.gitignore:
+```
+__pycache__/
+*.pyc
+.env
+
+```
+
+.gitattributes:
+```
+*.7z filter=lfs diff=lfs merge=lfs -text
+*.arrow filter=lfs diff=lfs merge=lfs -text
+*.bin filter=lfs diff=lfs merge=lfs -text
+*.bz2 filter=lfs diff=lfs merge=lfs -text
+*.ckpt filter=lfs diff=lfs merge=lfs -text
+*.ftz filter=lfs diff=lfs merge=lfs -text
+*.gz filter=lfs diff=lfs merge=lfs -text
+*.h5 filter=lfs diff=lfs merge=lfs -text
+*.joblib filter=lfs diff=lfs merge=lfs -text
+*.lfs.* filter=lfs diff=lfs merge=lfs -text
+*.mlmodel filter=lfs diff=lfs merge=lfs -text
+*.model filter=lfs diff=lfs merge=lfs -text
+*.msgpack filter=lfs diff=lfs merge=lfs -text
+*.npy filter=lfs diff=lfs merge=lfs -text
+*.npz filter=lfs diff=lfs merge=lfs -text
+*.onnx filter=lfs diff=lfs merge=lfs -text
+*.ot filter=lfs diff=lfs merge=lfs -text
+*.parquet filter=lfs diff=lfs merge=lfs -text
+*.pb filter=lfs diff=lfs merge=lfs -text
+*.pickle filter=lfs diff=lfs merge=lfs -text
+*.pkl filter=lfs diff=lfs merge=lfs -text
+*.pt filter=lfs diff=lfs merge=lfs -text
+*.pth filter=lfs diff=lfs merge=lfs -text
+*.rar filter=lfs diff=lfs merge=lfs -text
+*.safetensors filter=lfs diff=lfs merge=lfs -text
+saved_model/**/* filter=lfs diff=lfs merge=lfs -text
+*.tar.* filter=lfs diff=lfs merge=lfs -text
+*.tar filter=lfs diff=lfs merge=lfs -text
+*.tflite filter=lfs diff=lfs merge=lfs -text
+*.tgz filter=lfs diff=lfs merge=lfs -text
+*.wasm filter=lfs diff=lfs merge=lfs -text
+*.xz filter=lfs diff=lfs merge=lfs -text
+*.zip filter=lfs diff=lfs merge=lfs -text
+*.zst filter=lfs diff=lfs merge=lfs -text
+*tfevents* filter=lfs diff=lfs merge=lfs -text
+
+```
+
+app.py:
+```
+"""
+LatentOS EDU — Academic Signal Liquidity Endpoint
+
+Converts consented academic credentials into scholarship, credit, staking,
+prediction, and opportunity settlement without exposing raw student records.
+
+Protocol: Event → Evidence → Verification → Valuation → Settlement
+Doctrine: Liquidify the proof, not the student.
+
+Endpoints:
+  POST /v1/edu/liquidify                — Main endpoint: full valuation + settlement readiness
+  POST /v1/edu/credential/verify        — Verify issuer-signed credential
+  POST /v1/edu/privacy/minimize         — Minimize disclosure to settlement-required fields
+  POST /v1/edu/mint-cap                 — EDU mint capacity
+  POST /v1/edu/risk-score               — Risk scores (privacy, fraud, dropout, compliance)
+  POST /v1/edu/prediction/settle        — Settle prediction based on credential
+  POST /v1/edu/profile/proof-of-scholarship — Proof-of-Scholarship Profile
+  POST /v1/edu/consent/check            — Check consent status and FERPA compliance
+  POST /v1/edu/fraud/check              — Fraud detection on credentials
+  POST /v1/edu/oracle/resolve           — Resolve outcome from credential oracle
+  POST /v1/edu/privacy-minimized-settlement — Settle value from academic proof without exposing raw records
+
+  GET  /health
+  GET  /
+  GET  /openapi.json
+  GET  /api/help
+"""
+
+import os
+import time
+import json
+import hashlib
+import uuid
+from datetime import datetime, timezone
+from typing import Optional
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, HTMLResponse
+from pydantic import BaseModel, Field
+
+app = FastAPI(
+    title="LatentOS EDU",
+    description="Academic Signal Liquidity Endpoint — liquidifies academic progress, not academic privacy.",
+    version="1.0.0",
+)
+
+# ─── Models ───
+
+class Credential(BaseModel):
+    type: str = Field(..., description="GradeBandCredential, CourseCompletedCredential, SkillMasteryCredential, etc.")
+    issuer: str = Field(..., description="Issuer DID or identifier")
+    holder: str = Field(..., description="Student wallet or identity DID")
+    claim: str = Field(..., description="'grade_band >= B', 'course_completed', etc.")
+    course_ref: Optional[str] = Field(None, description="Hashed course reference")
+    status: str = Field("valid", description="valid | revoked | expired")
+    evidence_level: str = Field("issuer_signed", description="issuer_signed | self_declared | platform_attested")
+    expires: Optional[str] = Field(None, description="ISO date")
+    signature: Optional[str] = Field(None, description="Cryptographic signature")
+
+
+class StudentPermissions(BaseModel):
+    reveal_grade_band: bool = True
+    reveal_raw_grade: bool = False
+    reveal_institution: bool = True
+    reveal_course: bool = True
+    reveal_identity: str = "selective"  # selective | full | none
+    consent_status: str = "explicit"  # explicit | guardian_required | missing
+    age_class: str = "adult"  # adult | minor | unknown
+
+
+class LiquidifyRequest(BaseModel):
+    artifact_type: str = Field("academic_credential")
+    credential: Optional[Credential] = None
+    credentials: list[Credential] = Field(default_factory=list)
+    student_permissions: StudentPermissions = Field(default_factory=StudentPermissions)
+    context: dict = Field(default_factory={"use_case": "scholarship", "jurisdiction": "US", "settlement_type": "outcome_based"})
+
+
+class PredictionSettleRequest(BaseModel):
+    prediction_id: str
+    outcome_credential: Credential
+    expected_outcome: str
+    stake_amount: float = 0.0
+
+
+class RiskScoreRequest(BaseModel):
+    credentials: list[Credential] = Field(default_factory=list)
+    student_permissions: StudentPermissions = Field(default_factory=StudentPermissions)
+    context: dict = Field(default_factory={})
+
+
+# ─── Stores ───
+
+credential_store: dict[str, dict] = {}
+prediction_store: dict[str, dict] = {}
+settlement_store: dict[str, dict] = {}
+receipt_store: list[dict] = []
+
+TRUSTED_ISSUERS = {
+    "did:example:university": {"trust_score": 95, "name": "Example University", "verified": True},
+    "did:example:college": {"trust_score": 88, "name": "Example College", "verified": True},
+    "did:example:platform": {"trust_score": 72, "name": "Learning Platform", "verified": True},
+    "did:example:registrar": {"trust_score": 98, "name": "Registrar Office", "verified": True},
+}
+
+SKILL_SCARCITY = {
+    "computer_science": 0.85, "data_science": 0.82, "nursing": 0.78,
+    "engineering": 0.80, "mathematics": 0.75, "physics": 0.73,
+    "business": 0.45, "liberal_arts": 0.30, "default": 0.50,
+}
+
+SCHOLARSHIP_ROUTES = [
+    {"route": "scholarship_pool", "range_usd": "$250-$5,000", "requirements": ["issuer_signature", "credential_status", "student_consent"]},
+    {"route": "conditional_advance", "range_usd": "$500-$3,000", "requirements": ["issuer_signature", "grade_band_claim", "completion_probability"]},
+    {"route": "employer_bounty", "range_usd": "$500-$10,000", "requirements": ["skill_mastery", "issuer_signature", "employer_match"]},
+    {"route": "peer_prediction_pool", "range_usd": "$50-$1,000", "requirements": ["credential_status", "outcome_definition", "settlement_rule"]},
+    {"route": "income_share", "range_usd": "$1,000-$25,000", "requirements": ["completion_trajectory", "institution_trust", "labor_market_signal"]},
+]
+
+# ─── Helpers ───
+
+def sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
+
+def create_receipt(receipt_type: str, data: dict) -> dict:
+    r = {"receipt_id": f"rcpt_{uuid.uuid4().hex[:12]}", "receipt_type": receipt_type,
+         "timestamp": time.time(), "data_hash": sha256_text(json.dumps(data, sort_keys=True, default=str)), "data": data}
+    receipt_store.append(r)
+    return r
+
+def get_issuer_trust(issuer: str) -> int:
+    return TRUSTED_ISSUERS.get(issuer, {"trust_score": 30})["trust_score"]
+
+def get_skill_scarcity(course_ref: Optional[str]) -> float:
+    if not course_ref: return SKILL_SCARCITY["default"]
+    for k, v in SKILL_SCARCITY.items():
+        if k in course_ref.lower(): return v
+    return SKILL_SCARCITY["default"]
+
+def verify_credential_sig(cred: Credential) -> bool:
+    if cred.evidence_level == "self_declared": return False
+    if cred.evidence_level == "issuer_signed" and cred.signature:
+        return cred.issuer in TRUSTED_ISSUERS
+    if cred.evidence_level == "platform_attested": return True
+    return False
+
+def check_ferpa_compliance(perms: StudentPermissions) -> dict:
+    violations = []
+    if perms.age_class == "minor" and perms.consent_status != "guardian_required":
+        if perms.consent_status != "explicit":
+            violations.append("minor_requires_guardian_consent")
+    if perms.reveal_raw_grade and perms.consent_status == "missing":
+        violations.append("raw_grade_disclosure_without_consent")
+    if perms.reveal_identity == "full" and perms.age_class == "minor":
+        violations.append("full_identity_disclosure_for_minor")
+    return {"compliant": len(violations) == 0, "violations": violations}
+
+def compute_risk_scores(credentials: list[Credential], perms: StudentPermissions) -> dict:
+    verified = [c for c in credentials if verify_credential_sig(c) and c.status == "valid"]
+    unverified = [c for c in credentials if not verify_credential_sig(c)]
+    self_declared = [c for c in credentials if c.evidence_level == "self_declared"]
+
+    privacy_risk = 15
+    if perms.reveal_raw_grade: privacy_risk += 40
+    if perms.reveal_identity == "full": privacy_risk += 25
+    if perms.age_class == "minor": privacy_risk += 20
+    ferpa = check_ferpa_compliance(perms)
+    if not ferpa["compliant"]: privacy_risk += 30
+
+    fraud_risk = 50
+    if verified: fraud_risk -= len(verified) * 15
+    if self_declared: fraud_risk += len(self_declared) * 20
+    fraud_risk = max(5, min(95, fraud_risk))
+
+    dropout_risk = 45
+    if any("completion" in c.type.lower() for c in verified): dropout_risk -= 15
+    if any("trajectory" in c.type.lower() for c in verified): dropout_risk -= 10
+    dropout_risk = max(10, min(90, dropout_risk))
+
+    compliance_risk = 10
+    if not ferpa["compliant"]: compliance_risk += 50
+    if perms.consent_status == "missing": compliance_risk += 30
+
+    return {
+        "privacy_risk_score": min(100, privacy_risk),
+        "fraud_risk_score": fraud_risk,
+        "dropout_risk_score": dropout_risk,
+        "compliance_risk_score": min(100, compliance_risk),
+        "ferpa_check": ferpa,
+        "verified_credentials": len(verified),
+        "unverified_credentials": len(unverified),
+        "self_declared_claims": len(self_declared),
+    }
+
+def compute_completion_probability(credentials: list[Credential]) -> float:
+    verified = [c for c in credentials if verify_credential_sig(c) and c.status == "valid"]
+    if not verified: return 0.15
+    score = 0.30
+    for c in verified:
+        if "completed" in c.type.lower(): score += 0.15
+        if "grade" in c.type.lower(): score += 0.10
+        if "skill" in c.type.lower(): score += 0.08
+        if "trajectory" in c.type.lower(): score += 0.07
+        if "credit" in c.type.lower(): score += 0.05
+    return min(0.95, score)
+
+def compute_proof_of_scholarship(credentials: list[Credential], perms: StudentPermissions) -> dict:
+    verified = [c for c in credentials if verify_credential_sig(c) and c.status == "valid"]
+    if not verified: return {"score": 0, "eligible": False, "reason": "no_verified_credentials"}
+
+    verified_claims = len(verified)
+    issuer_trust = max([get_issuer_trust(c.issuer) for c in verified], default=0)
+    credential_status_validity = sum(1 for c in verified if c.status == "valid") / max(len(verified), 1)
+    completion_trajectory = 0.5
+    if any("trajectory" in c.type.lower() for c in verified): completion_trajectory = 0.8
+    skill_scarcity = max([get_skill_scarcity(c.course_ref) for c in verified], default=0.5)
+    evidence_quality = 0.9 if all(c.evidence_level == "issuer_signed" for c in verified) else 0.5
+    prediction_history = 0.5  # would come from settlement_store
+    counterparty_acceptance = 0.6
+    privacy_minimization = 0.9 if not perms.reveal_raw_grade else 0.3
+
+    score = (
+        0.20 * min(100, verified_claims * 20)
+        + 0.16 * issuer_trust
+        + 0.14 * (credential_status_validity * 100)
+        + 0.12 * (completion_trajectory * 100)
+        + 0.10 * (skill_scarcity * 100)
+        + 0.10 * (evidence_quality * 100)
+        + 0.08 * (prediction_history * 100)
+        + 0.06 * (counterparty_acceptance * 100)
+        + 0.04 * (privacy_minimization * 100)
+    )
+
+    return {
+        "score": round(score),
+        "eligible": score >= 40,
+        "components": {
+            "verified_claims": verified_claims,
+            "issuer_trust": issuer_trust,
+            "credential_validity": round(credential_status_validity, 2),
+            "completion_trajectory": completion_trajectory,
+            "skill_scarcity": round(skill_scarcity, 2),
+            "evidence_quality": evidence_quality,
+            "privacy_minimization": privacy_minimization,
+        },
+    }
+
+def compute_mint_cap(credentials: list[Credential], risks: dict, pos: dict) -> dict:
+    verified = [c for c in credentials if verify_credential_sig(c) and c.status == "valid"]
+    if not verified or not pos.get("eligible"): return {"low": 0, "mid": 0, "high": 0, "unit": "EDU"}
+
+    base = pos["score"] * 40
+    risk_haircut = (risks["fraud_risk_score"] + risks["dropout_risk_score"] + risks["compliance_risk_score"]) / 300
+    adjusted = base * (1 - risk_haircut)
+
+    return {
+        "low": int(adjusted * 0.5),
+        "mid": int(adjusted),
+        "high": int(adjusted * 2.5),
+        "unit": "EDU",
+        "base_score": pos["score"],
+        "risk_haircut": round(risk_haircut, 3),
+    }
+
+def compute_liquidity_score(pos: dict, risks: dict, mint_cap: dict) -> int:
+    if not pos.get("eligible"): return 0
+    score = pos["score"] * 0.5
+    score += (100 - risks["privacy_risk_score"]) * 0.15
+    score += (100 - risks["fraud_risk_score"]) * 0.15
+    score += (100 - risks["dropout_risk_score"]) * 0.10
+    score += min(100, mint_cap["mid"] / 20) * 0.10
+    return round(min(100, score))
+
+def minimize_disclosure(credentials: list[Credential], purpose: str) -> dict:
+    allowed = ["credential_validity", "threshold_met", "issuer_trust_level", "expiry", "status"]
+    blocked = ["raw_grade", "full_transcript", "unrelated_student_records", "unconsented_pii"]
+
+    if purpose in ("scholarship", "conditional_advance"):
+        allowed.extend(["grade_band", "course_completed", "completion_probability"])
+    if purpose == "employer_bounty":
+        allowed.extend(["skill_mastery", "course_ref"])
+    if purpose == "prediction":
+        allowed.extend(["outcome_definition", "settlement_rule"])
+    if purpose == "income_share":
+        allowed.extend(["completion_trajectory", "institution_trust", "labor_market_signal"])
+
+    return {
+        "allowed_disclosure": list(set(allowed)),
+        "blocked_disclosure": blocked,
+        "minimization_principle": "reveal minimum academic receipt required to settle value",
+        "purpose": purpose,
+    }
+
+def match_scholarship_routes(pos: dict, risks: dict, purpose: str) -> list:
+    matched = []
+    for route in SCHOLARSHIP_ROUTES:
+        if pos.get("eligible") and risks["compliance_risk_score"] < 60:
+            reqs_met = True
+            if "issuer_signature" in route["requirements"] and pos["components"].get("evidence_quality", 0) < 0.5:
+                reqs_met = False
+            if reqs_met:
+                matched.append({"route": route["route"], "range_usd": route["range_usd"], "requirements": route["requirements"]})
+    return matched
+
+
+# ─── Endpoints ───
+
+@app.get("/health")
+async def health():
+    return {"ok": True, "service": "latentos-edu", "version": "1.0.0", "timestamp": time.time()}
+
+
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    return """<!DOCTYPE html><html><head><title>LatentOS EDU</title>
+    <style>body{font-family:system-ui;max-width:800px;margin:40px auto;padding:20px;background:#0d1117;color:#c9d1d9}
+    h1{color:#58a6ff} code{background:#161b22;padding:2px 6px;border-radius:4px;color:#f0883e}
+    a{color:#58a6ff}</style></head>
+    <body><h1>LatentOS EDU</h1>
+    <p><strong>Academic Signal Liquidity Endpoint</strong></p>
+    <p>Liquidifies academic progress, not academic privacy.</p>
+    <p><a href="/docs">API Docs (Swagger)</a> | <a href="/api/help">API Help</a> | <a href="/openapi.json">OpenAPI Schema</a></p>
+    <h2>Endpoints</h2><ul>
+    <li><code>POST /v1/edu/liquidify</code> — Main endpoint</li>
+    <li><code>POST /v1/edu/credential/verify</code> — Verify credential</li>
+    <li><code>POST /v1/edu/privacy/minimize</code> — Minimize disclosure</li>
+    <li><code>POST /v1/edu/mint-cap</code> — EDU mint capacity</li>
+    <li><code>POST /v1/edu/risk-score</code> — Risk scores</li>
+    <li><code>POST /v1/edu/prediction/settle</code> — Settle prediction</li>
+    <li><code>POST /v1/edu/profile/proof-of-scholarship</code> — Proof-of-Scholarship Profile</li>
+    <li><code>POST /v1/edu/consent/check</code> — Consent + FERPA check</li>
+    <li><code>POST /v1/edu/fraud/check</code> — Fraud detection</li>
+    <li><code>POST /v1/edu/oracle/resolve</code> — Resolve outcome from credential</li>
+    <li><code>POST /v1/edu/privacy-minimized-settlement</code> — Settle without exposing raw records</li>
+    </ul><h2>Doctrine</h2><pre>
+A grade is private.
+A credential is permissioned.
+A claim is not proof.
+A student is not collateral.
+A transcript is not a token.
+Liquidify the proof, not the student.
+    </pre></body></html>"""
+
+
+@app.post("/v1/edu/liquidify")
+async def liquidify(req: LiquidifyRequest):
+    creds = list(req.credentials)
+    if req.credential: creds.append(req.credential)
+    perms = req.student_permissions
+    purpose = req.context.get("use_case", "scholarship")
+
+    risks = compute_risk_scores(creds, perms)
+    pos = compute_proof_of_scholarship(creds, perms)
+    mint_cap = compute_mint_cap(creds, risks, pos)
+    liquidity = compute_liquidity_score(pos, risks, mint_cap)
+    disclosure = minimize_disclosure(creds, purpose)
+    routes = match_scholarship_routes(pos, risks, purpose)
+    completion_prob = compute_completion_probability(creds)
+
+    result = {
+        "academic_liquidity_score": liquidity,
+        "proof_of_scholarship_score": pos.get("score", 0),
+        "issuer_trust_score": pos.get("components", {}).get("issuer_trust", 0),
+        "verified_performance_score": round(pos.get("components", {}).get("evidence_quality", 0), 2),
+        "completion_probability": round(completion_prob, 2),
+        "privacy_risk_score": risks["privacy_risk_score"],
+        "fraud_risk_score": risks["fraud_risk_score"],
+        "dropout_risk_score": risks["dropout_risk_score"],
+        "compliance_risk_score": risks["compliance_risk_score"],
+        "ferpa_check": risks["ferpa_check"],
+        "edu_mint_cap": mint_cap,
+        "edu_mint_cap_usd": {"low": mint_cap["low"] * 5, "mid": mint_cap["mid"] * 5, "high": mint_cap["high"] * 5, "unit": "USD"},
+        "settlement_allowed": pos.get("eligible", False) and risks["ferpa_check"]["compliant"],
+        "recommended_routes": [r["route"] for r in routes],
+        "route_details": routes,
+        "blocked_routes": ["public_raw_grade_market", "minor_transcript_speculation", "unconsented_transcript_resale", "coercive_grade_futures"],
+        "allowed_disclosure": disclosure["allowed_disclosure"],
+        "blocked_disclosure": disclosure["blocked_disclosure"],
+        "required_proofs": ["issuer_signature", "credential_status", "student_consent"],
+        "settlement_rule": {
+            "oracle": "issuer_signed_credential",
+            "minimum_disclosure": "grade_band_or_threshold",
+            "raw_record_required": False,
+        },
+        "minimization_principle": disclosure["minimization_principle"],
+    }
+
+    receipt = create_receipt("liquidify", result)
+    result["receipt"] = receipt["receipt_id"]
+    result["timestamp"] = receipt["timestamp"]
+    return result
+
+
+@app.post("/v1/edu/score")
+async def academic_score(req: LiquidifyRequest):
+    creds = list(req.credentials)
+    if req.credential: creds.append(req.credential)
+    risks = compute_risk_scores(creds, req.student_permissions)
+    pos = compute_proof_of_scholarship(creds, req.student_permissions)
+    mint_cap = compute_mint_cap(creds, risks, pos)
+    liquidity = compute_liquidity_score(pos, risks, mint_cap)
+    return {"academic_liquidity_score": liquidity, "proof_of_scholarship_score": pos.get("score", 0),
+            "components": pos.get("components", {}), "receipt": create_receipt("score", {"score": liquidity})["receipt_id"]}
+
+
+@app.post("/v1/edu/credential/verify")
+async def credential_verify(cred: Credential):
+    sig_valid = verify_credential_sig(cred)
+    issuer_trust = get_issuer_trust(cred.issuer)
+    verified = sig_valid and cred.status == "valid" and issuer_trust >= 50
+
+    result = {
+        "credential_valid": verified,
+        "signature_valid": sig_valid,
+        "issuer_trust_score": issuer_trust,
+        "issuer_known": cred.issuer in TRUSTED_ISSUERS,
+        "status": cred.status,
+        "evidence_level": cred.evidence_level,
+        "verification_timestamp": time.time(),
+    }
+
+    if verified:
+        cred_id = sha256_text(json.dumps(cred.dict(), sort_keys=True, default=str))
+        credential_store[cred_id] = {"credential": cred.dict(), "verified": True, "timestamp": time.time()}
+        result["credential_id"] = cred_id
+
+    result["receipt"] = create_receipt("credential_verify", result)["receipt_id"]
+    return result
+
+
+@app.post("/v1/edu/privacy/grade")
+async def privacy_grade(perms: StudentPermissions):
+    ferpa = check_ferpa_compliance(perms)
+    risk = compute_risk_scores([], perms)
+    result = {
+        "ferpa_compliant": ferpa["compliant"],
+        "violations": ferpa["violations"],
+        "privacy_risk_score": risk["privacy_risk_score"],
+        "compliance_risk_score": risk["compliance_risk_score"],
+        "recommendation": "approved" if ferpa["compliant"] else "blocked",
+        "blocked_actions": [] if ferpa["compliant"] else ["raw_grade_disclosure", "public_listing", "token_minting"],
+    }
+    result["receipt"] = create_receipt("privacy_check", result)["receipt_id"]
+    return result
+
+
+@app.post("/v1/edu/mint-cap")
+async def mint_cap(req: LiquidifyRequest):
+    creds = list(req.credentials)
+    if req.credential: creds.append(req.credential)
+    risks = compute_risk_scores(creds, req.student_permissions)
+    pos = compute_proof_of_scholarship(creds, req.student_permissions)
+    cap = compute_mint_cap(creds, risks, pos)
+    result = {**cap, "proof_of_scholarship_score": pos.get("score", 0), "eligible": pos.get("eligible", False)}
+    result["receipt"] = create_receipt("mint_cap", result)["receipt_id"]
+    return result
+
+
+@app.post("/v1/edu/prediction/settle")
+async def prediction_settle(req: PredictionSettleRequest):
+    cred_valid = verify_credential_sig(req.outcome_credential) and req.outcome_credential.status == "valid"
+
+    outcome_met = False
+    claim = req.outcome_credential.claim.lower()
+    expected = req.expected_outcome.lower()
+    if "grade_band" in expected and "grade_band" in claim:
+        outcome_met = True
+    elif "completed" in expected and "completed" in claim:
+        outcome_met = True
+    elif "threshold" in expected and "threshold" in claim:
+        outcome_met = True
+    elif expected in claim:
+        outcome_met = True
+
+    settled = cred_valid and outcome_met
+    result = {
+        "prediction_id": req.prediction_id,
+        "settled": settled,
+        "credential_valid": cred_valid,
+        "outcome_met": outcome_met,
+        "stake_amount": req.stake_amount,
+        "settlement_amount": req.stake_amount * 2 if settled else 0,
+        "settlement_timestamp": time.time() if settled else None,
+    }
+
+    if settled:
+        settlement_id = f"stl_{uuid.uuid4().hex[:12]}"
+        settlement_store[settlement_id] = result
+        result["settlement_id"] = settlement_id
+
+    result["receipt"] = create_receipt("prediction_settle", result)["receipt_id"]
+    return result
+
+
+@app.post("/v1/edu/scholarship/match")
+async def scholarship_match(req: LiquidifyRequest):
+    creds = list(req.credentials)
+    if req.credential: creds.append(req.credential)
+    risks = compute_risk_scores(creds, req.student_permissions)
+    pos = compute_proof_of_scholarship(creds, req.student_permissions)
+    purpose = req.context.get("use_case", "scholarship")
+    routes = match_scholarship_routes(pos, risks, purpose)
+    return {"matched_routes": routes, "count": len(routes), "eligible": pos.get("eligible", False),
+            "proof_of_scholarship_score": pos.get("score", 0)}
+
+
+@app.post("/v1/edu/risk-score")
+async def risk_score(req: RiskScoreRequest):
+    risks = compute_risk_scores(req.credentials, req.student_permissions)
+    result = dict(risks)
+    result["receipt"] = create_receipt("risk_score", risks)["receipt_id"]
+    return result
+
+
+@app.post("/v1/edu/profile/proof-of-scholarship")
+async def proof_profile(req: LiquidifyRequest):
+    creds = list(req.credentials)
+    if req.credential: creds.append(req.credential)
+    pos = compute_proof_of_scholarship(creds, req.student_permissions)
+    risks = compute_risk_scores(creds, req.student_permissions)
+
+    profile = {
+        "proof_of_scholarship_profile": {
+            "score": pos.get("score", 0),
+            "eligible": pos.get("eligible", False),
+            "components": pos.get("components", {}),
+            "verified_claims": [c.dict() for c in creds if verify_credential_sig(c) and c.status == "valid"],
+            "risk_haircuts": {
+                "privacy": risks["privacy_risk_score"],
+                "fraud": risks["fraud_risk_score"],
+                "dropout": risks["dropout_risk_score"],
+                "compliance": risks["compliance_risk_score"],
+            },
+            "privacy_permissions": req.student_permissions.dict(),
+        },
+        "minimization_note": "This profile reveals only permissioned claims. Raw grades and full transcripts are not included.",
+    }
+    profile["receipt"] = create_receipt("proof_profile", profile)["receipt_id"]
+    return profile
+
+
+@app.post("/v1/edu/privacy/minimize")
+async def privacy_minimize(req: LiquidifyRequest):
+    creds = list(req.credentials)
+    if req.credential: creds.append(req.credential)
+    purpose = req.context.get("use_case", "scholarship")
+    disclosure = minimize_disclosure(creds, purpose)
+    result = {
+        **disclosure,
+        "settlement_rule": {
+            "oracle": "issuer_signed_credential",
+            "minimum_disclosure": "grade_band_or_threshold",
+            "raw_record_required": False,
+        },
+        "blocked_routes": ["public_raw_grade_market", "minor_transcript_speculation", "unconsented_transcript_resale", "coercive_grade_futures"],
+    }
+    result["receipt"] = create_receipt("privacy_minimize", result)["receipt_id"]
+    return result
+
+
+@app.post("/v1/edu/consent/check")
+async def consent_check(perms: StudentPermissions):
+    ferpa = check_ferpa_compliance(perms)
+    consent_valid = perms.consent_status == "explicit" or (perms.age_class == "minor" and perms.consent_status == "guardian_required")
+    result = {
+        "consent_valid": consent_valid,
+        "consent_status": perms.consent_status,
+        "age_class": perms.age_class,
+        "ferpa_compliant": ferpa["compliant"],
+        "violations": ferpa["violations"],
+        "guardian_required": perms.age_class == "minor",
+        "can_proceed": consent_valid and ferpa["compliant"],
+        "blocked_if_missing": ["raw_grade_disclosure", "public_listing", "token_minting", "prediction_settlement"] if not consent_valid else [],
+    }
+    result["receipt"] = create_receipt("consent_check", result)["receipt_id"]
+    return result
+
+
+@app.post("/v1/edu/fraud/check")
+async def fraud_check(req: LiquidifyRequest):
+    creds = list(req.credentials)
+    if req.credential: creds.append(req.credential)
+    risks = compute_risk_scores(creds, req.student_permissions)
+
+    fraud_indicators = []
+    for c in creds:
+        if c.evidence_level == "self_declared":
+            fraud_indicators.append({"credential": c.type, "indicator": "self_declared_without_issuer", "severity": "high"})
+        if c.status == "revoked":
+            fraud_indicators.append({"credential": c.type, "indicator": "revoked_credential", "severity": "critical"})
+        if c.issuer not in TRUSTED_ISSUERS and c.evidence_level == "issuer_signed":
+            fraud_indicators.append({"credential": c.type, "indicator": "unknown_issuer", "severity": "medium"})
+        if not c.signature and c.evidence_level == "issuer_signed":
+            fraud_indicators.append({"credential": c.type, "indicator": "missing_signature", "severity": "high"})
+
+    result = {
+        "fraud_risk_score": risks["fraud_risk_score"],
+        "fraud_indicators": fraud_indicators,
+        "verified_credentials": risks["verified_credentials"],
+        "unverified_credentials": risks["unverified_credentials"],
+        "self_declared_claims": risks["self_declared_claims"],
+        "recommendation": "approved" if risks["fraud_risk_score"] < 40 else "review" if risks["fraud_risk_score"] < 70 else "blocked",
+    }
+    result["receipt"] = create_receipt("fraud_check", result)["receipt_id"]
+    return result
+
+
+@app.post("/v1/edu/oracle/resolve")
+async def oracle_resolve(req: PredictionSettleRequest):
+    cred = req.outcome_credential
+    cred_valid = verify_credential_sig(cred) and cred.status == "valid"
+    issuer_trust = get_issuer_trust(cred.issuer)
+
+    claim = cred.claim.lower()
+    expected = req.expected_outcome.lower()
+    outcome_met = False
+    if "grade_band" in expected and "grade_band" in claim:
+        outcome_met = True
+    elif "completed" in expected and "completed" in claim:
+        outcome_met = True
+    elif "threshold" in expected and "threshold" in claim:
+        outcome_met = True
+    elif expected in claim:
+        outcome_met = True
+
+    resolved = cred_valid and outcome_met and issuer_trust >= 50
+
+    result = {
+        "oracle": "issuer_signed_credential",
+        "resolved": resolved,
+        "credential_valid": cred_valid,
+        "outcome_met": outcome_met,
+        "issuer_trust_score": issuer_trust,
+        "expected_outcome": req.expected_outcome,
+        "actual_claim": cred.claim,
+        "resolution_timestamp": time.time() if resolved else None,
+        "raw_record_disclosed": False,
+        "minimum_disclosure_used": "grade_band_or_threshold",
+    }
+
+    if resolved:
+        settlement_id = f"oracle_{uuid.uuid4().hex[:12]}"
+        settlement_store[settlement_id] = result
+        result["settlement_id"] = settlement_id
+
+    result["receipt"] = create_receipt("oracle_resolve", result)["receipt_id"]
+    return result
+
+
+@app.post("/v1/edu/privacy-minimized-settlement")
+async def privacy_minimized_settlement(req: LiquidifyRequest):
+    creds = list(req.credentials)
+    if req.credential: creds.append(req.credential)
+    perms = req.student_permissions
+    purpose = req.context.get("use_case", "scholarship")
+
+    risks = compute_risk_scores(creds, perms)
+    pos = compute_proof_of_scholarship(creds, perms)
+    mint_cap = compute_mint_cap(creds, risks, pos)
+    disclosure = minimize_disclosure(creds, purpose)
+    ferpa = check_ferpa_compliance(perms)
+    consent_valid = perms.consent_status == "explicit" or (perms.age_class == "minor" and perms.consent_status == "guardian_required")
+
+    can_settle = (
+        pos.get("eligible", False)
+        and ferpa["compliant"]
+        and consent_valid
+        and risks["fraud_risk_score"] < 70
+        and not perms.reveal_raw_grade
+    )
+
+    result = {
+        "settlement_authorized": can_settle,
+        "academic_liquidity_score": compute_liquidity_score(pos, risks, mint_cap),
+        "proof_of_scholarship_score": pos.get("score", 0),
+        "edu_mint_cap": mint_cap,
+        "edu_mint_cap_usd": {"low": mint_cap["low"] * 5, "mid": mint_cap["mid"] * 5, "high": mint_cap["high"] * 5, "unit": "USD"},
+        "allowed_disclosure": disclosure["allowed_disclosure"],
+        "blocked_disclosure": disclosure["blocked_disclosure"],
+        "settlement_rule": {
+            "oracle": "issuer_signed_credential",
+            "minimum_disclosure": "grade_band_or_threshold",
+            "raw_record_required": False,
+        },
+        "blocked_routes": ["public_raw_grade_market", "minor_transcript_speculation", "unconsented_transcript_resale", "coercive_grade_futures"],
+        "consent_valid": consent_valid,
+        "ferpa_compliant": ferpa["compliant"],
+        "fraud_risk_score": risks["fraud_risk_score"],
+        "privacy_risk_score": risks["privacy_risk_score"],
+        "principle": "settle value from academic proof without exposing raw education records",
+        "raw_record_disclosed": False,
+    }
+
+    if can_settle:
+        settlement_id = f"pms_{uuid.uuid4().hex[:12]}"
+        settlement_store[settlement_id] = result
+        result["settlement_id"] = settlement_id
+
+    result["receipt"] = create_receipt("privacy_minimized_settlement", result)["receipt_id"]
+    return result
+
+
+@app.get("/api/help")
+async def api_help():
+    return {
+        "service": "LatentOS EDU",
+        "version": "1.0.0",
+        "description": "Academic Signal Liquidity Endpoint",
+        "doctrine": "Liquidify the proof, not the student.",
+        "endpoints": [
+            {"method": "POST", "path": "/v1/edu/liquidify", "description": "Main endpoint: full valuation + settlement readiness"},
+            {"method": "POST", "path": "/v1/edu/score", "description": "Academic liquidity score"},
+            {"method": "POST", "path": "/v1/edu/credential/verify", "description": "Verify issuer-signed credential"},
+            {"method": "POST", "path": "/v1/edu/privacy/minimize", "description": "Minimize disclosure to settlement-required fields"},
+            {"method": "POST", "path": "/v1/edu/privacy/grade", "description": "FERPA/privacy compliance check"},
+            {"method": "POST", "path": "/v1/edu/mint-cap", "description": "EDU mint capacity calculation"},
+            {"method": "POST", "path": "/v1/edu/prediction/settle", "description": "Settle prediction based on credential"},
+            {"method": "POST", "path": "/v1/edu/scholarship/match", "description": "Match to scholarship routes"},
+            {"method": "POST", "path": "/v1/edu/risk-score", "description": "Risk scores (privacy, fraud, dropout, compliance)"},
+            {"method": "POST", "path": "/v1/edu/profile/proof-of-scholarship", "description": "Proof-of-Scholarship Profile"},
+            {"method": "POST", "path": "/v1/edu/consent/check", "description": "Check consent status and FERPA compliance"},
+            {"method": "POST", "path": "/v1/edu/fraud/check", "description": "Fraud detection on credentials"},
+            {"method": "POST", "path": "/v1/edu/oracle/resolve", "description": "Resolve outcome from credential oracle"},
+            {"method": "POST", "path": "/v1/edu/privacy-minimized-settlement", "description": "Settle value from academic proof without exposing raw records"},
+            {"method": "GET", "path": "/health", "description": "Health check"},
+            {"method": "GET", "path": "/api/help", "description": "This help listing"},
+            {"method": "GET", "path": "/receipts", "description": "List all receipts"},
+            {"method": "GET", "path": "/openapi.json", "description": "OpenAPI 3.1 schema"},
+        ],
+        "receipts_issued": len(receipt_store),
+    }
+
+
+@app.get("/receipts")
+async def list_receipts(limit: int = 50):
+    return {"receipts": receipt_store[-limit:], "total": len(receipt_store)}
+
+```

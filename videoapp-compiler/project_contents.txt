@@ -1,0 +1,3047 @@
+Project Structure:
+Dockerfile
+local_extract.sh
+README.md
+.gitattributes
+nginx.conf
+public/index.html
+public/style.css
+public/app.js
+api/download.php
+api/gallery.php
+api/extract.php
+api/generate.php
+api/analyze.php
+api/package.php
+api/config.php
+api/upload.php
+api/status.php
+api/analyze_receipt.php
+c/Makefile
+c/videoextract.c
+
+File Contents:
+Dockerfile:
+```
+FROM ubuntu:22.04
+ENV DEBIAN_FRONTEND=noninteractive
+ENV APP_HOME=/app
+ENV PORT=7860
+RUN apt-get update && apt-get install -y \
+    nginx \
+    php8.1-fpm \
+    php8.1-cli \
+    php8.1-curl \
+    php8.1-mbstring \
+    php8.1-zip \
+    ffmpeg \
+    tesseract-ocr \
+    build-essential \
+    ca-certificates \
+    curl \
+    zip \
+    unzip \
+    python3 \
+    python3-pip \
+    && pip3 install --no-cache-dir yt-dlp \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY nginx.conf /etc/nginx/sites-available/default
+COPY c/Makefile /app/Makefile
+COPY c/videoextract.c /app/videoextract.c
+COPY public /app/public
+COPY api /app/api
+RUN make
+RUN mkdir -p /app/storage/uploads /app/storage/receipts /app/storage/generated /app/storage/dmgs
+RUN chown -R www-data:www-data /app/storage /app/public /app/api
+RUN mkdir -p /run/php && \
+    sed -i 's|;listen.owner = www-data|listen.owner = www-data|' /etc/php/8.1/fpm/pool.d/www.conf && \
+    sed -i 's|;listen.group = www-data|listen.group = www-data|' /etc/php/8.1/fpm/pool.d/www.conf
+RUN rm -f /etc/nginx/sites-enabled/default && \
+    ln -s /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
+EXPOSE 7860
+CMD service php8.1-fpm start && nginx -g "daemon off;"
+
+```
+
+local_extract.sh:
+```
+#!/bin/bash
+# local_extract.sh — Extracts video evidence LOCALLY on your Mac
+# Video never leaves your machine. Only the receipt JSON is sent to HF Space.
+#
+# Usage:
+#   ./local_extract.sh /path/to/video.mp4 [format]
+#   ./local_extract.sh "https://youtube.com/watch?v=XXX" [format]
+#
+# Requires: ffmpeg, tesseract (brew install ffmpeg tesseract)
+# Optional: yt-dlp for YouTube (brew install yt-dlp)
+
+set -e
+
+HF_SPACE="https://josephrw-videoapp-compiler.hf.space"
+FORMAT="${2:-evidence}"
+WORKDIR="/tmp/videoapp_local_$$"
+
+# Colors
+ORANGE='\033[1;33m'
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+echo -e "${ORANGE}◉ VIDEOAPP LOCAL EXTRACTOR${NC}"
+echo -e "${GREEN}◆ source video exposed: false · ⧖ receipt-only${NC}"
+echo ""
+
+mkdir -p "$WORKDIR/keyframes"
+trap "rm -rf $WORKDIR" EXIT
+
+INPUT="$1"
+VIDEO_PATH=""
+
+# ─── Check if YouTube URL ─────────────────────────────
+if [[ "$INPUT" == *"youtube.com"* ]] || [[ "$INPUT" == *"youtu.be"* ]] || [[ "$INPUT" == *"yt://"* ]]; then
+    echo -e "${ORANGE}⌁ YouTube URL detected — downloading locally...${NC}"
+
+    if ! command -v yt-dlp &>/dev/null; then
+        echo -e "${RED}✕ yt-dlp not found. Install: brew install yt-dlp${NC}"
+        exit 1
+    fi
+
+    # Clean URL
+    URL="${INPUT/yt\///https://www.youtube.com/watch?v=}"
+
+    # Download best quality mp4, max 1080p
+    yt-dlp -f "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best" \
+        --merge-output-format mp4 \
+        -o "$WORKDIR/video.mp4" \
+        "$URL" 2>&1 | tail -5
+
+    VIDEO_PATH="$WORKDIR/video.mp4"
+    VIDEO_NAME=$(yt-dlp --get-title "$URL" 2>/dev/null | head -1)
+    if [ -z "$VIDEO_NAME" ]; then
+        VIDEO_NAME="youtube_video"
+    fi
+
+    echo -e "${GREEN}◆ Downloaded: $VIDEO_NAME${NC}"
+
+elif [[ -f "$INPUT" ]]; then
+    VIDEO_PATH="$INPUT"
+    VIDEO_NAME=$(basename "$INPUT")
+
+else
+    echo -e "${RED}✕ Input must be a file path or YouTube URL${NC}"
+    echo "Usage: $0 /path/to/video.mp4 [format]"
+    echo "       $0 \"https://youtube.com/watch?v=XXX\" [format]"
+    exit 1
+fi
+
+# ─── Check dependencies ───────────────────────────────
+for cmd in ffmpeg ffprobe tesseract; do
+    if ! command -v $cmd &>/dev/null; then
+        echo -e "${RED}✕ $cmd not found. Install: brew install ffmpeg tesseract${NC}"
+        exit 1
+    fi
+done
+
+# ─── Probe video ──────────────────────────────────────
+echo -e "${ORANGE}⌁ Probing video metadata...${NC}"
+DURATION=$(ffprobe -v quiet -show_entries format=duration -of csv=p=0 "$VIDEO_PATH" 2>/dev/null)
+WIDTH=$(ffprobe -v quiet -select_streams v:0 -show_entries stream=width -of csv=p=0 "$VIDEO_PATH" 2>/dev/null)
+HEIGHT=$(ffprobe -v quiet -select_streams v:0 -show_entries stream=height -of csv=p=0 "$VIDEO_PATH" 2>/dev/null)
+FPS=$(ffprobe -v quiet -select_streams v:0 -show_entries stream=r_frame_rate -of csv=p=0 "$VIDEO_PATH" 2>/dev/null | awk -F/ '{if($2>0) printf "%.1f", $1/$2; else print "0"}')
+
+echo "  Duration: ${DURATION}s | ${WIDTH}x${HEIGHT} | ${FPS}fps"
+
+# ─── Extract keyframes ────────────────────────────────
+echo -e "${ORANGE}⌁ Extracting keyframes (every 5s)...${NC}"
+INTERVAL=5
+MAX_FRAMES=50
+FRAME_COUNT=0
+TS=0
+
+# JSON arrays
+KEYFRAMES_JSON="["
+OCR_JSON="["
+ACTIONS_JSON="["
+PROOF_JSON="["
+FIRST_KF=true
+FIRST_OCR=true
+FIRST_PROOF=true
+
+PREV_TYPE=""
+PREV_TS=0
+PREV_TEXT=""
+
+while (( $(echo "$TS < $DURATION" | bc -l) )) && [ $FRAME_COUNT -lt $MAX_FRAMES ]; do
+    IMG="$WORKDIR/keyframes/kf_${FRAME_COUNT}_ts${TS}.jpg"
+    ffmpeg -ss "$TS" -i "$VIDEO_PATH" -frames:v 1 -q:v 2 -y "$IMG" 2>/dev/null
+
+    if [ -f "$IMG" ]; then
+        KF_NAME="kf_${FRAME_COUNT}_ts${TS}.jpg"
+
+        if [ "$FIRST_KF" = true ]; then
+            KEYFRAMES_JSON+="{\"path\":\"$KF_NAME\",\"timestamp\":$TS}"
+            FIRST_KF=false
+        else
+            KEYFRAMES_JSON+=",{\"path\":\"$KF_NAME\",\"timestamp\":$TS}"
+        fi
+
+        # OCR
+        OCR_TEXT=$(tesseract "$IMG" stdout 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]*$//' | sed 's/"/\\"/g')
+
+        if [ ${#OCR_TEXT} -gt 2 ]; then
+            # Detect type
+            TYPE="info"
+            if echo "$OCR_TEXT" | grep -qiE "error|fail|exception|crash"; then TYPE="error"; fi
+            if echo "$OCR_TEXT" | grep -qiE "success|pass|complete|done"; then TYPE="pass"; fi
+            if echo "$OCR_TEXT" | grep -qiE "click|tap|select|open|close"; then TYPE="action"; fi
+
+            if [ "$FIRST_OCR" = true ]; then
+                OCR_JSON+="{\"timestamp\":$TS,\"text\":\"$OCR_TEXT\",\"type\":\"$TYPE\"}"
+                ACTIONS_JSON+="{\"timestamp\":$TS,\"type\":\"$TYPE\",\"text\":\"$OCR_TEXT\"}"
+                FIRST_OCR=false
+            else
+                OCR_JSON+=",{\"timestamp\":$TS,\"text\":\"$OCR_TEXT\",\"type\":\"$TYPE\"}"
+                ACTIONS_JSON+=",{\"timestamp\":$TS,\"type\":\"$TYPE\",\"text\":\"$OCR_TEXT\"}"
+            fi
+
+            # Proof moment detection (error followed by pass)
+            if [ "$PREV_TYPE" = "error" ] && [ "$TYPE" = "pass" ]; then
+                if [ "$FIRST_PROOF" = true ]; then
+                    PROOF_JSON+="{\"error_time\":$PREV_TS,\"success_time\":$TS,\"error_text\":\"$PREV_TEXT\",\"success_text\":\"$OCR_TEXT\"}"
+                    FIRST_PROOF=false
+                else
+                    PROOF_JSON+=",{\"error_time\":$PREV_TS,\"success_time\":$TS,\"error_text\":\"$PREV_TEXT\",\"success_text\":\"$OCR_TEXT\"}"
+                fi
+            fi
+
+            PREV_TYPE="$TYPE"
+            PREV_TS="$TS"
+            PREV_TEXT="$OCR_TEXT"
+        fi
+
+        FRAME_COUNT=$((FRAME_COUNT + 1))
+        echo -ne "\r  Keyframes: $FRAME_COUNT / $MAX_FRAMES"
+    fi
+
+    TS=$(echo "$TS + $INTERVAL" | bc -l)
+done
+
+echo ""
+KEYFRAMES_JSON+="]"
+OCR_JSON+="]"
+ACTIONS_JSON+="]"
+PROOF_JSON+="]"
+
+# ─── Extract audio ────────────────────────────────────
+echo -e "${ORANGE}⌁ Extracting audio...${NC}"
+ffmpeg -i "$VIDEO_PATH" -vn -acodec pcm_s16le -ar 16000 -ac 1 -y "$WORKDIR/audio.wav" 2>/dev/null
+echo "  Audio extracted"
+
+# ─── Transcribe audio (local whisper if available) ────
+echo -e "${ORANGE}⟡ Transcribing audio...${NC}"
+TRANSCRIPT=""
+TRANSCRIPT_SOURCE="none"
+
+if command -v whisper &>/dev/null; then
+    echo "  Using local whisper..."
+    whisper "$WORKDIR/audio.wav" --model tiny --output_format txt --output_dir "$WORKDIR" --language English 2>/dev/null
+    if [ -f "$WORKDIR/audio.txt" ]; then
+        TRANSCRIPT=$(cat "$WORKDIR/audio.txt" | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+        TRANSCRIPT_SOURCE="local_whisper"
+    fi
+elif [ -f "$HOME/.local/bin/whisper-ctranslate2" ]; then
+    echo "  Using whisper-ctranslate2..."
+    "$HOME/.local/bin/whisper-ctranslate2" "$WORKDIR/audio.wav" --model tiny --output_format txt --output_dir "$WORKDIR" 2>/dev/null
+    if [ -f "$WORKDIR/audio.txt" ]; then
+        TRANSCRIPT=$(cat "$WORKDIR/audio.txt" | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+        TRANSCRIPT_SOURCE="local_whisper_ct2"
+    fi
+fi
+
+if [ -n "$TRANSCRIPT" ]; then
+    echo "  Transcript: ${#TRANSCRIPT} chars"
+    echo "  Preview: ${TRANSCRIPT:0:120}..."
+else
+    echo "  No local whisper found — HF Space will transcribe via HF Whisper API"
+    echo "  Install: pip install openai-whisper (for local transcription)"
+fi
+
+# ─── Build receipt JSON ───────────────────────────────
+echo -e "${ORANGE}⟡ Building receipt...${NC}"
+VIDEO_ID=$(echo "$VIDEO_NAME" | md5 2>/dev/null | cut -c1-16 || echo "$(date +%s)" | md5 | cut -c1-16)
+
+# Escape video name for JSON
+VIDEO_NAME_ESC=$(echo "$VIDEO_NAME" | sed 's/"/\\"/g')
+
+cat > "$WORKDIR/receipt.json" << RECEIPT
+{
+  "videoId": "$VIDEO_ID",
+  "videoName": "$VIDEO_NAME_ESC",
+  "videoPath": "LOCAL — not uploaded",
+  "duration": $DURATION,
+  "width": $WIDTH,
+  "height": $HEIGHT,
+  "fps": $FPS,
+  "keyframe_count": $FRAME_COUNT,
+  "keyframes": $KEYFRAMES_JSON,
+  "ocr_samples": $OCR_JSON,
+  "actions": $ACTIONS_JSON,
+  "proof_moments": $PROOF_JSON,
+  "files_detected": [],
+  "urls_detected": [],
+  "transcript": "$TRANSCRIPT",
+  "transcript_source": "$TRANSCRIPT_SOURCE",
+  "source_video_exposed": false,
+  "created_at": $(date +%s)
+}
+RECEIPT
+
+echo "  Receipt: $(wc -c < "$WORKDIR/receipt.json") bytes"
+echo "  Keyframes: $FRAME_COUNT"
+echo "  OCR blocks: $(echo "$OCR_JSON" | grep -o '"timestamp"' | wc -l | tr -d ' ')"
+echo "  Actions: $(echo "$ACTIONS_JSON" | grep -o '"timestamp"' | wc -l | tr -d ' ')"
+if [ -n "$TRANSCRIPT" ]; then
+    echo "  Transcript: ${#TRANSCRIPT} chars ($TRANSCRIPT_SOURCE)"
+fi
+
+# ─── Send receipt to HF Space ─────────────────────────
+echo ""
+echo -e "${ORANGE}◉ Sending receipt to HF Space (video stays local)...${NC}"
+
+RESPONSE=$(curl -s -X POST "$HF_SPACE/api/analyze_receipt.php" \
+    -H "Content-Type: application/json" \
+    -d "{\"receipt\": $(cat "$WORKDIR/receipt.json"), \"format\": \"$FORMAT\"}")
+
+HF_ID=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))" 2>/dev/null)
+
+if [ -z "$HF_ID" ]; then
+    echo -e "${RED}✕ Failed to send receipt to HF Space${NC}"
+    echo "$RESPONSE"
+    exit 1
+fi
+
+echo -e "${GREEN}◆ Receipt sent. HF ID: $HF_ID${NC}"
+
+# ─── AI Analysis ──────────────────────────────────────
+echo -e "${ORANGE}⟡ AI analysis on HF Space...${NC}"
+ANALYZE_RESP=$(curl -s -X POST "$HF_SPACE/api/analyze.php" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    -d "id=$HF_ID&format=$FORMAT")
+
+echo "  Analysis complete"
+
+# ─── Generate App ─────────────────────────────────────
+echo -e "${ORANGE}◉ Generating app on HF Space...${NC}"
+GEN_RESP=$(curl -s -X POST "$HF_SPACE/api/generate.php" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    -d "id=$HF_ID&format=$FORMAT")
+
+PREVIEW_URL=$(echo "$GEN_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('preview_url',''))" 2>/dev/null)
+
+# ─── Package ──────────────────────────────────────────
+echo -e "${ORANGE}⬇ Packaging...${NC}"
+PKG_RESP=$(curl -s -X POST "$HF_SPACE/api/package.php" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    -d "id=$HF_ID")
+
+# ─── Download ─────────────────────────────────────────
+echo -e "${ORANGE}⬇ Downloading generated app...${NC}"
+DOWNLOAD_DIR="$HOME/Downloads/videoapp_generated"
+mkdir -p "$DOWNLOAD_DIR"
+ZIP_PATH="$DOWNLOAD_DIR/${HF_ID}.videoapp.zip"
+
+curl -s -o "$ZIP_PATH" "$HF_SPACE/api/download.php?id=$HF_ID"
+
+echo ""
+echo -e "${GREEN}◆ DONE!${NC}"
+echo ""
+echo "  App zip:   $ZIP_PATH"
+echo "  Preview:   $HF_SPACE$PREVIEW_URL"
+echo "  Gallery:   $HF_SPACE"
+echo ""
+echo -e "${GREEN}◆ source video exposed: false · ⧖ receipt-only · ⟡ redacted${NC}"
+
+```
+
+README.md:
+```
+---
+title: VideoGame From Video
+emoji: 🎬
+colorFrom: yellow
+colorTo: gray
+sdk: docker
+app_port: 7860
+pinned: false
+---
+# VideoGame From Video
+Turn any video into a unique playable browser micro-game.
+No Gradio. No Streamlit. No Python runtime.
+Stack:
+- C extraction binary
+- PHP orchestration backend
+- Vanilla JavaScript game engine
+- Nginx on port 7860
+- FFmpeg for frames/audio metadata
+- Tesseract OCR
+- Local Whisper for transcription
+- Hugging Face Inference API for game design
+Source video exposed: false.
+Derived receipt only.
+
+```
+
+.gitattributes:
+```
+*.7z filter=lfs diff=lfs merge=lfs -text
+*.arrow filter=lfs diff=lfs merge=lfs -text
+*.bin filter=lfs diff=lfs merge=lfs -text
+*.bz2 filter=lfs diff=lfs merge=lfs -text
+*.ckpt filter=lfs diff=lfs merge=lfs -text
+*.ftz filter=lfs diff=lfs merge=lfs -text
+*.gz filter=lfs diff=lfs merge=lfs -text
+*.h5 filter=lfs diff=lfs merge=lfs -text
+*.joblib filter=lfs diff=lfs merge=lfs -text
+*.lfs.* filter=lfs diff=lfs merge=lfs -text
+*.mlmodel filter=lfs diff=lfs merge=lfs -text
+*.model filter=lfs diff=lfs merge=lfs -text
+*.msgpack filter=lfs diff=lfs merge=lfs -text
+*.npy filter=lfs diff=lfs merge=lfs -text
+*.npz filter=lfs diff=lfs merge=lfs -text
+*.onnx filter=lfs diff=lfs merge=lfs -text
+*.ot filter=lfs diff=lfs merge=lfs -text
+*.parquet filter=lfs diff=lfs merge=lfs -text
+*.pb filter=lfs diff=lfs merge=lfs -text
+*.pickle filter=lfs diff=lfs merge=lfs -text
+*.pkl filter=lfs diff=lfs merge=lfs -text
+*.pt filter=lfs diff=lfs merge=lfs -text
+*.pth filter=lfs diff=lfs merge=lfs -text
+*.rar filter=lfs diff=lfs merge=lfs -text
+*.safetensors filter=lfs diff=lfs merge=lfs -text
+saved_model/**/* filter=lfs diff=lfs merge=lfs -text
+*.tar.* filter=lfs diff=lfs merge=lfs -text
+*.tar filter=lfs diff=lfs merge=lfs -text
+*.tflite filter=lfs diff=lfs merge=lfs -text
+*.tgz filter=lfs diff=lfs merge=lfs -text
+*.wasm filter=lfs diff=lfs merge=lfs -text
+*.xz filter=lfs diff=lfs merge=lfs -text
+*.zip filter=lfs diff=lfs merge=lfs -text
+*.zst filter=lfs diff=lfs merge=lfs -text
+*tfevents* filter=lfs diff=lfs merge=lfs -text
+
+```
+
+nginx.conf:
+```
+server {
+    listen 7860;
+    server_name _;
+    root /app/public;
+    index index.html;
+    client_max_body_size 8000M;
+    proxy_read_timeout 3600;
+    fastcgi_read_timeout 3600;
+
+    location / {
+        try_files $uri $uri/ =404;
+    }
+
+    location /api/ {
+        root /app;
+        index index.php;
+        location ~ \.php$ {
+            include fastcgi_params;
+            fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+            fastcgi_pass unix:/run/php/php8.1-fpm.sock;
+        }
+    }
+
+    location /generated/ {
+        alias /app/storage/generated/;
+        autoindex off;
+    }
+}
+
+```
+
+index.html:
+```
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>◉ VideoApp Compiler</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+
+  <div id="app">
+
+    <!-- ─── SIDEBAR ─── -->
+    <aside id="sidebar">
+      <div class="brand">◉ VIDEOGAME<br><span class="brand-sub">from video</span></div>
+      <div class="nav">
+        <button class="nav-btn active" data-view="drop">◈ Drop Video</button>
+        <button class="nav-btn" data-view="gallery">▦ Gallery</button>
+      </div>
+      <div class="sidebar-footer">
+        <div class="trust">◆ source video exposed: false</div>
+        <div class="trust-sub">⟡ redacted · ⧖ receipt-only</div>
+      </div>
+    </aside>
+
+    <!-- ─── MAIN ─── -->
+    <main id="main">
+
+      <!-- DROP VIEW -->
+      <section id="view-drop" class="view active">
+        <div class="drop-zone" id="dropZone">
+          <div class="drop-inner">
+            <div class="drop-glyph" id="dropGlyph">◉</div>
+            <div class="drop-title">DROP VIDEO HERE</div>
+            <div class="drop-sub">MP4 · MOV · M4V · WEBM · MKV</div>
+            <div class="drop-hint">or click to browse</div>
+            <input type="file" id="fileInput" accept="video/*" style="display:none">
+          </div>
+        </div>
+        <div class="url-zone">
+          <div class="url-title">▶ or paste YouTube / video URL</div>
+          <div class="url-row">
+            <input type="text" id="urlInput" placeholder="https://youtube.com/watch?v=..." class="url-input">
+            <button class="btn-primary" id="urlBtn">◉ Extract</button>
+          </div>
+          <div class="url-hint">Video is downloaded and extracted LOCALLY · only receipt sent to HF</div>
+        </div>
+        <div class="local-hint">
+          <div class="local-title">◈ LOCAL MODE (video stays on your Mac)</div>
+          <div class="local-code">./local_extract.sh /path/to/video.mp4 evidence</div>
+          <div class="local-code">./local_extract.sh "https://youtube.com/watch?v=XXX" tutorial</div>
+          <div class="local-sub">Downloads to ~/Downloads/videoapp_generated/ · ◆ source video exposed: false</div>
+        </div>
+      </section>
+
+      <!-- FORMAT VIEW -->
+      <section id="view-format" class="view">
+        <h1>⟡ CHOOSE GAME GENRE</h1>
+        <div class="video-name" id="formatVideoName"></div>
+        <div class="format-grid" id="formatGrid"></div>
+        <div class="format-actions">
+          <button class="btn-primary" id="generateBtn">◉ Generate Game</button>
+          <button class="btn-secondary" id="cancelFormatBtn">Cancel</button>
+        </div>
+      </section>
+
+      <!-- PROGRESS VIEW -->
+      <section id="view-progress" class="view">
+        <div class="progress-container">
+          <div class="progress-glyph" id="progressGlyph">◉</div>
+          <div class="progress-title" id="progressTitle">EXTRACTING EVIDENCE</div>
+          <div class="progress-status" id="progressStatus">Starting...</div>
+          <div class="progress-detail" id="progressDetail"></div>
+          <div class="progress-bar-track">
+            <div class="progress-bar-fill" id="progressBar"></div>
+          </div>
+          <div class="progress-steps" id="progressSteps"></div>
+        </div>
+      </section>
+
+      <!-- RESULT VIEW -->
+      <section id="view-result" class="view">
+        <h1 id="resultTitle">◆ GAME GENERATED</h1>
+        <div class="result-container" id="resultContainer"></div>
+        <div class="result-actions">
+          <button class="btn-primary" id="previewBtn">▶ Play Game</button>
+          <button class="btn-primary" id="downloadBtn">⬇ Download .zip</button>
+          <button class="btn-secondary" id="newVideoBtn">◉ New Video</button>
+        </div>
+      </section>
+
+      <!-- GALLERY VIEW -->
+      <section id="view-gallery" class="view">
+        <h1>▦ GAME GALLERY</h1>
+        <div class="gallery-grid" id="galleryGrid"></div>
+      </section>
+
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+
+</html>
+```
+
+style.css:
+```
+:root {
+    --bg: #060608;
+    --bg-radial: radial-gradient(circle at 20% 0%, #211205, #060608 50%);
+    --panel: rgba(20, 20, 28, .86);
+    --panel-hover: rgba(28, 28, 38, .92);
+    --text: #eee8df;
+    --muted: #8a8780;
+    --dim: #5a5852;
+    --orange: #ff8c32;
+    --orange-dim: rgba(255, 140, 50, .12);
+    --orange-border: rgba(255, 140, 50, .18);
+    --green: #3aff7a;
+    --red: #ff4444;
+    --border: rgba(255, 140, 50, .18);
+    --radius: 14px;
+    --radius-sm: 8px;
+}
+
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    background: var(--bg-radial);
+    color: var(--text);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 14px;
+    line-height: 1.6;
+    overflow-x: hidden;
+}
+
+#app {
+    display: flex;
+    min-height: 100vh;
+}
+
+/* ─── SIDEBAR ─── */
+aside {
+    width: 240px;
+    padding: 24px;
+    border-right: 1px solid var(--border);
+    background: rgba(0, 0, 0, .35);
+    display: flex;
+    flex-direction: column;
+    position: fixed;
+    height: 100vh;
+    z-index: 10;
+}
+
+.brand {
+    color: var(--orange);
+    font-weight: 800;
+    font-size: 16px;
+    margin-bottom: 28px;
+    line-height: 1.3;
+}
+
+.brand-sub {
+    font-size: 11px;
+    font-weight: 400;
+    color: var(--muted);
+}
+
+.nav {
+    flex: 1;
+}
+
+.nav-btn {
+    display: block;
+    width: 100%;
+    margin: 8px 0;
+    padding: 12px 14px;
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--text);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    text-align: left;
+    font-family: inherit;
+    font-size: 13px;
+    transition: all .15s ease;
+}
+
+.nav-btn:hover,
+.nav-btn.active {
+    border-color: var(--orange);
+    color: var(--orange);
+    background: var(--orange-dim);
+}
+
+.sidebar-footer {
+    margin-top: auto;
+}
+
+.trust {
+    color: var(--green);
+    font-size: 11px;
+}
+
+.trust-sub {
+    color: var(--dim);
+    font-size: 10px;
+    margin-top: 4px;
+}
+
+/* ─── MAIN ─── */
+main {
+    flex: 1;
+    margin-left: 240px;
+    padding: 32px;
+    min-height: 100vh;
+}
+
+.view {
+    display: none;
+}
+
+.view.active {
+    display: block;
+}
+
+h1 {
+    color: var(--orange);
+    font-size: 24px;
+    margin-bottom: 24px;
+}
+
+/* ─── DROP ZONE ─── */
+.drop-zone {
+    border: 2px dashed var(--border);
+    border-radius: var(--radius);
+    padding: 80px 40px;
+    text-align: center;
+    cursor: pointer;
+    transition: all .2s ease;
+    min-height: 400px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.drop-zone.drag-over {
+    border-color: var(--orange);
+    background: var(--orange-dim);
+}
+
+.drop-zone:hover {
+    border-color: var(--orange);
+}
+
+.drop-glyph {
+    font-size: 64px;
+    color: var(--orange);
+    margin-bottom: 20px;
+    transition: transform .2s ease;
+}
+
+.drop-zone.drag-over .drop-glyph {
+    transform: scale(1.15);
+}
+
+.drop-title {
+    font-size: 20px;
+    font-weight: 700;
+    color: var(--text);
+    margin-bottom: 8px;
+}
+
+.drop-sub {
+    color: var(--muted);
+    font-size: 13px;
+    margin-bottom: 16px;
+}
+
+.drop-hint {
+    color: var(--dim);
+    font-size: 11px;
+}
+
+/* ─── FORMAT GRID ─── */
+.video-name {
+    color: var(--muted);
+    margin-bottom: 24px;
+    font-size: 13px;
+}
+
+.format-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+    gap: 16px;
+    margin-bottom: 24px;
+}
+
+.format-card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 20px;
+    cursor: pointer;
+    transition: all .15s ease;
+}
+
+.format-card:hover {
+    background: var(--panel-hover);
+}
+
+.format-card.selected {
+    border-color: var(--orange);
+    background: var(--orange-dim);
+}
+
+.format-glyph {
+    font-size: 28px;
+    color: var(--orange);
+    margin-bottom: 12px;
+}
+
+.format-card.selected .format-glyph {
+    color: var(--orange);
+}
+
+.format-name {
+    font-size: 15px;
+    font-weight: 600;
+    margin-bottom: 6px;
+}
+
+.format-desc {
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+.format-actions {
+    display: flex;
+    gap: 12px;
+}
+
+/* ─── BUTTONS ─── */
+.btn-primary {
+    padding: 14px 28px;
+    background: var(--orange);
+    color: #060608;
+    border: none;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 14px;
+    font-weight: 600;
+    transition: opacity .15s ease;
+}
+
+.btn-primary:hover {
+    opacity: .85;
+}
+
+.btn-primary:disabled {
+    opacity: .4;
+    cursor: not-allowed;
+}
+
+.btn-secondary {
+    padding: 14px 28px;
+    background: var(--panel);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 14px;
+    transition: all .15s ease;
+}
+
+.btn-secondary:hover {
+    border-color: var(--orange);
+    color: var(--orange);
+}
+
+/* ─── PROGRESS ─── */
+.progress-container {
+    max-width: 600px;
+    margin: 60px auto;
+    text-align: center;
+}
+
+.progress-glyph {
+    font-size: 48px;
+    color: var(--orange);
+    margin-bottom: 20px;
+}
+
+.progress-title {
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--orange);
+    margin-bottom: 12px;
+}
+
+.progress-status {
+    color: var(--text);
+    font-size: 14px;
+    margin-bottom: 8px;
+}
+
+.progress-detail {
+    color: var(--muted);
+    font-size: 12px;
+    margin-bottom: 24px;
+}
+
+.progress-bar-track {
+    width: 100%;
+    height: 6px;
+    background: rgba(255, 255, 255, .06);
+    border-radius: 3px;
+    overflow: hidden;
+    margin-bottom: 24px;
+}
+
+.progress-bar-fill {
+    height: 100%;
+    background: var(--orange);
+    width: 0%;
+    transition: width .3s ease;
+    border-radius: 3px;
+}
+
+.progress-steps {
+    display: flex;
+    justify-content: space-between;
+    font-size: 11px;
+    color: var(--dim);
+}
+
+.progress-step {
+    transition: color .2s ease;
+}
+
+.progress-step.active {
+    color: var(--orange);
+}
+
+.progress-step.done {
+    color: var(--green);
+}
+
+/* ─── RESULT ─── */
+.result-container {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 24px;
+    margin-bottom: 24px;
+}
+
+.result-title-app {
+    font-size: 22px;
+    color: var(--orange);
+    margin-bottom: 12px;
+}
+
+.result-desc {
+    color: var(--text);
+    margin-bottom: 16px;
+}
+
+.result-meta {
+    color: var(--muted);
+    font-size: 12px;
+    margin-bottom: 16px;
+}
+
+.result-features {
+    list-style: none;
+}
+
+.result-features li {
+    padding: 6px 0;
+    color: var(--text);
+}
+
+.result-features li::before {
+    content: "◉ ";
+    color: var(--orange);
+}
+
+.result-actions {
+    display: flex;
+    gap: 12px;
+}
+
+/* ─── GALLERY ─── */
+.gallery-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 16px;
+}
+
+.gallery-card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 18px;
+    transition: all .15s ease;
+}
+
+.gallery-card:hover {
+    background: var(--panel-hover);
+    border-color: var(--orange);
+}
+
+.gallery-title {
+    color: var(--orange);
+    font-size: 15px;
+    font-weight: 700;
+    margin-bottom: 8px;
+}
+
+.gallery-video {
+    color: var(--muted);
+    font-size: 11px;
+    margin-bottom: 8px;
+}
+
+.gallery-meta {
+    color: var(--dim);
+    font-size: 10px;
+    margin-bottom: 12px;
+}
+
+.gallery-actions {
+    display: flex;
+    gap: 8px;
+}
+
+.gallery-actions button {
+    padding: 8px 14px;
+    font-size: 12px;
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--text);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    font-family: inherit;
+}
+
+.gallery-actions button:hover {
+    border-color: var(--orange);
+    color: var(--orange);
+}
+
+.gallery-empty {
+    color: var(--dim);
+    text-align: center;
+    padding: 60px;
+}
+
+/* ─── ANIMATIONS ─── */
+@keyframes pulse {
+
+    0%,
+    100% {
+        opacity: 1;
+    }
+
+    50% {
+        opacity: .5;
+    }
+}
+
+.pulsing {
+    animation: pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+.spinning {
+    animation: spin 2s linear infinite;
+    display: inline-block;
+}
+
+/* ─── URL ZONE ─── */
+.url-zone {
+    margin-top: 24px;
+    padding: 24px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+}
+
+.url-title {
+    color: var(--orange);
+    font-size: 13px;
+    margin-bottom: 12px;
+}
+
+.url-row {
+    display: flex;
+    gap: 12px;
+}
+
+.url-input {
+    flex: 1;
+    padding: 14px;
+    background: rgba(0, 0, 0, .3);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    font-family: inherit;
+    font-size: 13px;
+}
+
+.url-input:focus {
+    outline: none;
+    border-color: var(--orange);
+}
+
+.url-hint {
+    color: var(--dim);
+    font-size: 11px;
+    margin-top: 10px;
+}
+
+/* ─── LOCAL HINT ─── */
+.local-hint {
+    margin-top: 24px;
+    padding: 20px;
+    background: rgba(58, 255, 122, .04);
+    border: 1px solid rgba(58, 255, 122, .12);
+    border-radius: var(--radius);
+}
+
+.local-title {
+    color: var(--green);
+    font-size: 13px;
+    margin-bottom: 12px;
+}
+
+.local-code {
+    font-family: ui-monospace, monospace;
+    font-size: 12px;
+    color: var(--text);
+    background: rgba(0, 0, 0, .3);
+    padding: 8px 12px;
+    border-radius: 6px;
+    margin: 6px 0;
+    border: 1px solid var(--border);
+}
+
+.local-sub {
+    color: var(--dim);
+    font-size: 11px;
+    margin-top: 10px;
+}
+```
+
+app.js:
+```
+// app.js — VideoApp Compiler frontend (vanilla JS)
+// No frameworks. No build step. No dependencies.
+
+(function () {
+    'use strict';
+
+    // ─── STATE ───
+    const state = {
+        currentVideoId: null,
+        currentVideoName: null,
+        selectedFormat: 'arcade',
+        currentAnalysis: null,
+        currentReceipt: null
+    };
+
+    const FORMATS = [
+        { id: 'arcade', name: 'Arcade', glyph: '◉', desc: 'Fast-paced click/tap action. React fast, score high, survive.' },
+        { id: 'puzzle', name: 'Puzzle', glyph: '◈', desc: 'Think before you click. Pattern matching and logic from video content.' },
+        { id: 'action', name: 'Action', glyph: '⌁', desc: 'Dodge enemies, collect targets. Mouse-driven survival.' },
+        { id: 'strategy', name: 'Strategy', glyph: '⟡', desc: 'Plan moves, manage resources. Slower pace, deeper decisions.' },
+        { id: 'simulation', name: 'Simulation', glyph: '◍', desc: 'Simulate what the video shows. Interactive sandbox.' },
+        { id: 'clicker', name: 'Clicker', glyph: '▲', desc: 'Incremental game. Click to grow, upgrade, expand.' }
+    ];
+
+    // ─── NAV ───
+    document.querySelectorAll('.nav-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            const view = btn.dataset.view;
+            if (view === 'gallery') loadGallery();
+            showView(view);
+        });
+    });
+
+    function showView(name) {
+        document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+        const el = document.getElementById('view-' + name);
+        if (el) el.classList.add('active');
+    }
+
+    // ─── DROP ZONE ───
+    const dropZone = document.getElementById('dropZone');
+    const fileInput = document.getElementById('fileInput');
+
+    dropZone.addEventListener('click', () => fileInput.click());
+
+    dropZone.addEventListener('dragover', e => {
+        e.preventDefault();
+        dropZone.classList.add('drag-over');
+    });
+    dropZone.addEventListener('dragleave', () => {
+        dropZone.classList.remove('drag-over');
+    });
+    dropZone.addEventListener('drop', e => {
+        e.preventDefault();
+        dropZone.classList.remove('drag-over');
+        const file = e.dataTransfer.files[0];
+        if (file) handleVideoFile(file);
+    });
+
+    fileInput.addEventListener('change', e => {
+        const file = e.target.files[0];
+        if (file) handleVideoFile(file);
+    });
+
+    // ─── YOUTUBE URL HANDLER ───
+    const urlInput = document.getElementById('urlInput');
+    const urlBtn = document.getElementById('urlBtn');
+
+    urlBtn.addEventListener('click', () => {
+        const url = urlInput.value.trim();
+        if (!url) return;
+        handleVideoURL(url);
+    });
+
+    urlInput.addEventListener('keypress', e => {
+        if (e.key === 'Enter') {
+            const url = urlInput.value.trim();
+            if (url) handleVideoURL(url);
+        }
+    });
+
+    function handleVideoURL(url) {
+        if (!url.match(/^https?:\/\/(youtube\.com|youtu\.be|www\.youtube\.com)/)) {
+            alert('Please enter a valid YouTube URL');
+            return;
+        }
+
+        state.currentVideoName = url;
+        document.getElementById('formatVideoName').textContent = '\u25B6 ' + url.substring(0, 60) + '...';
+
+        showView('progress');
+        setProgress('\u25C9 YOUTUBE', 'Sending URL to HF Space...', 'Starting download via yt-dlp', 5);
+
+        fetch('/api/upload.php', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: 'youtube_url=' + encodeURIComponent(url)
+        })
+            .then(r => r.json())
+            .then(data => {
+                if (!data.ok) throw new Error(data.error || 'URL submission failed');
+                state.currentVideoId = data.id;
+                pollYouTubeStatus(data.id);
+            })
+            .catch(err => {
+                alert('Failed: ' + err.message);
+                showView('drop');
+            });
+    }
+
+    async function pollYouTubeStatus(id) {
+        let attempts = 0;
+        const maxAttempts = 120;
+
+        while (attempts < maxAttempts) {
+            await new Promise(r => setTimeout(r, 2000));
+            attempts++;
+
+            try {
+                const r = await fetch('/api/status.php?id=' + id);
+                const data = await r.json();
+
+                if (data.status === 'downloaded' || data.ready) {
+                    state.currentVideoName = (data.job && data.job.original_name) || 'youtube_video';
+                    document.getElementById('formatVideoName').textContent = '\u25B6 ' + state.currentVideoName;
+                    setProgress('\u25C6', 'Download complete!', 'Video ready for extraction', 100);
+                    await new Promise(r => setTimeout(r, 500));
+                    showFormatChooser();
+                    return;
+                }
+
+                if (data.status === 'download_failed') {
+                    alert('YouTube download failed. Try local mode: ./local_extract.sh "URL"');
+                    showView('drop');
+                    return;
+                }
+
+                setProgress('\u25C9 YOUTUBE', 'Downloading video...', 'Attempt ' + attempts + ' \u2014 waiting for yt-dlp', Math.min(attempts * 2, 50));
+            } catch (e) {
+                // keep trying
+            }
+        }
+
+        alert('Download timed out. Try local mode: ./local_extract.sh "URL"');
+        showView('drop');
+    }
+
+    function handleVideoFile(file) {
+        const ext = file.name.split('.').pop().toLowerCase();
+        const allowed = ['mp4', 'mov', 'm4v', 'webm', 'mkv'];
+        if (!allowed.includes(ext)) {
+            alert('Unsupported format. Use: ' + allowed.join(', '));
+            return;
+        }
+
+        state.currentVideoName = file.name;
+        document.getElementById('formatVideoName').textContent = '▶ ' + file.name;
+
+        // Upload
+        const formData = new FormData();
+        formData.append('video', file);
+
+        showView('progress');
+        setProgress('◉ UPLOADING', file.name, 'Uploading to HF Space...', 10);
+
+        fetch('/api/upload.php', { method: 'POST', body: formData })
+            .then(r => r.json())
+            .then(data => {
+                if (!data.ok) throw new Error(data.error || 'Upload failed');
+                state.currentVideoId = data.id;
+                showFormatChooser();
+            })
+            .catch(err => {
+                alert('Upload failed: ' + err.message);
+                showView('drop');
+            });
+    }
+
+    // ─── FORMAT CHOOSER ───
+    function showFormatChooser() {
+        showView('format');
+        const grid = document.getElementById('formatGrid');
+        grid.innerHTML = '';
+        FORMATS.forEach(f => {
+            const card = document.createElement('div');
+            card.className = 'format-card' + (f.id === state.selectedFormat ? ' selected' : '');
+            card.innerHTML = `
+            <div class="format-glyph">${f.glyph}</div>
+            <div class="format-name">${f.name}</div>
+            <div class="format-desc">${f.desc}</div>
+        `;
+            card.addEventListener('click', () => {
+                state.selectedFormat = f.id;
+                document.querySelectorAll('.format-card').forEach(c => c.classList.remove('selected'));
+                card.classList.add('selected');
+            });
+            grid.appendChild(card);
+        });
+    }
+
+    document.getElementById('generateBtn').addEventListener('click', runPipeline);
+    document.getElementById('cancelFormatBtn').addEventListener('click', () => showView('drop'));
+
+    // ─── PIPELINE ───
+    async function runPipeline() {
+        const id = state.currentVideoId;
+        if (!id) return;
+
+        const steps = [
+            { label: 'Extract', glyph: '⌁', action: () => extractStep(id) },
+            { label: 'Analyze', glyph: '⟡', action: () => analyzeStep(id) },
+            { label: 'Generate', glyph: '◉', action: () => generateStep(id) },
+            { label: 'Package', glyph: '⬇', action: () => packageStep(id) }
+        ];
+
+        showView('progress');
+        renderSteps(steps, 0);
+
+        for (let i = 0; i < steps.length; i++) {
+            renderSteps(steps, i);
+            setProgress(steps[i].glyph + ' ' + steps[i].label.toUpperCase(), 'Step ' + (i + 1) + ' of ' + steps.length, 'Processing...', ((i) / steps.length) * 100);
+            try {
+                const result = await steps[i].action();
+                if (!result.ok) throw new Error(result.error || steps[i].label + ' failed');
+                steps[i].result = result;
+            } catch (err) {
+                alert(steps[i].label + ' failed: ' + err.message);
+                showView('format');
+                return;
+            }
+        }
+
+        renderSteps(steps, steps.length);
+        setProgress('◆', 'COMPLETE', 'App generated successfully', 100);
+        showResult(steps);
+    }
+
+    function renderSteps(steps, current) {
+        const el = document.getElementById('progressSteps');
+        el.innerHTML = steps.map((s, i) => {
+            let cls = 'progress-step';
+            if (i < current) cls += ' done';
+            else if (i === current) cls += ' active';
+            return `<span class="${cls}">${i < current ? '✓' : s.glyph} ${s.label}</span>`;
+        }).join('<span style="color:var(--dim)"> · </span>');
+    }
+
+    function setProgress(title, status, detail, percent) {
+        document.getElementById('progressTitle').textContent = title;
+        document.getElementById('progressStatus').textContent = status;
+        document.getElementById('progressDetail').textContent = detail || '';
+        document.getElementById('progressBar').style.width = percent + '%';
+    }
+
+    async function extractStep(id) {
+        setProgress('⌁ EXTRACTING', 'Running C extractor...', 'FFmpeg keyframes + Tesseract OCR', 25);
+        const r = await fetch('/api/extract.php', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'id=' + id });
+        const data = await r.json();
+        if (data.ok) state.currentReceipt = data.receipt;
+        return data;
+    }
+
+    async function analyzeStep(id) {
+        setProgress('⟡ ANALYZING', 'Hugging Face inference...', 'AI model analyzing evidence', 50);
+        const r = await fetch('/api/analyze.php', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'id=' + id + '&format=' + state.selectedFormat });
+        const data = await r.json();
+        if (data.ok) state.currentAnalysis = data.analysis;
+        return data;
+    }
+
+    async function generateStep(id) {
+        setProgress('◉ GENERATING', 'Building app...', 'Writing HTML/CSS/JS from evidence', 75);
+        const r = await fetch('/api/generate.php', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'id=' + id + '&format=' + state.selectedFormat });
+        return await r.json();
+    }
+
+    async function packageStep(id) {
+        setProgress('⬇ PACKAGING', 'Creating .videoapp.zip...', 'Packaging for download', 90);
+        const r = await fetch('/api/package.php', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'id=' + id });
+        return await r.json();
+    }
+
+    // ─── RESULT ───
+    function showResult(steps) {
+        showView('result');
+        const analysis = state.currentAnalysis || {};
+        const receipt = state.currentReceipt || {};
+        const gameTitle = analysis.game_title || 'MicroGame';
+        const gameConcept = analysis.game_concept || '';
+        const gameGenre = analysis.game_genre || 'arcade';
+        const understanding = analysis.understanding || '';
+        const inspiration = analysis.inspiration || '';
+        const entities = analysis.game_entities || [];
+        const pkgStep = steps.find(s => s.label === 'Package');
+        const previewUrl = steps.find(s => s.label === 'Generate')?.result?.preview_url;
+        const downloadUrl = pkgStep?.result?.package_url;
+
+        document.getElementById('resultTitle').textContent = '◆ ' + gameTitle.toUpperCase();
+
+        const container = document.getElementById('resultContainer');
+        container.innerHTML = `
+        <div class="result-title-app">${gameTitle}</div>
+        <div class="result-desc" style="font-style:italic;color:var(--orange);">${gameConcept}</div>
+        <div class="result-meta">
+            Genre: ${gameGenre} · 
+            Video: ${(receipt.duration || 0).toFixed(0)}s · 
+            Entities: ${entities.length}
+        </div>
+        <div style="margin:16px 0;padding:14px;background:rgba(58,255,122,.05);border:1px solid rgba(58,255,122,.12);border-radius:10px;">
+            <div style="color:var(--green);font-size:11px;margin-bottom:6px;">⟡ VIDEO UNDERSTANDING</div>
+            <div style="color:var(--text);font-size:13px;">${understanding}</div>
+        </div>
+        <div style="margin:16px 0;padding:14px;background:rgba(255,140,50,.05);border:1px solid rgba(255,140,50,.12);border-radius:10px;">
+            <div style="color:var(--orange);font-size:11px;margin-bottom:6px;">◈ GAME INSPIRATION</div>
+            <div style="color:var(--text);font-size:13px;">${inspiration}</div>
+        </div>
+        <div class="trust" style="margin-top:20px;color:var(--green);">◆ source video exposed: false · ⧖ receipt-only · ⟡ redacted</div>
+    `;
+
+        const previewBtn = document.getElementById('previewBtn');
+        const downloadBtn = document.getElementById('downloadBtn');
+
+        previewBtn.onclick = () => {
+            if (previewUrl) window.open(previewUrl, '_blank');
+        };
+
+        downloadBtn.onclick = () => {
+            if (downloadUrl) window.location.href = downloadUrl;
+        };
+
+        document.getElementById('newVideoBtn').onclick = () => {
+            state.currentVideoId = null;
+            state.currentVideoName = null;
+            state.currentAnalysis = null;
+            state.currentReceipt = null;
+            showView('drop');
+            document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+            document.querySelector('[data-view="drop"]').classList.add('active');
+        };
+    }
+
+    // ─── GALLERY ───
+    async function loadGallery() {
+        showView('gallery');
+        const grid = document.getElementById('galleryGrid');
+        grid.innerHTML = '<div class="gallery-empty">Loading...</div>';
+
+        try {
+            const r = await fetch('/api/gallery.php');
+            const data = await r.json();
+            const entries = data.entries || [];
+
+            if (entries.length === 0) {
+                grid.innerHTML = '<div class="gallery-empty">◌ No games generated yet. Drop a video to begin.</div>';
+                return;
+            }
+
+            grid.innerHTML = entries.map(e => `
+            <div class="gallery-card">
+                <div class="gallery-title">${e.gameTitle || e.videoId}</div>
+                <div class="gallery-video">▶ ${e.videoName || 'unknown'}</div>
+                <div class="gallery-meta">${e.gameGenre || 'arcade'} · ${(e.duration || 0).toFixed(0)}s · ${e.createdAt || ''}</div>
+                <div class="gallery-actions">
+                    <button onclick="window.open('/generated/${e.videoId}/index.html', '_blank')">▶ Play</button>
+                    <button onclick="window.location.href='/api/download.php?id=${e.videoId}'">⬇ Download</button>
+                </div>
+            </div>
+        `).join('');
+        } catch (err) {
+            grid.innerHTML = '<div class="gallery-empty">Failed to load gallery.</div>';
+        }
+    }
+
+    // ─── INIT ───
+    showView('drop');
+
+})();
+
+```
+
+download.php:
+```
+<?php
+require_once __DIR__ . '/config.php';
+
+$id = $_GET['id'] ?? null;
+if (!$id || !preg_match('/^[a-f0-9]{16}$/', $id)) {
+    fail_json('Invalid id');
+}
+
+$zipPath = DMG_DIR . "/$id.videoapp.zip";
+if (!file_exists($zipPath)) {
+    fail_json('Package not found', 404);
+}
+
+header('Content-Type: application/zip');
+header('Content-Disposition: attachment; filename="' . $id . '.videoapp.zip"');
+header('Content-Length: ' . filesize($zipPath));
+readfile($zipPath);
+exit;
+
+```
+
+gallery.php:
+```
+<?php
+require_once __DIR__ . '/config.php';
+ensure_dirs();
+
+$galleryFile = RECEIPT_DIR . '/gallery.json';
+$entries = [];
+if (file_exists($galleryFile)) {
+    $entries = read_json_file($galleryFile) ?: [];
+}
+
+json_response([
+    'ok' => true,
+    'entries' => $entries
+]);
+
+```
+
+extract.php:
+```
+<?php
+require_once __DIR__ . '/config.php';
+ensure_dirs();
+
+$id = $_POST['id'] ?? $_GET['id'] ?? null;
+if (!$id || !preg_match('/^[a-f0-9]{16}$/', $id)) {
+    fail_json('Invalid id');
+}
+
+$jobPath = RECEIPT_DIR . "/$id.job.json";
+$job = read_json_file($jobPath);
+if (!$job) {
+    fail_json('Job not found', 404);
+}
+
+$video = $job['upload_path'];
+if (!file_exists($video)) {
+    fail_json('Uploaded video missing');
+}
+
+$outDir = RECEIPT_DIR . "/$id";
+if (!is_dir($outDir)) {
+    mkdir($outDir, 0775, true);
+}
+
+$cmd = BIN_EXTRACT . ' extract ' . shell_arg($video) . ' ' . shell_arg($outDir) . ' 2>&1';
+$output = [];
+$code = 0;
+exec($cmd, $output, $code);
+
+$receiptPath = "$outDir/receipt.json";
+$receipt = read_json_file($receiptPath);
+
+// Inject videoId and videoName into receipt
+if ($receipt) {
+    $receipt['videoId'] = $id;
+    $receipt['videoName'] = $job['original_name'];
+    write_json_file($receiptPath, $receipt);
+}
+
+$job['status'] = $code === 0 ? 'extracted' : 'extract_failed';
+$job['extract_exit_code'] = $code;
+$job['extract_log'] = implode("\n", array_slice($output, -80));
+$job['receipt_path'] = $receiptPath;
+$job['updated_at'] = time();
+write_json_file($jobPath, $job);
+
+if ($code !== 0 || !$receipt) {
+    fail_json('Extraction failed', 500, [
+        'exit_code' => $code,
+        'log' => $job['extract_log']
+    ]);
+}
+
+json_response([
+    'ok' => true,
+    'id' => $id,
+    'receipt' => $receipt,
+    'log' => $job['extract_log']
+]);
+
+```
+
+generate.php:
+```
+<?php
+// generate.php — Generate a UNIQUE micro-game from video analysis
+// Output: a single playable HTML file with embedded game logic
+// Every video produces a different game
+
+require_once __DIR__ . '/config.php';
+ensure_dirs();
+
+$id = $_POST['id'] ?? $_GET['id'] ?? null;
+$format = $_POST['format'] ?? $_GET['format'] ?? 'arcade';
+if (!$id || !preg_match('/^[a-f0-9]{16}$/', $id)) {
+    fail_json('Invalid id');
+}
+
+$receipt = read_json_file(RECEIPT_DIR . "/$id/receipt.json");
+$analysis = read_json_file(RECEIPT_DIR . "/$id/analysis.json");
+if (!$receipt) fail_json('Receipt not found', 404);
+if (!$analysis) fail_json('Analysis missing. Run analyze first.', 400);
+
+$appDir = GENERATED_DIR . "/$id";
+if (!is_dir($appDir)) {
+    mkdir($appDir, 0775, true);
+}
+
+// ─── EXTRACT GAME DESIGN ─────────────────────────────
+$gameTitle = htmlspecialchars($analysis['game_title'] ?? 'MicroGame');
+$gameConcept = htmlspecialchars($analysis['game_concept'] ?? 'A game inspired by video content');
+$gameMechanic = htmlspecialchars($analysis['game_mechanic'] ?? 'Click to play');
+$gameGenre = $analysis['game_genre'] ?? 'arcade';
+$gameWin = htmlspecialchars($analysis['game_win'] ?? 'Reach target score');
+$gameLose = htmlspecialchars($analysis['game_lose'] ?? 'Miss too many');
+$inspiration = htmlspecialchars($analysis['inspiration'] ?? '');
+$understanding = htmlspecialchars($analysis['understanding'] ?? '');
+
+$colors = $analysis['game_colors'] ?? [];
+$bgColor = $colors['bg'] ?? '#0a0a0f';
+$primaryColor = $colors['primary'] ?? '#ff8c32';
+$accentColor = $colors['accent'] ?? '#3aff7a';
+$textColor = $colors['text'] ?? '#eee8df';
+
+// Build JSON config for the game engine (injected via script tag)
+$gameConfig = json_encode([
+    'title' => $analysis['game_title'] ?? 'MicroGame',
+    'concept' => $analysis['game_concept'] ?? '',
+    'mechanic' => $analysis['game_mechanic'] ?? '',
+    'genre' => $gameGenre,
+    'entities' => $analysis['game_entities'] ?? ['target'],
+    'powerups' => $analysis['game_powerups'] ?? [],
+    'win' => $analysis['game_win'] ?? 'Reach target score',
+    'lose' => $analysis['game_lose'] ?? 'Miss too many',
+    'scoring' => $analysis['game_scoring'] ?? 'Score increases on hit',
+    'difficulty' => $analysis['game_difficulty'] ?? 'Speed increases over time',
+    'inspiration' => $analysis['inspiration'] ?? '',
+    'understanding' => $analysis['understanding'] ?? '',
+    'colors' => [
+        'bg' => $bgColor,
+        'primary' => $primaryColor,
+        'accent' => $accentColor,
+        'text' => $textColor
+    ]
+], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+
+// ─── HTML HEAD + BODY (PHP heredoc with interpolation) ───
+$html = <<<HTML
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>$gameTitle</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:$bgColor;color:$textColor;font-family:ui-monospace,monospace;overflow:hidden;display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh}
+#gameContainer{position:relative;width:min(800px,95vw);height:min(600px,85vh)}
+canvas{display:block;border-radius:12px;box-shadow:0 0 40px rgba(255,140,50,.15)}
+#hud{position:absolute;top:12px;left:12px;right:12px;display:flex;justify-content:space-between;pointer-events:none;z-index:10}
+.hud-item{background:rgba(0,0,0,.6);padding:8px 16px;border-radius:8px;font-size:14px;border:1px solid rgba(255,255,255,.1)}
+#score{color:$primaryColor;font-weight:bold}
+#lives{color:$accentColor}
+#timer{color:$textColor}
+#overlay{position:absolute;inset:0;background:rgba(0,0,0,.85);display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:20;border-radius:12px}
+#overlay h1{color:$primaryColor;font-size:32px;margin-bottom:12px;text-align:center}
+#overlay p{color:$textColor;font-size:14px;max-width:400px;text-align:center;margin-bottom:8px;line-height:1.6}
+#overlay .concept{color:$accentColor;font-style:italic;margin-bottom:20px}
+#startBtn{padding:14px 40px;background:$primaryColor;color:$bgColor;border:none;border-radius:10px;font-size:18px;font-weight:bold;cursor:pointer;font-family:inherit}
+#startBtn:hover{opacity:.85}
+#inspiration{position:absolute;bottom:12px;left:12px;right:12px;color:rgba(255,255,255,.3);font-size:10px;text-align:center;pointer-events:none}
+.hidden{display:none!important}
+.game-over-stats{margin:16px 0;text-align:center}
+.game-over-stats .label{color:rgba(255,255,255,.4);font-size:11px}
+.game-over-stats .value{color:$primaryColor;font-size:24px;font-weight:bold}
+</style>
+</head>
+<body>
+<div id="gameContainer">
+    <div id="hud">
+        <div class="hud-item" id="score">SCORE: 0</div>
+        <div class="hud-item" id="timer">TIME: 0s</div>
+        <div class="hud-item" id="lives">LIVES: 3</div>
+    </div>
+    <canvas id="game" width="800" height="600"></canvas>
+    <div id="overlay">
+        <h1 id="title">$gameTitle</h1>
+        <p class="concept">$gameConcept</p>
+        <p>$gameMechanic</p>
+        <p style="color:rgba(255,255,255,.5);font-size:12px">Win: $gameWin &middot; Lose: $gameLose</p>
+        <button id="startBtn">PLAY</button>
+    </div>
+    <div id="inspiration">Inspired by video evidence &middot; $gameGenre &middot; source video exposed: false</div>
+</div>
+<script id="gameConfig" type="application/json">$gameConfig</script>
+<script src="game.js"></script>
+</body>
+</html>
+HTML;
+
+// ─── GAME ENGINE JS (PHP nowdoc — NO interpolation) ───
+$js = <<<'JSEOF'
+(function(){
+const cfg = JSON.parse(document.getElementById('gameConfig').textContent);
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const overlay = document.getElementById('overlay');
+const scoreEl = document.getElementById('score');
+const livesEl = document.getElementById('lives');
+const timerEl = document.getElementById('timer');
+const startBtn = document.getElementById('startBtn');
+
+const C = cfg.colors;
+let W = canvas.width, H = canvas.height;
+let state = 'menu';
+let score = 0, lives = 3, time = 0, startTime = 0;
+let entities = [], particles = [], powerupActive = null;
+let difficulty = 1;
+let lastTime = 0;
+let mouse = {x: W/2, y: H/2, down: false};
+
+function resize() {
+    const container = document.getElementById('gameContainer');
+    const rect = container.getBoundingClientRect();
+    canvas.width = Math.min(800, rect.width);
+    canvas.height = Math.min(600, rect.height);
+    W = canvas.width; H = canvas.height;
+}
+window.addEventListener('resize', resize);
+resize();
+
+canvas.addEventListener('mousemove', e => {
+    const rect = canvas.getBoundingClientRect();
+    mouse.x = (e.clientX - rect.left) * (canvas.width / rect.width);
+    mouse.y = (e.clientY - rect.top) * (canvas.height / rect.height);
+});
+canvas.addEventListener('mousedown', () => { mouse.down = true; });
+canvas.addEventListener('mouseup', () => { mouse.down = false; });
+canvas.addEventListener('click', e => {
+    if (state === 'playing') handleClick(mouse.x, mouse.y);
+});
+
+function makeEntity(type, x, y) {
+    const names = cfg.entities.length ? cfg.entities : ['target'];
+    const name = names[Math.floor(Math.random() * names.length)] || 'target';
+    return {
+        type: type || 'target',
+        name: name,
+        x: x !== undefined ? x : Math.random() * (W - 60) + 30,
+        y: y !== undefined ? y : Math.random() * (H - 60) + 30,
+        vx: (Math.random() - 0.5) * (2 + difficulty),
+        vy: (Math.random() - 0.5) * (2 + difficulty),
+        r: 20 + Math.random() * 15,
+        hp: type === 'enemy' ? 2 : 1,
+        maxHp: type === 'enemy' ? 2 : 1,
+        color: type === 'enemy' ? '#ff4444' : C.primary,
+        alive: true,
+        age: 0,
+        pulse: Math.random() * Math.PI * 2,
+        points: type === 'enemy' ? 50 : 10
+    };
+}
+
+function makeParticle(x, y, color) {
+    return {
+        x, y,
+        vx: (Math.random() - 0.5) * 6,
+        vy: (Math.random() - 0.5) * 6,
+        life: 1,
+        color: color || C.primary,
+        size: 2 + Math.random() * 3
+    };
+}
+
+function spawnEntities() {
+    const count = 3 + Math.floor(difficulty);
+    for (let i = 0; i < count; i++) {
+        const isEnemy = Math.random() < 0.25 + difficulty * 0.03;
+        entities.push(makeEntity(isEnemy ? 'enemy' : 'target'));
+    }
+}
+
+function handleClick(x, y) {
+    let hit = false;
+    for (let e of entities) {
+        if (!e.alive) continue;
+        const dx = x - e.x, dy = y - e.y;
+        if (dx*dx + dy*dy < e.r*e.r) {
+            e.hp--;
+            hit = true;
+            if (e.hp <= 0) {
+                e.alive = false;
+                score += e.points;
+                scoreEl.textContent = 'SCORE: ' + score;
+                for (let i = 0; i < 12; i++) {
+                    particles.push(makeParticle(e.x, e.y, e.color));
+                }
+                if (cfg.powerups.length > 0 && Math.random() < 0.15) {
+                    const pu = cfg.powerups[Math.floor(Math.random() * cfg.powerups.length)];
+                    powerupActive = {name: pu, time: 5};
+                }
+            } else {
+                for (let i = 0; i < 5; i++) {
+                    particles.push(makeParticle(e.x, e.y, e.color));
+                }
+            }
+        }
+    }
+    if (!hit && (cfg.genre === 'arcade' || cfg.genre === 'action')) {
+        score = Math.max(0, score - 5);
+        scoreEl.textContent = 'SCORE: ' + score;
+    }
+}
+
+function updateGame(dt) {
+    time = (Date.now() - startTime) / 1000;
+    timerEl.textContent = 'TIME: ' + Math.floor(time) + 's';
+    difficulty = 1 + time * 0.05;
+
+    for (let e of entities) {
+        if (!e.alive) continue;
+        e.age += dt;
+        e.pulse += dt * 3;
+
+        if (cfg.genre === 'action' || cfg.genre === 'arcade') {
+            e.x += e.vx * difficulty;
+            e.y += e.vy * difficulty;
+            if (e.x < e.r) { e.x = e.r; e.vx *= -1; }
+            if (e.x > W - e.r) { e.x = W - e.r; e.vx *= -1; }
+            if (e.y < e.r) { e.y = e.r; e.vy *= -1; }
+            if (e.y > H - e.r) { e.y = H - e.r; e.vy *= -1; }
+        } else if (cfg.genre === 'puzzle') {
+            e.x += e.vx * 0.3;
+            e.y += e.vy * 0.3;
+            if (e.x < e.r || e.x > W - e.r) e.vx *= -1;
+            if (e.y < e.r || e.y > H - e.r) e.vy *= -1;
+        } else {
+            e.y += Math.sin(e.pulse) * 0.5;
+            e.x += Math.cos(e.pulse * 0.7) * 0.3;
+        }
+
+        if (e.type === 'enemy' && cfg.genre === 'action') {
+            const dx = mouse.x - e.x, dy = mouse.y - e.y;
+            if (dx*dx + dy*dy < (e.r + 15) * (e.r + 15)) {
+                lives--;
+                livesEl.textContent = 'LIVES: ' + lives;
+                e.alive = false;
+                for (let i = 0; i < 15; i++) {
+                    particles.push(makeParticle(e.x, e.y, '#ff4444'));
+                }
+                if (lives <= 0) { gameOver(); return; }
+            }
+        }
+    }
+
+    entities = entities.filter(e => e.alive);
+    if (entities.length < 3 + Math.floor(difficulty)) {
+        const isEnemy = Math.random() < 0.2 + difficulty * 0.03;
+        entities.push(makeEntity(isEnemy ? 'enemy' : 'target'));
+    }
+
+    for (let p of particles) {
+        p.x += p.vx;
+        p.y += p.vy;
+        p.vy += 0.15;
+        p.life -= dt * 1.5;
+    }
+    particles = particles.filter(p => p.life > 0);
+
+    if (powerupActive) {
+        powerupActive.time -= dt;
+        if (powerupActive.time <= 0) powerupActive = null;
+    }
+
+    if (score >= 500) gameWin();
+}
+
+function drawGame() {
+    ctx.fillStyle = C.bg;
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.strokeStyle = 'rgba(255,255,255,.03)';
+    ctx.lineWidth = 1;
+    for (let x = 0; x < W; x += 40) {
+        ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke();
+    }
+    for (let y = 0; y < H; y += 40) {
+        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+    }
+
+    for (let e of entities) {
+        if (!e.alive) continue;
+        const pulseR = e.r + Math.sin(e.pulse) * 3;
+        const grad = ctx.createRadialGradient(e.x, e.y, 0, e.x, e.y, pulseR * 2);
+        grad.addColorStop(0, e.color + '88');
+        grad.addColorStop(1, e.color + '00');
+        ctx.fillStyle = grad;
+        ctx.beginPath();
+        ctx.arc(e.x, e.y, pulseR * 2, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.fillStyle = e.color;
+        ctx.beginPath();
+        ctx.arc(e.x, e.y, pulseR, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.fillStyle = 'rgba(255,255,255,.3)';
+        ctx.beginPath();
+        ctx.arc(e.x - pulseR * 0.3, e.y - pulseR * 0.3, pulseR * 0.3, 0, Math.PI * 2);
+        ctx.fill();
+
+        if (e.type === 'enemy' && e.hp < e.maxHp) {
+            ctx.fillStyle = 'rgba(255,255,255,.2)';
+            ctx.fillRect(e.x - e.r, e.y - e.r - 8, e.r * 2, 4);
+            ctx.fillStyle = '#ff4444';
+            ctx.fillRect(e.x - e.r, e.y - e.r - 8, (e.r * 2) * (e.hp / e.maxHp), 4);
+        }
+
+        ctx.fillStyle = 'rgba(255,255,255,.4)';
+        ctx.font = '9px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText(e.name.substring(0, 12), e.x, e.y + e.r + 14);
+    }
+
+    for (let p of particles) {
+        ctx.globalAlpha = p.life;
+        ctx.fillStyle = p.color;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+        ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    if (state === 'playing') {
+        ctx.strokeStyle = C.accent;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(mouse.x, mouse.y, 12, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(mouse.x - 6, mouse.y);
+        ctx.lineTo(mouse.x + 6, mouse.y);
+        ctx.moveTo(mouse.x, mouse.y - 6);
+        ctx.lineTo(mouse.x, mouse.y + 6);
+        ctx.stroke();
+    }
+
+    if (powerupActive) {
+        ctx.fillStyle = C.accent;
+        ctx.font = 'bold 14px monospace';
+        ctx.textAlign = 'left';
+        ctx.fillText('PWR: ' + powerupActive.name + ' (' + powerupActive.time.toFixed(1) + 's)', 12, H - 12);
+    }
+}
+
+function startGame() {
+    state = 'playing';
+    score = 0; lives = 3; time = 0;
+    startTime = Date.now();
+    difficulty = 1;
+    entities = []; particles = [];
+    powerupActive = null;
+    scoreEl.textContent = 'SCORE: 0';
+    livesEl.textContent = 'LIVES: 3';
+    timerEl.textContent = 'TIME: 0s';
+    overlay.classList.add('hidden');
+    spawnEntities();
+}
+
+function gameWin() {
+    state = 'won';
+    overlay.classList.remove('hidden');
+    overlay.innerHTML =
+        '<h1 style="color:' + C.accent + '">YOU WIN!</h1>' +
+        '<div class="game-over-stats">' +
+        '<div class="label">FINAL SCORE</div>' +
+        '<div class="value">' + score + '</div>' +
+        '<div class="label">TIME</div>' +
+        '<div class="value" style="font-size:18px">' + Math.floor(time) + 's</div>' +
+        '</div>' +
+        '<p style="color:rgba(255,255,255,.4);font-size:11px;max-width:350px">' + cfg.inspiration + '</p>' +
+        '<button id="startBtn" style="margin-top:16px">PLAY AGAIN</button>';
+    document.getElementById('startBtn').onclick = startGame;
+}
+
+function gameOver() {
+    state = 'lost';
+    overlay.classList.remove('hidden');
+    overlay.innerHTML =
+        '<h1 style="color:#ff4444">GAME OVER</h1>' +
+        '<div class="game-over-stats">' +
+        '<div class="label">FINAL SCORE</div>' +
+        '<div class="value">' + score + '</div>' +
+        '<div class="label">TIME SURVIVED</div>' +
+        '<div class="value" style="font-size:18px">' + Math.floor(time) + 's</div>' +
+        '</div>' +
+        '<p style="color:rgba(255,255,255,.4);font-size:11px;max-width:350px">' + cfg.inspiration + '</p>' +
+        '<button id="startBtn" style="margin-top:16px">TRY AGAIN</button>';
+    document.getElementById('startBtn').onclick = startGame;
+}
+
+function loop(ts) {
+    const dt = Math.min(0.05, (ts - lastTime) / 1000) || 0;
+    lastTime = ts;
+    if (state === 'playing') updateGame(dt);
+    drawGame();
+    requestAnimationFrame(loop);
+}
+
+startBtn.onclick = startGame;
+requestAnimationFrame(loop);
+})();
+JSEOF;
+
+file_put_contents("$appDir/index.html", $html);
+file_put_contents("$appDir/game.js", $js);
+
+write_json_file("$appDir/app_manifest.json", [
+    'id' => $id,
+    'game_title' => $analysis['game_title'] ?? 'MicroGame',
+    'game_genre' => $gameGenre,
+    'game_concept' => $analysis['game_concept'] ?? '',
+    'inspiration' => $analysis['inspiration'] ?? '',
+    'understanding' => $analysis['understanding'] ?? '',
+    'created_at' => time(),
+    'source_video_exposed' => false
+]);
+
+// Save to gallery
+$galleryFile = RECEIPT_DIR . '/gallery.json';
+$gallery = file_exists($galleryFile) ? (read_json_file($galleryFile) ?: []) : [];
+$entry = [
+    'videoId' => $id,
+    'videoName' => $receipt['videoName'] ?? 'unknown',
+    'gameTitle' => $analysis['game_title'] ?? 'MicroGame',
+    'gameGenre' => $gameGenre,
+    'gameConcept' => $analysis['game_concept'] ?? '',
+    'createdAt' => date('c'),
+    'duration' => $receipt['duration'] ?? 0
+];
+$gallery = array_filter($gallery, fn($e) => ($e['videoId'] ?? '') !== $id);
+array_unshift($gallery, $entry);
+$gallery = array_slice($gallery, 0, 50);
+write_json_file($galleryFile, $gallery);
+
+json_response([
+    'ok' => true,
+    'id' => $id,
+    'game_title' => $analysis['game_title'] ?? 'MicroGame',
+    'game_genre' => $gameGenre,
+    'game_concept' => $analysis['game_concept'] ?? '',
+    'preview_url' => "/generated/$id/index.html"
+]);
+
+```
+
+analyze.php:
+```
+<?php
+// analyze.php — Understand the video, then generate a unique micro-game concept
+// 1. Transcribe audio (local whisper or HF Whisper API)
+// 2. Gather OCR + metadata + transcript as evidence
+// 3. LLM understands what the video is ABOUT and designs a unique game
+
+require_once __DIR__ . '/config.php';
+ensure_dirs();
+
+$id = $_POST['id'] ?? $_GET['id'] ?? null;
+$format = $_POST['format'] ?? $_GET['format'] ?? 'arcade';
+if (!$id || !preg_match('/^[a-f0-9]{16}$/', $id)) {
+    fail_json('Invalid id');
+}
+
+$receiptPath = RECEIPT_DIR . "/$id/receipt.json";
+$receipt = read_json_file($receiptPath);
+if (!$receipt) {
+    fail_json('Receipt not found', 404);
+}
+
+$hfToken = getenv('HF_TOKEN') ?: '';
+
+// Accept token from POST body as fallback (for local mode)
+$postToken = $_POST['hf_token'] ?? '';
+if (!$hfToken && $postToken) {
+    $hfToken = $postToken;
+    // Save for future requests
+    @file_put_contents(APP_ROOT . '/.hf_token', $postToken);
+    putenv("HF_TOKEN=$postToken");
+}
+
+// Also try loading from file
+if (!$hfToken) {
+    $tokenFile = APP_ROOT . '/.hf_token';
+    if (file_exists($tokenFile)) {
+        $hfToken = trim(file_get_contents($tokenFile));
+        if ($hfToken) putenv("HF_TOKEN=$hfToken");
+    }
+}
+
+$hfModel = getenv('HF_MODEL') ?: 'meta-llama/Llama-3.2-3B-Instruct';
+$whisperModel = getenv('HF_WHISPER_MODEL') ?: 'openai/whisper-large-v3';
+
+// Debug env
+$_debugEnv = [
+    'HF_TOKEN_set' => !empty($hfToken),
+    'HF_TOKEN_len' => strlen($hfToken),
+];
+
+// ─── 1. TRANSCRIPTION ────────────────────────────────
+$transcript = $receipt['transcript'] ?? '';
+$transcriptSource = $receipt['transcript_source'] ?? 'none';
+
+if (!$transcript && $hfToken) {
+    $audioPath = RECEIPT_DIR . "/$id/audio.wav";
+    if (!file_exists($audioPath)) {
+        $jobPath = RECEIPT_DIR . "/$id.job.json";
+        $job = read_json_file($jobPath);
+        if ($job && !empty($job['upload_path']) && file_exists($job['upload_path'])) {
+            $cmd = 'ffmpeg -i ' . shell_arg($job['upload_path']) . ' -vn -acodec pcm_s16le -ar 16000 -ac 1 -y ' . shell_arg($audioPath) . ' 2>/dev/null';
+            exec($cmd, $out, $code);
+        }
+    }
+
+    if (file_exists($audioPath) && filesize($audioPath) > 1000) {
+        $audioData = file_get_contents($audioPath);
+        $ch = curl_init("https://router.huggingface.co/hf-inference/models/$whisperModel");
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_POST => true,
+            CURLOPT_HTTPHEADER => [
+                'Authorization: Bearer ' . $hfToken,
+                'Content-Type: application/octet-stream'
+            ],
+            CURLOPT_POSTFIELDS => $audioData,
+            CURLOPT_TIMEOUT => 120
+        ]);
+        $raw = curl_exec($ch);
+        $err = curl_error($ch);
+        $status = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        if ($raw && $status >= 200 && $status < 300) {
+            $decoded = json_decode($raw, true);
+            if (isset($decoded['text'])) {
+                $transcript = $decoded['text'];
+                $transcriptSource = 'hf_whisper';
+                $receipt['transcript'] = $transcript;
+                $receipt['transcript_source'] = $transcriptSource;
+                write_json_file($receiptPath, $receipt);
+            }
+        }
+    }
+}
+
+// ─── 2. GATHER EVIDENCE ──────────────────────────────
+$ocrText = '';
+if (!empty($receipt['ocr_samples'])) {
+    $ocrText = implode("\n", array_map(fn($o) => ($o['text'] ?? ''), array_slice($receipt['ocr_samples'], 0, 20)));
+}
+
+$metadata = sprintf(
+    "Duration: %.1fs, Resolution: %dx%d, Keyframes: %d, OCR blocks: %d, Video: %s",
+    $receipt['duration'] ?? 0,
+    $receipt['width'] ?? 0,
+    $receipt['height'] ?? 0,
+    $receipt['keyframe_count'] ?? 0,
+    count($receipt['ocr_samples'] ?? []),
+    $receipt['videoName'] ?? 'unknown'
+);
+
+// ─── 3. LLM: UNDERSTAND VIDEO + DESIGN GAME ──────────
+$prompt = "You are a creative game designer. You analyze video evidence to understand what a video is ABOUT, then design a unique micro-game inspired by that content.\n\n"
+    . "The game must be:\n"
+    . "- A real, playable browser game (HTML5 canvas or DOM)\n"
+    . "- UNIQUE to this specific video — not a template\n"
+    . "- Inspired by the video's subject matter, not a display of its contents\n"
+    . "- Playable in under 2 minutes\n"
+    . "- Fun and replayable\n\n"
+    . "First, understand what the video is about from the evidence below.\n"
+    . "Then design a game that captures the ESSENCE of what's happening.\n\n"
+    . "Return STRICT JSON:\n"
+    . "{\n"
+    . "  \"understanding\": \"What this video is about (2-3 sentences)\",\n"
+    . "  \"game_title\": \"Catchy game name\",\n"
+    . "  \"game_concept\": \"Core game loop in one sentence\",\n"
+    . "  \"game_mechanic\": \"How the game works — controls, scoring, win/lose\",\n"
+    . "  \"game_theme\": \"Visual theme derived from video content\",\n"
+    . "  \"game_genre\": \"arcade|puzzle|action|strategy|simulation|clicker\",\n"
+    . "  \"game_colors\": {\"bg\": \"#hex\", \"primary\": \"#hex\", \"accent\": \"#hex\", \"text\": \"#hex\"},\n"
+    . "  \"game_entities\": [\"List of game objects/characters derived from video content\"],\n"
+    . "  \"game_scoring\": \"How score works\",\n"
+    . "  \"game_difficulty\": \"How difficulty scales\",\n"
+    . "  \"game_win\": \"Win condition\",\n"
+    . "  \"game_lose\": \"Lose condition\",\n"
+    . "  \"game_powerups\": [\"Optional powerups if any\"],\n"
+    . "  \"inspiration\": \"How the game connects to the video content\"\n"
+    . "}\n\n"
+    . "VIDEO EVIDENCE:\n"
+    . "Metadata: $metadata\n"
+    . "Transcript: " . substr($transcript, 0, 2000) . "\n"
+    . "OCR (screen text): " . substr($ocrText, 0, 2000) . "\n";
+
+$analysis = [
+    'understanding' => '',
+    'game_title' => 'MicroGame',
+    'game_concept' => '',
+    'game_mechanic' => '',
+    'game_theme' => '',
+    'game_genre' => 'arcade',
+    'game_colors' => ['bg' => '#0a0a0f', 'primary' => '#ff8c32', 'accent' => '#3aff7a', 'text' => '#eee8df'],
+    'game_entities' => [],
+    'game_scoring' => '',
+    'game_difficulty' => '',
+    'game_win' => '',
+    'game_lose' => '',
+    'game_powerups' => [],
+    'inspiration' => '',
+    'transcript' => $transcript,
+    'transcript_source' => $transcriptSource
+];
+
+if ($hfToken) {
+    $payload = [
+        'inputs' => $prompt,
+        'parameters' => [
+            'max_new_tokens' => 1000,
+            'temperature' => 0.8,
+            'return_full_text' => false,
+            'top_p' => 0.92
+        ]
+    ];
+    $ch = curl_init("https://router.huggingface.co/hf-inference/models/$hfModel");
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST => true,
+        CURLOPT_HTTPHEADER => [
+            'Authorization: Bearer ' . $hfToken,
+            'Content-Type: application/json'
+        ],
+        CURLOPT_POSTFIELDS => json_encode($payload),
+        CURLOPT_TIMEOUT => 120
+    ]);
+    $raw = curl_exec($ch);
+    $err = curl_error($ch);
+    $status = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    // Debug info
+    $analysis['hf_debug'] = [
+        'status' => $status,
+        'error' => $err,
+        'raw_len' => strlen($raw ?: ''),
+        'raw_preview' => substr($raw ?: '', 0, 500),
+        'model' => $hfModel
+    ];
+
+    if ($raw && $status >= 200 && $status < 300) {
+        $decoded = json_decode($raw, true);
+        $text = '';
+        if (isset($decoded[0]['generated_text'])) {
+            $text = $decoded[0]['generated_text'];
+        } elseif (isset($decoded['generated_text'])) {
+            $text = $decoded['generated_text'];
+        } elseif (is_string($decoded)) {
+            $text = $decoded;
+        }
+        if ($text) {
+            $jsonStart = strpos($text, '{');
+            $jsonEnd = strrpos($text, '}');
+            if ($jsonStart !== false && $jsonEnd !== false && $jsonEnd > $jsonStart) {
+                $maybe = json_decode(substr($text, $jsonStart, $jsonEnd - $jsonStart + 1), true);
+                if (is_array($maybe)) {
+                    $analysis = array_merge($analysis, $maybe);
+                }
+            }
+            $analysis['hf_raw'] = $text;
+        }
+    } else {
+        $analysis['hf_warning'] = $err ?: "HF status $status";
+    }
+} else {
+    $analysis['hf_warning'] = 'HF_TOKEN not set — using fallback. Set HF_TOKEN for AI-designed unique games.';
+}
+
+$analysis['_debug_env'] = $_debugEnv;
+
+$analysisPath = RECEIPT_DIR . "/$id/analysis.json";
+write_json_file($analysisPath, $analysis);
+
+json_response([
+    'ok' => true,
+    'id' => $id,
+    'analysis' => $analysis
+]);
+
+```
+
+package.php:
+```
+<?php
+require_once __DIR__ . '/config.php';
+ensure_dirs();
+
+$id = $_POST['id'] ?? $_GET['id'] ?? null;
+if (!$id || !preg_match('/^[a-f0-9]{16}$/', $id)) {
+    fail_json('Invalid id');
+}
+
+$appDir = GENERATED_DIR . "/$id";
+if (!is_dir($appDir)) {
+    fail_json('Generated app not found. Run generate first.', 404);
+}
+
+$zipPath = DMG_DIR . "/$id.videoapp.zip";
+if (file_exists($zipPath)) unlink($zipPath);
+
+$cmd = 'cd ' . shell_arg(GENERATED_DIR) . ' && zip -r ' . shell_arg($zipPath) . ' ' . shell_arg($id) . ' 2>&1';
+$output = [];
+$code = 0;
+exec($cmd, $output, $code);
+
+if ($code !== 0 || !file_exists($zipPath)) {
+    fail_json('Packaging failed', 500, [
+        'log' => implode("\n", $output)
+    ]);
+}
+
+json_response([
+    'ok' => true,
+    'id' => $id,
+    'package_url' => "/api/download.php?id=$id",
+    'package_path' => $zipPath,
+    'note' => 'HF Linux cannot build a signed macOS DMG. This packages the generated app folder. Final DMG signing must happen on macOS.'
+]);
+
+```
+
+config.php:
+```
+<?php
+define('APP_ROOT', '/app');
+define('STORAGE_ROOT', APP_ROOT . '/storage');
+define('UPLOAD_DIR', STORAGE_ROOT . '/uploads');
+define('RECEIPT_DIR', STORAGE_ROOT . '/receipts');
+define('GENERATED_DIR', STORAGE_ROOT . '/generated');
+define('DMG_DIR', STORAGE_ROOT . '/dmgs');
+define('BIN_EXTRACT', APP_ROOT . '/videoextract');
+
+// Load HF_TOKEN from env file if not in environment
+if (!getenv('HF_TOKEN')) {
+    $envFile = APP_ROOT . '/.hf_token';
+    if (file_exists($envFile)) {
+        $token = trim(file_get_contents($envFile));
+        if ($token) {
+            putenv("HF_TOKEN=$token");
+        }
+    }
+}
+
+function json_response($data, $status = 200) {
+    http_response_code($status);
+    header('Content-Type: application/json');
+    echo json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+    exit;
+}
+function fail_json($message, $status = 400, $extra = []) {
+    json_response(array_merge([
+        'ok' => false,
+        'error' => $message
+    ], $extra), $status);
+}
+function ensure_dirs() {
+    foreach ([UPLOAD_DIR, RECEIPT_DIR, GENERATED_DIR, DMG_DIR] as $dir) {
+        if (!is_dir($dir)) {
+            mkdir($dir, 0775, true);
+        }
+    }
+}
+function safe_id() {
+    return bin2hex(random_bytes(8));
+}
+function shell_arg($s) {
+    return escapeshellarg($s);
+}
+function read_json_file($path) {
+    if (!file_exists($path)) return null;
+    $raw = file_get_contents($path);
+    return json_decode($raw, true);
+}
+function write_json_file($path, $data) {
+    file_put_contents($path, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+}
+
+```
+
+upload.php:
+```
+<?php
+require_once __DIR__ . '/config.php';
+ensure_dirs();
+
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+    fail_json('POST required', 405);
+}
+
+// ─── YouTube URL mode (async) ───
+$youtubeUrl = $_POST['youtube_url'] ?? '';
+if ($youtubeUrl) {
+    if (!filter_var($youtubeUrl, FILTER_VALIDATE_URL)) {
+        fail_json('Invalid URL');
+    }
+    if (!preg_match('/(youtube\.com|youtu\.be)/', $youtubeUrl)) {
+        fail_json('Only YouTube URLs supported');
+    }
+
+    $id = safe_id();
+    $uploadPath = UPLOAD_DIR . "/$id.mp4";
+
+    $job = [
+        'id' => $id,
+        'original_name' => 'youtube_video',
+        'upload_path' => $uploadPath,
+        'extension' => 'mp4',
+        'status' => 'downloading',
+        'created_at' => time(),
+        'source_video_exposed' => false,
+        'youtube_url' => $youtubeUrl
+    ];
+    write_json_file(RECEIPT_DIR . "/$id.job.json", $job);
+
+    // Fork background download
+    $logFile = RECEIPT_DIR . "/$id.download.log";
+    $cmd = sprintf(
+        'nohup bash -c %s > %s 2>&1 &',
+        shell_arg(sprintf(
+            'cd /app && yt-dlp -f "best[ext=mp4]/best" -o %s %s 2>&1 && ' .
+            'TITLE=$(yt-dlp --get-title %s 2>/dev/null) && ' .
+            'echo "DONE|$TITLE" >> %s',
+            shell_arg($uploadPath),
+            shell_arg($youtubeUrl),
+            shell_arg($youtubeUrl),
+            shell_arg($logFile)
+        )),
+        shell_arg($logFile)
+    );
+    exec($cmd);
+
+    json_response([
+        'ok' => true,
+        'id' => $id,
+        'job' => $job,
+        'status_url' => "/api/status.php?id=$id"
+    ]);
+}
+
+// ─── File upload mode ───
+if (!isset($_FILES['video'])) {
+    fail_json('No video uploaded or YouTube URL provided');
+}
+
+$file = $_FILES['video'];
+if ($file['error'] !== UPLOAD_ERR_OK) {
+    fail_json('Upload failed', 400, ['upload_error' => $file['error']]);
+}
+
+$original = basename($file['name']);
+$ext = strtolower(pathinfo($original, PATHINFO_EXTENSION));
+$allowed = ['mp4', 'mov', 'm4v', 'webm', 'mkv'];
+if (!in_array($ext, $allowed, true)) {
+    fail_json('Unsupported video type', 400, ['extension' => $ext]);
+}
+
+$id = safe_id();
+$uploadPath = UPLOAD_DIR . "/$id.$ext";
+
+if (!move_uploaded_file($file['tmp_name'], $uploadPath)) {
+    fail_json('Could not save upload');
+}
+
+$job = [
+    'id' => $id,
+    'original_name' => $original,
+    'upload_path' => $uploadPath,
+    'extension' => $ext,
+    'status' => 'uploaded',
+    'created_at' => time(),
+    'source_video_exposed' => false
+];
+write_json_file(RECEIPT_DIR . "/$id.job.json", $job);
+
+json_response([
+    'ok' => true,
+    'id' => $id,
+    'job' => $job
+]);
+
+```
+
+status.php:
+```
+<?php
+// status.php — Poll job status for async YouTube downloads
+require_once __DIR__ . '/config.php';
+ensure_dirs();
+
+$id = $_GET['id'] ?? '';
+if (!$id || !preg_match('/^[a-f0-9]{16}$/', $id)) {
+    fail_json('Invalid id');
+}
+
+$jobPath = RECEIPT_DIR . "/$id.job.json";
+$job = read_json_file($jobPath);
+if (!$job) {
+    fail_json('Job not found', 404);
+}
+
+$uploadPath = $job['upload_path'] ?? '';
+$logFile = RECEIPT_DIR . "/$id.download.log";
+
+// Check if download completed
+if ($job['status'] === 'downloading') {
+    if (file_exists($uploadPath) && filesize($uploadPath) > 1000) {
+        // Download complete — update job
+        $job['status'] = 'downloaded';
+
+        // Try to get title from log
+        $log = file_exists($logFile) ? file_get_contents($logFile) : '';
+        if (preg_match('/DONE\|(.+)/', $log, $m)) {
+            $job['original_name'] = trim($m[1]) . '.mp4';
+        }
+
+        write_json_file($jobPath, $job);
+    } else {
+        // Check log for errors
+        $log = file_exists($logFile) ? file_get_contents($logFile) : '';
+        if (strpos($log, 'ERROR') !== false || strpos($log, 'error') !== false) {
+            // Still might be downloading, check age
+            $age = time() - ($job['created_at'] ?? time());
+            if ($age > 300) {
+                $job['status'] = 'download_failed';
+                $job['error'] = 'Download timeout';
+                write_json_file($jobPath, $job);
+            }
+        }
+    }
+}
+
+json_response([
+    'ok' => true,
+    'id' => $id,
+    'status' => $job['status'],
+    'job' => $job,
+    'ready' => in_array($job['status'], ['downloaded', 'uploaded', 'extracted'])
+]);
+
+```
+
+analyze_receipt.php:
+```
+<?php
+// analyze_receipt.php — Accept pre-extracted receipt (no video upload needed)
+// Video stays local. Only the receipt JSON is sent to the HF Space.
+
+require_once __DIR__ . '/config.php';
+ensure_dirs();
+
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+    fail_json('POST required', 405);
+}
+
+$raw = file_get_contents('php://input');
+$data = json_decode($raw, true);
+
+if (!$data) {
+    fail_json('Invalid JSON body');
+}
+
+$receipt = $data['receipt'] ?? null;
+$format = $data['format'] ?? 'arcade';
+$hfToken = $data['hf_token'] ?? '';
+
+// Save token if provided (for local mode — token stays on Space only)
+if ($hfToken && !getenv('HF_TOKEN')) {
+    file_put_contents(APP_ROOT . '/.hf_token', $hfToken);
+    putenv("HF_TOKEN=$hfToken");
+}
+
+if (!$receipt) {
+    fail_json('No receipt provided');
+}
+
+$id = $receipt['videoId'] ?? safe_id();
+$receipt['videoId'] = $id;
+
+// Save receipt
+$outDir = RECEIPT_DIR . "/$id";
+if (!is_dir($outDir)) {
+    mkdir($outDir, 0775, true);
+}
+write_json_file("$outDir/receipt.json", $receipt);
+
+// Save job
+$job = [
+    'id' => $id,
+    'original_name' => $receipt['videoName'] ?? 'local_video',
+    'upload_path' => 'LOCAL — not uploaded',
+    'extension' => 'local',
+    'status' => 'receipt_received',
+    'created_at' => time(),
+    'source_video_exposed' => false
+];
+write_json_file(RECEIPT_DIR . "/$id.job.json", $job);
+
+json_response([
+    'ok' => true,
+    'id' => $id,
+    'message' => 'Receipt received. Video stayed local.',
+    'token_set' => !empty($hfToken) || getenv('HF_TOKEN')
+]);
+
+```
+
+Makefile:
+```
+CC=gcc
+CFLAGS=-O2 -Wall
+LIBS=-lm
+
+videoextract: videoextract.c
+	$(CC) $(CFLAGS) -o videoextract videoextract.c $(LIBS)
+
+clean:
+	rm -f videoextract
+
+```
+
+videoextract.c:
+```
+/*
+ * videoextract.c — C video evidence extractor for VideoApp Compiler
+ * Uses ffmpeg subprocess for frame extraction, tesseract for OCR.
+ * No Python. No external runtime. Pure C.
+ *
+ * Usage:
+ *   videoextract extract <video_path> <output_dir>
+ *
+ * Output: writes receipt.json + keyframe images to <output_dir>
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <math.h>
+#include <time.h>
+
+#define MAX_CMD 8192
+#define MAX_OUTPUT 131072
+#define MAX_KEYFRAMES 50
+#define INTERVAL_SEC 5.0
+
+static char* exec_cmd(const char* cmd) {
+    FILE* fp = popen(cmd, "r");
+    if (!fp) return strdup("");
+    char* output = malloc(MAX_OUTPUT);
+    if (!output) { pclose(fp); return strdup(""); }
+    output[0] = '\0';
+    char buf[4096];
+    while (fgets(buf, sizeof(buf), fp)) {
+        if (strlen(output) + strlen(buf) < MAX_OUTPUT - 1) {
+            strcat(output, buf);
+        }
+    }
+    pclose(fp);
+    return output;
+}
+
+static void mkdir_p(const char* path) {
+    char cmd[MAX_CMD];
+    snprintf(cmd, sizeof(cmd), "mkdir -p '%s'", path);
+    system(cmd);
+}
+
+/* Get video duration via ffprobe */
+static double get_duration(const char* video_path) {
+    char cmd[MAX_CMD];
+    snprintf(cmd, sizeof(cmd),
+        "ffprobe -v quiet -show_entries format=duration -of csv=p=0 '%s' 2>&1",
+        video_path);
+    char* out = exec_cmd(cmd);
+    double d = atof(out);
+    free(out);
+    return d;
+}
+
+/* Get video dimensions via ffprobe */
+static void get_dimensions(const char* video_path, int* w, int* h, double* fps) {
+    char cmd[MAX_CMD];
+    snprintf(cmd, sizeof(cmd),
+        "ffprobe -v quiet -select_streams v:0 -show_entries stream=width,height,r_frame_rate -of csv=p=0 '%s' 2>&1",
+        video_path);
+    char* out = exec_cmd(cmd);
+    *w = 0; *h = 0; *fps = 0;
+    /* Parse "1920 1080 30/1" or similar */
+    sscanf(out, "%d %d %lf/%*d", w, h, fps);
+    if (*fps == 0) {
+        /* Try alternate parse */
+        char* tok = strtok(out, " ,\n");
+        if (tok) *w = atoi(tok);
+        tok = strtok(NULL, " ,\n");
+        if (tok) *h = atoi(tok);
+        tok = strtok(NULL, " ,\n");
+        if (tok) {
+            int num, den;
+            if (sscanf(tok, "%d/%d", &num, &den) == 2 && den > 0)
+                *fps = (double)num / den;
+            else
+                *fps = atof(tok);
+        }
+    }
+    free(out);
+}
+
+/* Extract keyframes at regular intervals */
+static int extract_keyframes(const char* video_path, const char* out_dir,
+                             double duration, char kf_names[][256],
+                             double kf_times[], int* kf_count) {
+    mkdir_p(out_dir);
+
+    int count = 0;
+    double ts = 0.0;
+    char img_path[MAX_CMD];
+
+    while (ts < duration && count < MAX_KEYFRAMES) {
+        snprintf(img_path, sizeof(img_path), "%s/keyframe_%04d_ts%.1f.jpg",
+                 out_dir, count, ts);
+
+        char cmd[MAX_CMD];
+        snprintf(cmd, sizeof(cmd),
+            "ffmpeg -ss %.2f -i '%s' -frames:v 1 -q:v 2 -y '%s' 2>/dev/null",
+            ts, video_path, img_path);
+        system(cmd);
+
+        struct stat st;
+        if (stat(img_path, &st) == 0 && st.st_size > 0) {
+            snprintf(kf_names[count], 256, "keyframe_%04d_ts%.1f.jpg", count, ts);
+            kf_times[count] = ts;
+            count++;
+        }
+        ts += INTERVAL_SEC;
+    }
+
+    *kf_count = count;
+    return 0;
+}
+
+/* OCR a single image using tesseract */
+static char* ocr_image(const char* image_path) {
+    char cmd[MAX_CMD];
+    snprintf(cmd, sizeof(cmd), "tesseract '%s' stdout 2>/dev/null", image_path);
+    char* out = exec_cmd(cmd);
+    /* Trim trailing whitespace */
+    char* end = out + strlen(out) - 1;
+    while (end > out && (*end == '\n' || *end == '\r' || *end == ' ' || *end == '\t')) {
+        *end = '\0';
+        end--;
+    }
+    return out;
+}
+
+/* Detect event type from text */
+static const char* detect_type(const char* text) {
+    if (strstr(text, "error") || strstr(text, "Error") || strstr(text, "ERROR") ||
+        strstr(text, "fail") || strstr(text, "Fail") || strstr(text, "FAIL") ||
+        strstr(text, "exception") || strstr(text, "crash"))
+        return "error";
+    if (strstr(text, "success") || strstr(text, "Success") || strstr(text, "SUCCESS") ||
+        strstr(text, "pass") || strstr(text, "Pass") || strstr(text, "PASS") ||
+        strstr(text, "complete") || strstr(text, "done") || strstr(text, "Done"))
+        return "pass";
+    if (strstr(text, "click") || strstr(text, "Click") || strstr(text, "tap") ||
+        strstr(text, "select") || strstr(text, "Select") || strstr(text, "open") ||
+        strstr(text, "Open") || strstr(text, "close") || strstr(text, "Close"))
+        return "action";
+    return "info";
+}
+
+/* Write JSON-escaped string to file */
+static void json_write_string(FILE* f, const char* s) {
+    fputc('"', f);
+    for (; *s; s++) {
+        switch (*s) {
+            case '"': fputs("\\\"", f); break;
+            case '\\': fputs("\\\\", f); break;
+            case '\n': fputs("\\n", f); break;
+            case '\r': fputs("\\r", f); break;
+            case '\t': fputs("\\t", f); break;
+            default:
+                if ((unsigned char)*s < 0x20) {
+                    fprintf(f, "\\u%04x", (unsigned char)*s);
+                } else {
+                    fputc(*s, f);
+                }
+        }
+    }
+    fputc('"', f);
+}
+
+int main(int argc, char** argv) {
+    if (argc < 4) {
+        fprintf(stderr, "Usage: videoextract extract <video_path> <output_dir>\n");
+        return 1;
+    }
+
+    const char* video_path = argv[2];
+    const char* out_dir = argv[3];
+
+    /* Create output dir */
+    mkdir_p(out_dir);
+    char kf_dir[MAX_CMD];
+    snprintf(kf_dir, sizeof(kf_dir), "%s/keyframes", out_dir);
+
+    /* Probe */
+    double duration = get_duration(video_path);
+    int width = 0, height = 0;
+    double fps = 0;
+    get_dimensions(video_path, &width, &height, &fps);
+
+    /* Extract keyframes */
+    char kf_names[MAX_KEYFRAMES][256];
+    double kf_times[MAX_KEYFRAMES];
+    int kf_count = 0;
+    extract_keyframes(video_path, kf_dir, duration, kf_names, kf_times, &kf_count);
+
+    /* OCR each keyframe */
+    char ocr_texts[MAX_KEYFRAMES][4096];
+    int ocr_count = 0;
+
+    for (int i = 0; i < kf_count; i++) {
+        char img_path[MAX_CMD];
+        snprintf(img_path, sizeof(img_path), "%s/%s", kf_dir, kf_names[i]);
+        char* text = ocr_image(img_path);
+        if (text && strlen(text) > 2) {
+            strncpy(ocr_texts[ocr_count], text, 4095);
+            ocr_texts[ocr_count][4095] = '\0';
+            ocr_count++;
+        }
+        free(text);
+    }
+
+    /* Extract audio for potential transcription */
+    char audio_path[MAX_CMD];
+    snprintf(audio_path, sizeof(audio_path), "%s/audio.wav", out_dir);
+    char cmd[MAX_CMD];
+    snprintf(cmd, sizeof(cmd),
+        "ffmpeg -i '%s' -vn -acodec pcm_s16le -ar 16000 -ac 1 -y '%s' 2>/dev/null",
+        video_path, audio_path);
+    system(cmd);
+
+    /* Write receipt.json */
+    char receipt_path[MAX_CMD];
+    snprintf(receipt_path, sizeof(receipt_path), "%s/receipt.json", out_dir);
+    FILE* f = fopen(receipt_path, "w");
+    if (!f) {
+        fprintf(stderr, "Cannot write receipt.json\n");
+        return 1;
+    }
+
+    fprintf(f, "{\n");
+    fprintf(f, "  \"videoId\": \"%s\",\n", out_dir); /* will be overwritten by PHP */
+    fprintf(f, "  \"duration\": %.2f,\n", duration);
+    fprintf(f, "  \"width\": %d,\n", width);
+    fprintf(f, "  \"height\": %d,\n", height);
+    fprintf(f, "  \"fps\": %.2f,\n", fps);
+    fprintf(f, "  \"keyframe_count\": %d,\n", kf_count);
+    fprintf(f, "  \"ocr_count\": %d,\n", ocr_count);
+
+    /* Keyframes array */
+    fprintf(f, "  \"keyframes\": [\n");
+    for (int i = 0; i < kf_count; i++) {
+        fprintf(f, "    {\"path\": ");
+        json_write_string(f, kf_names[i]);
+        fprintf(f, ", \"timestamp\": %.1f}%s\n", kf_times[i], i < kf_count - 1 ? "," : "");
+    }
+    fprintf(f, "  ],\n");
+
+    /* OCR samples array */
+    fprintf(f, "  \"ocr_samples\": [\n");
+    for (int i = 0; i < ocr_count; i++) {
+        const char* type = detect_type(ocr_texts[i]);
+        fprintf(f, "    {\"timestamp\": %.1f, \"text\": ", kf_times[i]);
+        json_write_string(f, ocr_texts[i]);
+        fprintf(f, ", \"type\": \"%s\"}%s\n", type, i < ocr_count - 1 ? "," : "");
+    }
+    fprintf(f, "  ],\n");
+
+    /* Actions array (derived from OCR) */
+    fprintf(f, "  \"actions\": [\n");
+    for (int i = 0; i < ocr_count; i++) {
+        const char* type = detect_type(ocr_texts[i]);
+        fprintf(f, "    {\"timestamp\": %.1f, \"type\": \"%s\", \"text\": ", kf_times[i], type);
+        json_write_string(f, ocr_texts[i]);
+        fprintf(f, "}%s\n", i < ocr_count - 1 ? "," : "");
+    }
+    fprintf(f, "  ],\n");
+
+    /* Proof moments (error→pass pairs) */
+    fprintf(f, "  \"proof_moments\": [\n");
+    int proof_count = 0;
+    for (int i = 0; i < ocr_count - 1; i++) {
+        const char* t1 = detect_type(ocr_texts[i]);
+        if (strcmp(t1, "error") == 0) {
+            /* Look for a pass within next 5 OCR blocks */
+            for (int j = i + 1; j < ocr_count && j < i + 6; j++) {
+                const char* t2 = detect_type(ocr_texts[j]);
+                if (strcmp(t2, "pass") == 0) {
+                    if (proof_count > 0) fprintf(f, ",\n");
+                    fprintf(f, "    {\"error_time\": %.1f, \"success_time\": %.1f, \"error_text\": ",
+                            kf_times[i], kf_times[j]);
+                    json_write_string(f, ocr_texts[i]);
+                    fprintf(f, ", \"success_text\": ");
+                    json_write_string(f, ocr_texts[j]);
+                    fprintf(f, "}");
+                    proof_count++;
+                    break;
+                }
+            }
+        }
+    }
+    fprintf(f, "\n  ],\n");
+
+    /* Files and URLs detected */
+    fprintf(f, "  \"files_detected\": [\n");
+    /* Simple regex-like scan for file patterns in OCR text */
+    int file_count = 0;
+    for (int i = 0; i < ocr_count; i++) {
+        char* p = ocr_texts[i];
+        while (*p) {
+            /* Look for word.ext pattern */
+            char* start = p;
+            while (*p && (isalnum(*p) || *p == '-' || *p == '_')) p++;
+            if (*p == '.' && isalpha(*(p+1))) {
+                char* ext_start = p + 1;
+                while (isalpha(*p)) p++;
+                int ext_len = p - ext_start;
+                if (ext_len >= 2 && ext_len <= 4) {
+                    if (file_count > 0) fprintf(f, ",\n    ");
+                    fprintf(f, "    ");
+                    json_write_string(f, start);
+                    file_count++;
+                }
+            }
+            while (*p && !isalnum(*p) && *p != '-' && *p != '_') p++;
+        }
+    }
+    fprintf(f, "\n  ],\n");
+
+    fprintf(f, "  \"urls_detected\": [\n");
+    int url_count = 0;
+    for (int i = 0; i < ocr_count; i++) {
+        char* p = strstr(ocr_texts[i], "http");
+        while (p) {
+            char* end = p;
+            while (*end && !isspace(*end) && *end != '"' && *end != '\'' && *end != '<') end++;
+            if (url_count > 0) fprintf(f, ",\n    ");
+            fprintf(f, "    ");
+            /* Write substring */
+            fputc('"', f);
+            for (char* c = p; c < end; c++) {
+                if (*c == '"') fputs("\\\"", f);
+                else if (*c == '\\') fputs("\\\\", f);
+                else fputc(*c, f);
+            }
+            fputc('"', f);
+            url_count++;
+            p = strstr(end, "http");
+        }
+    }
+    fprintf(f, "\n  ],\n");
+
+    fprintf(f, "  \"source_video_exposed\": false,\n");
+    fprintf(f, "  \"created_at\": %ld\n", (long)time(NULL));
+    fprintf(f, "}\n");
+
+    fclose(f);
+
+    /* Print summary to stdout for PHP to capture */
+    printf("EXTRACT_OK|keyframes=%d|ocr=%d|duration=%.1f\n", kf_count, ocr_count, duration);
+
+    return 0;
+}
+
+```

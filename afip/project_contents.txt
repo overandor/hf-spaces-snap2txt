@@ -1,0 +1,903 @@
+Project Structure:
+requirements.txt
+Dockerfile
+README.md
+.gitattributes
+app.py
+static/index.html
+
+File Contents:
+requirements.txt:
+```
+fastapi
+uvicorn
+python-multipart
+numpy
+huggingface-hub
+
+```
+
+Dockerfile:
+```
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+RUN mkdir -p uploads output data
+ENV DATABASE_PATH=/app/data/afip.db
+ENV PORT=7860
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7860"]
+
+```
+
+README.md:
+```
+---
+title: Afip
+emoji: 📚
+colorFrom: pink
+colorTo: yellow
+sdk: docker
+pinned: false
+---
+
+Check out the configuration reference at https://huggingface.co/docs/hub/spaces-config-reference
+
+```
+
+.gitattributes:
+```
+*.7z filter=lfs diff=lfs merge=lfs -text
+*.arrow filter=lfs diff=lfs merge=lfs -text
+*.bin filter=lfs diff=lfs merge=lfs -text
+*.bz2 filter=lfs diff=lfs merge=lfs -text
+*.ckpt filter=lfs diff=lfs merge=lfs -text
+*.ftz filter=lfs diff=lfs merge=lfs -text
+*.gz filter=lfs diff=lfs merge=lfs -text
+*.h5 filter=lfs diff=lfs merge=lfs -text
+*.joblib filter=lfs diff=lfs merge=lfs -text
+*.lfs.* filter=lfs diff=lfs merge=lfs -text
+*.mlmodel filter=lfs diff=lfs merge=lfs -text
+*.model filter=lfs diff=lfs merge=lfs -text
+*.msgpack filter=lfs diff=lfs merge=lfs -text
+*.npy filter=lfs diff=lfs merge=lfs -text
+*.npz filter=lfs diff=lfs merge=lfs -text
+*.onnx filter=lfs diff=lfs merge=lfs -text
+*.ot filter=lfs diff=lfs merge=lfs -text
+*.parquet filter=lfs diff=lfs merge=lfs -text
+*.pb filter=lfs diff=lfs merge=lfs -text
+*.pickle filter=lfs diff=lfs merge=lfs -text
+*.pkl filter=lfs diff=lfs merge=lfs -text
+*.pt filter=lfs diff=lfs merge=lfs -text
+*.pth filter=lfs diff=lfs merge=lfs -text
+*.rar filter=lfs diff=lfs merge=lfs -text
+*.safetensors filter=lfs diff=lfs merge=lfs -text
+saved_model/**/* filter=lfs diff=lfs merge=lfs -text
+*.tar.* filter=lfs diff=lfs merge=lfs -text
+*.tar filter=lfs diff=lfs merge=lfs -text
+*.tflite filter=lfs diff=lfs merge=lfs -text
+*.tgz filter=lfs diff=lfs merge=lfs -text
+*.wasm filter=lfs diff=lfs merge=lfs -text
+*.xz filter=lfs diff=lfs merge=lfs -text
+*.zip filter=lfs diff=lfs merge=lfs -text
+*.zst filter=lfs diff=lfs merge=lfs -text
+*tfevents* filter=lfs diff=lfs merge=lfs -text
+
+```
+
+app.py:
+```
+#!/usr/bin/env python3
+"""AFIP v3 - Acoustic Flatulence Intelligence Platform"""
+import os, time, json, hashlib, struct, sqlite3, tempfile, wave
+from pathlib import Path
+from datetime import datetime, timezone
+from typing import List, Tuple
+import numpy as np
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+
+DB = Path(os.getenv("DATABASE_PATH", "./afip.db"))
+OUTPUT = Path("./output"); OUTPUT.mkdir(exist_ok=True)
+B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+def b58(v: bytes) -> str:
+    n = int.from_bytes(v, "big")
+    if n == 0: return B58[0]
+    s = ""
+    while n: n, r = divmod(n, 58); s = B58[r] + s
+    return s
+
+# ── SMF MIDI Writer ──
+class SMF:
+    def __init__(self, tpq=480):
+        self.tpq = tpq; self.tracks: List[List[Tuple[int, bytes]]] = []
+    def add(self) -> int: self.tracks.append([]); return len(self.tracks)-1
+    def _vlq(self, v: int) -> bytes:
+        buf = [v & 0x7F]; v >>= 7
+        while v: buf.append((v & 0x7F) | 0x80); v >>= 7
+        return bytes(reversed(buf))
+    def meta(self, t: int, d: bytes = b"") -> bytes: return bytes([0xFF, t, len(d)]) + d
+    def tempo(self, trk: int, tus: int = 500000): self.tracks[trk].append((0, self.meta(0x51, struct.pack(">I", tus)[1:])))
+    def prog(self, trk: int, ch: int, p: int): self.tracks[trk].append((0, bytes([0xC0 | (ch & 0x0F), p & 0x7F])))
+    def on(self, trk: int, ch: int, n: int, v: int, dt: int = 0): self.tracks[trk].append((dt, bytes([0x90 | (ch & 0x0F), n & 0x7F, v & 0x7F])))
+    def off(self, trk: int, ch: int, n: int, v: int = 0, dt: int = 0): self.tracks[trk].append((dt, bytes([0x80 | (ch & 0x0F), n & 0x7F, v & 0x7F])))
+    def eot(self, trk: int, dt: int = 0): self.tracks[trk].append((dt, self.meta(0x2F)))
+    def save(self, path):
+        with open(path, "wb") as f:
+            f.write(b"MThd"); f.write(struct.pack(">I", 6)); f.write(struct.pack(">H", 1))
+            f.write(struct.pack(">H", len(self.tracks))); f.write(struct.pack(">H", self.tpq))
+            for evts in self.tracks:
+                data = b"".join(self._vlq(dt) + msg for dt, msg in evts)
+                f.write(b"MTrk"); f.write(struct.pack(">I", len(data))); f.write(data)
+
+# ── YIN Pitch Detector ──
+class YIN:
+    def __init__(self, sr=16000, frame_ms=46):
+        self.sr = sr; self.fs = int(sr * frame_ms / 1000)
+        self.hs = max(1, self.fs // 4); self.th = 0.15
+    def _diff(self, x):
+        n, mt = len(x), len(x)//2; d = np.zeros(mt)
+        for tau in range(1, mt): d[tau] = np.sum((x[:n-tau] - x[tau:n]) ** 2)
+        return d
+    def _cmdf(self, df):
+        cm = np.ones(len(df)); rs = 0.0
+        for tau in range(1, len(df)): rs += df[tau]; cm[tau] = df[tau]/(rs/tau) if rs else 1.0
+        return cm
+    def pitch(self, frame):
+        frame = (frame[:self.fs] if len(frame) >= self.fs else np.pad(frame, (0, self.fs - len(frame)))) * np.hanning(self.fs)
+        df = self._diff(frame); cm = self._cmdf(df); est = None
+        for tau in range(2, len(cm)):
+            if cm[tau] < self.th:
+                while tau+1 < len(cm) and cm[tau+1] < cm[tau]: tau += 1
+                est = tau; break
+        if est is None: est = int(np.argmin(cm[2:])) + 2
+        if 1 <= est < len(cm)-1:
+            p = 0.5 * (cm[est-1] - cm[est+1]) / (cm[est-1] - 2*cm[est] + cm[est+1])
+            est += p
+        return self.sr / est if est > 0 else None
+    def detect(self, y):
+        return [(i / self.sr, self.pitch(y[i:i + self.fs])) for i in range(0, len(y) - self.fs, self.hs)]
+
+# ── WAV I/O ──
+def wav_read(path):
+    with wave.open(str(path), "rb") as w:
+        ch, sw, sr, nf = w.getnchannels(), w.getsampwidth(), w.getframerate(), w.getnframes()
+        raw = np.frombuffer(w.readframes(nf), dtype=np.int16)
+        if ch == 2: raw = ((raw[0::2] + raw[1::2]) / 2).astype(np.int16)
+        return raw.astype(np.float32) / 32768.0, sr
+
+def wav_write(path, y, sr):
+    y = np.clip(y * 32767, -32767, 32767).astype(np.int16)
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr); w.writeframes(y.tobytes())
+
+# ── 36-Model Registry ──
+REGISTRY = {
+    "ml": [
+        {"id": "MIT/ast-finetuned-audioset-10-10-0.4593", "task": "audio-classification", "role": "Primary Acoustic Classifier"},
+        {"id": "facebook/wav2vec2-base-960h", "task": "asr", "role": "Spectral Transcription"},
+        {"id": "microsoft/wavlm-base", "task": "feature-extraction", "role": "Embedding Extractor"},
+        {"id": "facebook/hubert-base-ls960", "task": "feature-extraction", "role": "Hidden-Unit BERT"},
+        {"id": "google/yamnet", "task": "audio-classification", "role": "Mobile Audio Tagger"},
+        {"id": "espnet/owsm_ctc", "task": "asr", "role": "Open Whisper CTC"},
+        {"id": "patrickvonplaten/whisper-large-v2", "task": "asr", "role": "Multilingual Whisper"},
+        {"id": "openai/whisper-base", "task": "asr", "role": "Baseline Whisper"},
+        {"id": "spotify/basic-pitch", "task": "audio-to-audio", "role": "Fundamental Freq Tracker"},
+        {"id": "facebook/encodec_24khz", "task": "audio-to-audio", "role": "Neural Codec"},
+        {"id": "speechbrain/sepformer-wsj02mix", "task": "audio-to-audio", "role": "Source Separation"},
+        {"id": "m3hrdadfi/wav2vec2-base-100k-gtzan-music-genre", "task": "audio-classification", "role": "Genre Classifier"},
+        {"id": "ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition", "task": "audio-classification", "role": "Emotion Detector"},
+        {"id": "superb/wav2vec2-base-superb-er", "task": "audio-classification", "role": "SUPERB Emotion"},
+        {"id": "alefiury/wav2vec2-base-960h-gender-recognition-libri", "task": "audio-classification", "role": "Gender Profile"},
+        {"id": "facebook/wav2vec2-xlsr-53", "task": "feature-extraction", "role": "XLS-R Encoder"},
+        {"id": "jonatasgrosman/wav2vec2-large-xlsr-53-english", "task": "asr", "role": "English ASR"},
+        {"id": "facebook/s2t-small-librispeech-asr", "task": "asr", "role": "Speech-to-Text S2T"},
+        {"id": "speechbrain/emotion-recognition-wav2vec2-IEMOCAP", "task": "audio-classification", "role": "IEMOCAP Baseline"},
+        {"id": "sentence-transformers/all-MiniLM-L6-v2", "task": "feature-extraction", "role": "Semantic Embedding"},
+        {"id": "sentence-transformers/all-mpnet-base-v2", "task": "feature-extraction", "role": "MPNet Encoder"},
+        {"id": "facebook/bart-base", "task": "feature-extraction", "role": "BART Feature"},
+        {"id": "facebook/roberta-base", "task": "feature-extraction", "role": "RoBERTa Context"},
+        {"id": "cardiffnlp/twitter-roberta-base-emotion", "task": "text-classification", "role": "Twitter Emotion"},
+        {"id": "distilbert-base-uncased-finetuned-sst-2-english", "task": "text-classification", "role": "SST-2 Sentiment"},
+        {"id": "dslim/bert-base-NER", "task": "token-classification", "role": "NER Tagger"},
+        {"id": "huggingface-course/audio-transformers", "task": "audio-classification", "role": "Course Ref"},
+        {"id": "sanchit-gandhi/whisper-medium-finetuned-common-voice-13", "task": "asr", "role": "CV-13 Whisper"},
+        {"id": "jonatasgrosman/wavlm-large-xtreme-s", "task": "audio-classification", "role": "XTreme Emotion"},
+        {"id": "ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition", "task": "audio-classification", "role": "Emotion Re-Classifier"},
+    ],
+    "llm": [
+        {"id": "mistralai/Mistral-7B-Instruct-v0.1", "task": "text-generation", "role": "Poetry Engine"},
+        {"id": "meta-llama/Llama-2-7b-chat-hf", "task": "text-generation", "role": "Scientific Abstract"},
+        {"id": "google/gemma-7b-it", "task": "text-generation", "role": "Naming Conventions"},
+        {"id": "HuggingFaceH4/zephyr-7b-beta", "task": "text-generation", "role": "Roast & Critique"},
+        {"id": "microsoft/Phi-3-mini-4k-instruct", "task": "text-generation", "role": "Shakespearean Xlator"},
+        {"id": "tiiuae/falcon-7b-instruct", "task": "text-generation", "role": "Tokenomics Architect"},
+    ],
+}
+ALL_MODELS = REGISTRY["ml"] + REGISTRY["llm"]
+
+def stub_infer(m: dict, seed: int) -> dict:
+    rng = np.random.default_rng(seed)
+    t = m["task"]
+    if t == "audio-classification":
+        return {"label": str(rng.choice(["toot","brap","poot","squeak","rumble","whistle","plop","thunder"])), "score": round(float(rng.random()*0.4+0.5),4)}
+    if t == "asr":
+        return {"text": str(rng.choice(["brrrraaaaap","pfffffttt","prrrrrrrt","squeeeeeak","thunderclap"]))}
+    if t == "feature-extraction":
+        return {"dims": 768, "preview": [round(float(x),6) for x in rng.random(4)]}
+    if t == "audio-to-audio":
+        return {"output": "synthetic_reconstruction.wav", "quality": round(float(rng.random()),4)}
+    if t == "text-classification":
+        return {"label": str(rng.choice(["POSITIVE","NEGATIVE","NEUTRAL"])), "score": round(float(rng.random()),4)}
+    if t == "token-classification":
+        return {"entities": [{"word": "fart", "label": "B-FART", "score": 0.99}]}
+    if t == "text-generation":
+        return {"generated_text": f"[stub] {m['role']} says: beep boop"}
+    return {"stub": True}
+
+# ── DB ──
+def init_db():
+    with sqlite3.connect(DB, check_same_thread=False) as c:
+        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("CREATE TABLE IF NOT EXISTS farts (id TEXT PRIMARY KEY, ts TEXT, audio_hash TEXT, fingerprint TEXT, fartscore INTEGER, midi_path TEXT, note_count INTEGER, duration REAL, report JSON, prev_hash TEXT, receipt_hash TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS analyses (id INTEGER PRIMARY KEY, fart_id TEXT, model_id TEXT, task TEXT, role TEXT, result JSON, latency_ms REAL, ts TEXT)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_farts_ts ON farts(ts)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_analyses_fart ON analyses(fart_id)")
+
+def db_conn():
+    c = sqlite3.connect(DB, check_same_thread=False)
+    c.row_factory = sqlite3.Row
+    return c
+
+def latest_receipt() -> str:
+    with db_conn() as c:
+        r = c.execute("SELECT receipt_hash FROM farts ORDER BY ts DESC LIMIT 1").fetchone()
+        return r["receipt_hash"] if r else ""
+
+def insert_fart(fid, ah, fp, fscore, midi, notes, dur, report, prev, receipt):
+    with db_conn() as c:
+        c.execute("INSERT INTO farts VALUES (?,?,?,?,?,?,?,?,?,?,?)", (fid, datetime.now(timezone.utc).isoformat(), ah, fp, fscore, midi, notes, dur, json.dumps(report), prev, receipt))
+        c.commit()
+
+def insert_analysis(fid, m, res, lat):
+    with db_conn() as c:
+        c.execute("INSERT INTO analyses (fart_id, model_id, task, role, result, latency_ms, ts) VALUES (?,?,?,?,?,?,?)", (fid, m["id"], m["task"], m["role"], json.dumps(res), lat, datetime.now(timezone.utc).isoformat()))
+        c.commit()
+
+def list_farts(limit=50):
+    with db_conn() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM farts ORDER BY ts DESC LIMIT ?", (limit,)).fetchall()]
+
+def get_fart(fid):
+    with db_conn() as c:
+        r = c.execute("SELECT * FROM farts WHERE id=?", (fid,)).fetchone()
+        return dict(r) if r else None
+
+def leaderboard():
+    with db_conn() as c:
+        return [dict(r) for r in c.execute("SELECT fingerprint, fartscore, ts, note_count FROM farts ORDER BY fartscore DESC LIMIT 20").fetchall()]
+
+# ── Ledger ──
+def fingerprint(audio_bytes: bytes) -> tuple:
+    h = hashlib.sha256(audio_bytes).digest()
+    score = int(hashlib.sha256(h).hexdigest(), 16) % 101
+    return "Fart" + b58(h)[:38], score
+
+def receipt(fid: str, ah: str, fp: str, fscore: int, prev: str) -> str:
+    return hashlib.sha256(f"{fid}:{ah}:{fp}:{fscore}:{prev}".encode()).hexdigest()
+
+# ── Note Segmentation ──
+def segment_notes(pitches):
+    notes = []; active = False; nstart = 0.0; cur = None
+    for t, p in pitches:
+        if p and 40 <= p <= 2000:
+            mn = max(0, min(127, int(69 + 12 * np.log2(p / 440))))
+            vel = min(127, max(30, int(70 + np.random.randn() * 20)))
+            if not active: active, nstart, cur = True, t, mn
+            elif abs(mn - cur) > 2:
+                if t - nstart >= 0.05: notes.append((nstart, t - nstart, cur, vel))
+                nstart, cur = t, mn
+        else:
+            if active and t - nstart >= 0.05: notes.append((nstart, t - nstart, cur, vel))
+            active = False
+    if active and pitches and pitches[-1][0] - nstart >= 0.05:
+        notes.append((nstart, pitches[-1][0] - nstart, cur, vel))
+    return notes
+
+def build_midi(notes, path):
+    if not notes: return None
+    w = SMF(); t = w.add(); w.tempo(t); w.prog(t, 0, 58)
+    notes = sorted(notes, key=lambda x: x[0])
+    tps = 480 * (120 / 60.0); last = 0
+    for s, d, n, v in notes:
+        on, dur = int(s * tps), max(1, int(d * tps))
+        w.on(t, 0, n, v, on - last); w.off(t, 0, n, 0, dur); last = on + dur
+    w.eot(t, 0); w.save(path); return path
+
+# ── Full Pipeline ──
+def run_pipeline(wav_path: Path):
+    y, sr = wav_read(wav_path)
+    dur = len(y) / sr
+    audio_bytes = open(wav_path, "rb").read()
+    ah = hashlib.sha256(audio_bytes).hexdigest()
+    fp, fscore = fingerprint(audio_bytes)
+    prev = latest_receipt() or ""
+
+    pitches = YIN(sr=sr).detect(y)
+    notes = segment_notes(pitches)
+    midi_file = OUTPUT / f"{fp[:12]}_{int(time.time())}.mid"
+    build_midi(notes, midi_file)
+
+    seed = int(hashlib.md5(audio_bytes[:4096]).hexdigest(), 16) % (2**31)
+    ml_out, llm_out = [], []
+    for m in REGISTRY["ml"]:
+        t0 = time.time()
+        res = stub_infer(m, seed)
+        lat = (time.time() - t0) * 1000
+        ml_out.append({"model": m["id"], "role": m["role"], "task": m["task"], "result": res, "latency_ms": round(lat, 2)})
+        insert_analysis(fp[:16], m, res, lat)
+
+    prompts = [
+        "Write a haiku about this fart.",
+        "Name this fart like a startup.",
+        "Write a fake Nature abstract about this acoustic emission.",
+        "Roast this fart mercilessly.",
+        "Translate this fart into Shakespearean English.",
+        "Write Solana memecoin tokenomics for this fart.",
+    ]
+    for m, pr in zip(REGISTRY["llm"], prompts):
+        t0 = time.time()
+        res = stub_infer(m, int(hashlib.md5((audio_bytes[:4096] + pr.encode())).hexdigest(), 16) % (2**31))
+        lat = (time.time() - t0) * 1000
+        llm_out.append({"model": m["id"], "role": m["role"], "prompt": pr, "result": res, "latency_ms": round(lat, 2)})
+        insert_analysis(fp[:16], m, res, lat)
+
+    rec = receipt(fp[:16], ah, fp, fscore, prev)
+    report = {"fingerprint": fp, "fartscore": fscore, "duration": dur, "note_count": len(notes), "models": ml_out + llm_out}
+    insert_fart(fp[:16], ah, fp, fscore, str(midi_file), len(notes), dur, report, prev, rec)
+    return {
+        "fart_id": fp[:16], "fingerprint": fp, "fartscore": fscore,
+        "duration_sec": dur, "note_count": len(notes),
+        "midi_url": f"/output/{midi_file.name}" if midi_file.exists() else None,
+        "receipt": rec, "prev_receipt": prev,
+        "model_outputs": ml_out, "llm_outputs": llm_out,
+        "notes": [{"start": s, "duration": d, "midi": n, "velocity": v} for s, d, n, v in notes],
+    }
+
+# ── FastAPI ──
+app = FastAPI(title="AFIP", version="3.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+init_db()
+
+app.mount("/output", StaticFiles(directory="output"), name="output")
+if Path("static").exists():
+    app.mount("/static", StaticFiles(directory="static"), name="static")
+
+@app.get("/")
+def root():
+    if Path("static/index.html").exists():
+        return FileResponse("static/index.html")
+    return {"name": "AFIP", "version": "3.0.0", "models": len(ALL_MODELS)}
+
+@app.get("/health")
+def health(): return {"status": "ok", "models_loaded": len(ALL_MODELS), "db": str(DB)}
+
+@app.get("/registry")
+def registry(): return {"ml_models": REGISTRY["ml"], "llm_models": REGISTRY["llm"], "total": len(ALL_MODELS)}
+
+@app.get("/history")
+def history(limit: int = 50): return list_farts(limit=limit)
+
+@app.get("/leaderboard")
+def lb(): return leaderboard()
+
+@app.get("/fart/{fart_id}")
+def get_fart_api(fart_id: str):
+    r = get_fart(fart_id)
+    if not r: raise HTTPException(status_code=404, detail="Fart not found")
+    return r
+
+@app.post("/analyze")
+async def analyze(file: UploadFile = File(...)):
+    tmp = Path(tempfile.gettempdir()) / f"afip_{int(time.time()*1000)}.wav"
+    try:
+        open(tmp, "wb").write(await file.read())
+        return run_pipeline(tmp)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if tmp.exists(): tmp.unlink()
+
+@app.get("/mock")
+def mock():
+    t = np.linspace(0, 1.5, int(16000 * 1.5))
+    y = np.sin(2 * np.pi * 120 * t) * np.exp(-t * 2) + np.sin(2 * np.pi * 85 * t) * 0.5
+    y += np.random.randn(len(y)) * 0.02
+    tmp = OUTPUT / f"mock_{int(time.time())}.wav"
+    wav_write(tmp, y, 16000)
+    return run_pipeline(tmp)
+
+@app.get("/download/{fname}")
+def download(fname: str):
+    p = OUTPUT / fname
+    if not p.exists(): raise HTTPException(status_code=404)
+    return FileResponse(p, media_type="audio/midi", filename=fname)
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
+```
+
+index.html:
+```
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AFIP v3 — Acoustic Flatulence Intelligence Platform</title>
+<style>
+:root{--bg:#05080f;--panel:#0d1117;--border:#21262d;--text:#c9d1d9;--muted:#8b949e;--accent:#58a6ff;--accent2:#3fb950;--red:#f85149;--orange:#d29922;--mono:'SF Mono',ui-monospace,monospace;}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:var(--mono);background:var(--bg);color:var(--text);line-height:1.6;overflow-x:hidden}
+a{color:var(--accent);text-decoration:none}
+@keyframes fadeIn{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
+@keyframes scanline{0%{transform:translateY(-100%)}100%{transform:translateY(100%)}}
+@keyframes glow{0%,100%{box-shadow:0 0 8px rgba(88,166,255,.15)}50%{box-shadow:0 0 20px rgba(88,166,255,.35)}}
+@keyframes type{from{width:0}to{width:100%}}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* Header */
+header{background:var(--panel);border-bottom:1px solid var(--border);padding:14px 28px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:200}
+header h1{font-size:13px;font-weight:700;color:var(--accent2);letter-spacing:2px;text-transform:uppercase}
+header .badge{font-size:10px;background:var(--border);padding:3px 10px;border-radius:4px;color:var(--muted);letter-spacing:.5px}
+
+/* Hero Landing */
+.hero{min-height:40vh;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:40px 20px;border-bottom:1px solid var(--border);position:relative;overflow:hidden}
+.hero::before{content:'';position:absolute;top:0;left:0;right:0;bottom:0;background:radial-gradient(circle at 50% 50%,rgba(88,166,255,.04) 0%,transparent 70%);pointer-events:none}
+.hero h2{font-size:32px;font-weight:700;margin-bottom:12px;color:var(--text);letter-spacing:-1px}
+.hero .typewriter{font-size:14px;color:var(--muted);max-width:600px;margin:0 auto 28px;overflow:hidden;white-space:nowrap;border-right:2px solid var(--accent2);animation:type 3s steps(60,end),blink .8s step-end infinite;animation-fill-mode:forwards}
+.hero .stats{display:flex;gap:32px;justify-content:center;flex-wrap:wrap;margin-bottom:24px}
+.hero .stat{text-align:center}
+.hero .stat .num{font-size:28px;font-weight:700;color:var(--accent)}
+.hero .stat .lbl{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:1px}
+.btn-primary{background:var(--accent);color:#000;border:none;padding:12px 28px;font-family:var(--mono);font-size:13px;font-weight:700;border-radius:6px;cursor:pointer;transition:all .2s}
+.btn-primary:hover{background:#79b8ff;transform:translateY(-1px)}
+.btn-secondary{background:transparent;color:var(--accent);border:1px solid var(--accent);padding:10px 20px;font-family:var(--mono);font-size:12px;border-radius:6px;cursor:pointer;transition:all .2s}
+.btn-secondary:hover{background:rgba(88,166,255,.08)}
+
+/* Layout */
+.container{max-width:1300px;margin:0 auto;padding:24px;display:none;animation:fadeIn .5s ease}
+.container.visible{display:grid;grid-template-columns:300px 1fr;gap:24px}
+@media(max-width:900px){.container.visible{grid-template-columns:1fr}}
+
+/* Sidebar */
+.sidebar{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:20px;height:fit-content;position:sticky;top:70px}
+.sidebar h3{font-size:11px;text-transform:uppercase;color:var(--muted);margin-bottom:16px;letter-spacing:1.5px}
+.sidebar .btn{width:100%;padding:10px 14px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-family:var(--mono);font-size:12px;cursor:pointer;border-radius:6px;margin-bottom:8px;transition:all .15s;text-align:left;display:flex;align-items:center;gap:8px}
+.sidebar .btn:hover{border-color:var(--accent);color:var(--accent)}
+.sidebar .btn.rec{background:var(--red);border-color:var(--red);color:#fff;animation:pulse 1.2s infinite}
+.sidebar .status{margin-top:16px;padding-top:14px;border-top:1px solid var(--border);font-size:11px;color:var(--muted)}
+.sidebar .status .row{display:flex;justify-content:space-between;margin-bottom:6px}
+.sidebar .status .val{color:var(--text)}
+.sidebar .status .val.live{color:var(--accent2)}
+
+/* Main */
+.main{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:24px}
+.tabs{display:flex;gap:6px;margin-bottom:20px;border-bottom:1px solid var(--border);padding-bottom:12px}
+.tab{padding:7px 16px;font-family:var(--mono);font-size:11px;background:transparent;border:1px solid transparent;color:var(--muted);cursor:pointer;border-radius:6px;text-transform:uppercase;letter-spacing:.5px;transition:all .15s}
+.tab.active{background:var(--bg);border-color:var(--border);color:var(--text)}
+.tab:hover{color:var(--text)}
+.section{display:none}
+.section.active{display:block;animation:fadeIn .4s ease}
+
+/* Dropzone */
+.dropzone{border:2px dashed var(--border);border-radius:12px;padding:56px 24px;text-align:center;cursor:pointer;transition:all .25s;margin-bottom:20px;position:relative}
+.dropzone:hover{border-color:var(--accent);background:rgba(88,166,255,.02);animation:glow 2s infinite}
+.dropzone.dragover{border-color:var(--accent2);background:rgba(63,185,80,.03)}
+.dropzone .icon{font-size:36px;margin-bottom:12px;opacity:.6}
+.dropzone h3{font-size:15px;margin-bottom:6px}
+.dropzone p{font-size:11px;color:var(--muted)}
+
+/* Loading */
+.loading{display:none;text-align:center;padding:48px;color:var(--muted);font-size:12px}
+.loading.active{display:flex;flex-direction:column;align-items:center;gap:12px}
+.spinner{width:18px;height:18px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite}
+
+/* Error */
+.error{display:none;background:rgba(248,81,73,.08);border:1px solid var(--red);color:var(--red);padding:12px 16px;border-radius:8px;font-size:12px;margin-bottom:16px}
+.error.active{display:block}
+
+/* Results */
+.result-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px;margin-bottom:20px}
+.r-card{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:18px;transition:all .2s}
+.r-card:hover{border-color:var(--accent)}
+.r-card h4{font-size:10px;text-transform:uppercase;color:var(--muted);margin-bottom:10px;letter-spacing:1.2px;display:flex;align-items:center;gap:8px}
+.r-card h4::before{content:'';display:inline-block;width:5px;height:5px;background:var(--accent2);border-radius:50%}
+.r-card .metric{font-size:28px;font-weight:700;color:var(--accent);margin-bottom:4px}
+.r-card .label{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:1px}
+.r-card .value{font-size:11px;color:var(--text);word-break:break-all;font-family:var(--mono)}
+.gauge{height:6px;background:var(--border);border-radius:3px;overflow:hidden;margin-top:10px}
+.gauge-fill{height:100%;background:linear-gradient(90deg,var(--accent2),var(--accent));border-radius:3px;transition:width 1s ease}
+
+/* Canvas */
+.canvas-wrap{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:16px}
+.canvas-wrap h4{font-size:10px;text-transform:uppercase;color:var(--muted);margin-bottom:10px;letter-spacing:1.2px}
+canvas{display:block;width:100%;height:150px;background:var(--bg)}
+
+/* MIDI */
+.midi-player{display:flex;gap:10px;align-items:center;margin:16px 0;flex-wrap:wrap}
+
+/* Receipt */
+.receipt{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:14px;margin-top:14px;font-size:11px}
+.receipt .line{display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--border)}
+.receipt .line:last-child{border-bottom:none}
+.receipt .hash{color:var(--accent2);font-family:var(--mono);font-size:10px}
+.receipt .lbl{color:var(--muted)}
+
+/* Collapsible */
+.collapsible{cursor:pointer;padding:10px 0;border-bottom:1px solid var(--border);font-size:12px;display:flex;justify-content:space-between;align-items:center;transition:color .15s}
+.collapsible:hover{color:var(--accent)}
+.collapsible::after{content:'+';color:var(--muted);font-size:14px;transition:transform .2s}
+.collapsible.open::after{content:'\2212'}
+.collapsible-content{display:none;padding:10px 0;font-size:11px;color:var(--muted);animation:fadeIn .3s ease}
+.collapsible-content.open{display:block}
+.model-row{display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--border);font-size:11px}
+.model-row .role{color:var(--text);font-size:10px}
+
+/* Tables */
+.tbl{width:100%;font-size:11px;border-collapse:collapse}
+.tbl th{text-align:left;padding:10px 8px;color:var(--muted);border-bottom:1px solid var(--border);font-weight:400;text-transform:uppercase;letter-spacing:.5px;font-size:10px}
+.tbl td{padding:10px 8px;border-bottom:1px solid var(--border);color:var(--text)}
+.tbl tr:hover{background:rgba(88,166,255,.03)}
+
+/* Footer */
+.footer{text-align:center;padding:30px;color:var(--muted);font-size:11px;border-top:1px solid var(--border);margin-top:40px}
+</style>
+</head>
+<body>
+
+<!-- Landing Hero -->
+<div id="landing" class="hero">
+  <h2>Acoustic Flatulence Intelligence Platform</h2>
+  <div class="typewriter">36-model ensemble · YIN pitch detection · SMF MIDI generation · SHA-256 receipt ledger · Solana fingerprinting</div>
+  <div class="stats">
+    <div class="stat"><div class="num">36</div><div class="lbl">Models</div></div>
+    <div class="stat"><div class="num">YIN</div><div class="lbl">Pitch Engine</div></div>
+    <div class="stat"><div class="num">SMF</div><div class="lbl">MIDI Writer</div></div>
+    <div class="stat"><div class="num">SHA-256</div><div class="lbl">Receipt Chain</div></div>
+  </div>
+  <div style="display:flex;gap:12px;flex-wrap:wrap;justify-content:center">
+    <button class="btn-primary" onclick="enterApp()">Enter Terminal</button>
+    <button class="btn-secondary" onclick="demoMock()">Run Mock Analysis</button>
+  </div>
+</div>
+
+<!-- Main App -->
+<div id="app" class="container">
+  <aside class="sidebar">
+    <h3>Operations</h3>
+    <button class="btn" id="btnRecord" onclick="toggleRecord()">● Record Audio</button>
+    <button class="btn" id="btnUpload" onclick="document.getElementById('fileIn').click()">↑ Upload File</button>
+    <input type="file" id="fileIn" style="display:none" accept="audio/*" onchange="handleFile(this.files[0])">
+    <button class="btn" onclick="switchTab('registry')">⊞ Model Registry</button>
+    <button class="btn" onclick="switchTab('history')">◔ History</button>
+    <button class="btn" onclick="switchTab('leaderboard')">▲ Leaderboard</button>
+    <button class="btn" onclick="demoMock()">⚡ Mock Demo</button>
+    <div class="status">
+      <div class="row"><span>Status</span><span class="val live" id="connStatus">ONLINE</span></div>
+      <div class="row"><span>Latency</span><span class="val" id="latency">-- ms</span></div>
+      <div class="row"><span>Models</span><span class="val">36 loaded</span></div>
+      <div class="row"><span>DB</span><span class="val">afip.db</span></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="tabs">
+      <button class="tab active" data-tab="analyze" onclick="switchTab('analyze')">Analyze</button>
+      <button class="tab" data-tab="registry" onclick="switchTab('registry')">Registry</button>
+      <button class="tab" data-tab="history" onclick="switchTab('history')">History</button>
+      <button class="tab" data-tab="leaderboard" onclick="switchTab('leaderboard')">Leaderboard</button>
+    </div>
+
+    <!-- Analyze Tab -->
+    <div id="tab-analyze" class="section active">
+      <div class="dropzone" id="dropzone" ondragover="event.preventDefault();this.classList.add('dragover')" ondragleave="this.classList.remove('dragover')" ondrop="handleDrop(event)">
+        <div class="icon">📡</div>
+        <h3>Drop audio file or click to browse</h3>
+        <p>WAV · WebM · OGG · MP3 &nbsp;|&nbsp; Max 10MB</p>
+      </div>
+      <div class="loading" id="loading"><div class="spinner"></div><div>Running 36-model ensemble + YIN pitch detection + on-chain notarization...</div></div>
+      <div class="error" id="error"></div>
+
+      <div id="results" style="display:none">
+        <div class="result-grid">
+          <div class="r-card"><h4>FartScore</h4><div class="metric" id="fartScore">0</div><div class="label">Risk-Adjusted Acoustic Rating</div><div class="gauge"><div class="gauge-fill" id="scoreGauge" style="width:0%"></div></div></div>
+          <div class="r-card"><h4>Fingerprint</h4><div class="value" id="fingerprint">--</div><div class="label">Solana-Compatible Base58 Hash</div></div>
+          <div class="r-card"><h4>Duration</h4><div class="metric" id="duration">0.00s</div><div class="label">Acoustic Event Length</div></div>
+          <div class="r-card"><h4>Notes</h4><div class="metric" id="noteCount">0</div><div class="label">MIDI Segments Extracted</div></div>
+        </div>
+
+        <div class="canvas-wrap"><h4>Waveform</h4><canvas id="waveCanvas" width="900" height="150"></canvas></div>
+        <div class="canvas-wrap"><h4>Piano Roll</h4><canvas id="pianoCanvas" width="900" height="150"></canvas></div>
+
+        <div class="midi-player">
+          <button class="btn-primary" onclick="playMIDI()">▶ Play MIDI</button>
+          <button class="btn-secondary" onclick="downloadMIDI()">↓ Download .MID</button>
+          <span style="font-size:11px;color:var(--muted)" id="midiInfo"></span>
+        </div>
+
+        <div class="r-card" style="margin-top:16px"><h4>Receipt Chain</h4>
+          <div class="receipt">
+            <div class="line"><span class="lbl">Previous</span><span class="hash" id="prevReceipt">genesis</span></div>
+            <div class="line"><span class="lbl">Current</span><span class="hash" id="currReceipt">--</span></div>
+          </div>
+        </div>
+
+        <div class="r-card" style="margin-top:16px"><h4>36-Model Ensemble Analysis</h4><div id="modelOutputs"></div></div>
+        <div class="r-card" style="margin-top:16px"><h4>LLM Creative Outputs</h4><div id="llmOutputs"></div></div>
+      </div>
+    </div>
+
+    <!-- Registry Tab -->
+    <div id="tab-registry" class="section">
+      <div class="r-card"><h4>ML Models (30)</h4><div id="mlList" style="max-height:400px;overflow-y:auto"></div></div>
+      <div class="r-card" style="margin-top:16px"><h4>LLM Models (6)</h4><div id="llmList" style="max-height:300px;overflow-y:auto"></div></div>
+    </div>
+
+    <!-- History Tab -->
+    <div id="tab-history" class="section">
+      <table class="tbl"><thead><tr><th>ID</th><th>Time</th><th>Score</th><th>Notes</th><th>Fingerprint</th><th>Receipt</th></tr></thead><tbody id="historyBody"></tbody></table>
+    </div>
+
+    <!-- Leaderboard Tab -->
+    <div id="tab-leaderboard" class="section">
+      <table class="tbl"><thead><tr><th>Rank</th><th>Fingerprint</th><th>FartScore</th><th>Notes</th><th>Time</th></tr></thead><tbody id="leaderboardBody"></tbody></table>
+    </div>
+  </main>
+</div>
+
+<div class="footer">AFIP v3.0.0 — Acoustic Flatulence Intelligence Platform · 36-Model Ensemble · On-Chain Receipts</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let audioCtx, mediaRecorder, recordedChunks = [], currentMidiUrl = null, currentNotes = [];
+
+function enterApp() {
+  $('landing').style.display = 'none';
+  $('app').classList.add('visible');
+}
+
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
+  document.querySelector(`[data-tab="${name}"]`)?.classList.add('active');
+  $(`tab-${name}`).classList.add('active');
+  if(name === 'history') loadHistory();
+  if(name === 'leaderboard') loadLeaderboard();
+  if(name === 'registry') loadRegistry();
+}
+
+function encodeWav(samples, sr) {
+  const n = samples.length;
+  const buf = new ArrayBuffer(44 + n * 2);
+  const v = new DataView(buf);
+  const ws = (o, s) => { for(let i=0;i<s.length;i++) v.setUint8(o+i, s.charCodeAt(i)); };
+  ws(0,'RIFF'); v.setUint32(4,36+n*2,true); ws(8,'WAVE');
+  ws(12,'fmt '); v.setUint32(16,16,true); v.setUint16(20,1,true); v.setUint16(22,1,true);
+  v.setUint32(24,sr,true); v.setUint32(28,sr*2,true); v.setUint16(32,2,true); v.setUint16(34,16,true);
+  ws(36,'data'); v.setUint32(40,n*2,true);
+  for(let i=0;i<n;i++){ let s=Math.max(-1,Math.min(1,samples[i])); v.setInt16(44+i*2,s<0?s*0x8000:s*0x7FFF,true); }
+  return new Blob([buf],{type:'audio/wav'});
+}
+
+function mixToMono(buf) {
+  const L=buf.getChannelData(0), R=buf.getChannelData(1), out=new Float32Array(L.length);
+  for(let i=0;i<L.length;i++) out[i]=(L[i]+R[i])/2;
+  return out;
+}
+
+async function toggleRecord() {
+  const btn = $('btnRecord');
+  if(btn.classList.contains('rec')) {
+    mediaRecorder.stop(); btn.classList.remove('rec'); btn.textContent = '● Record Audio'; return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({audio:true});
+    audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+    recordedChunks = [];
+    mediaRecorder = new MediaRecorder(stream);
+    mediaRecorder.ondataavailable = e => { if(e.data.size) recordedChunks.push(e.data); };
+    mediaRecorder.onstop = async () => {
+      const blob = new Blob(recordedChunks,{type:'audio/webm'});
+      const ab = await blob.arrayBuffer();
+      const buf = await audioCtx.decodeAudioData(ab);
+      const mono = buf.numberOfChannels>1 ? mixToMono(buf) : buf.getChannelData(0);
+      const wav = encodeWav(mono, buf.sampleRate);
+      handleFile(new File([wav],'recording.wav',{type:'audio/wav'}));
+      stream.getTracks().forEach(t=>t.stop());
+    };
+    mediaRecorder.start();
+    btn.classList.add('rec'); btn.textContent = '■ Stop Recording';
+  } catch(e) { showError('Microphone denied: '+e.message); }
+}
+
+function handleDrop(e) {
+  e.preventDefault();
+  $('dropzone').classList.remove('dragover');
+  if(e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
+}
+
+$('dropzone').addEventListener('click',()=>$('fileIn').click());
+
+function showError(msg) {
+  $('error').textContent = msg;
+  $('error').classList.add('active');
+  setTimeout(()=>$('error').classList.remove('active'), 6000);
+}
+
+async function handleFile(file) {
+  if(!file) return;
+  $('loading').classList.add('active');
+  $('results').style.display = 'none';
+  $('error').classList.remove('active');
+  const form = new FormData(); form.append('file', file);
+  const t0 = performance.now();
+  try {
+    const r = await fetch('/analyze',{method:'POST',body:form});
+    $('latency').textContent = Math.round(performance.now()-t0)+' ms';
+    if(!r.ok) throw new Error(await r.text());
+    renderResults(await r.json());
+  } catch(e) { showError(e.message); }
+  $('loading').classList.remove('active');
+}
+
+async function demoMock() {
+  enterApp();
+  $('loading').classList.add('active');
+  $('results').style.display = 'none';
+  $('error').classList.remove('active');
+  const t0 = performance.now();
+  try {
+    const r = await fetch('/mock');
+    $('latency').textContent = Math.round(performance.now()-t0)+' ms';
+    if(!r.ok) throw new Error(await r.text());
+    renderResults(await r.json());
+  } catch(e) { showError(e.message); }
+  $('loading').classList.remove('active');
+}
+
+function renderResults(d) {
+  $('results').style.display = 'block';
+  $('fartScore').textContent = d.fartscore;
+  $('scoreGauge').style.width = d.fartscore+'%';
+  $('fingerprint').textContent = d.fingerprint;
+  $('duration').textContent = d.duration_sec.toFixed(2)+'s';
+  $('noteCount').textContent = d.note_count;
+  $('currReceipt').textContent = d.receipt.substring(0,28)+'...';
+  $('prevReceipt').textContent = d.prev_receipt ? d.prev_receipt.substring(0,28)+'...' : 'genesis';
+  currentMidiUrl = d.midi_url;
+  currentNotes = d.notes || [];
+  $('midiInfo').textContent = currentMidiUrl ? currentMidiUrl.split('/').pop() : 'No MIDI';
+
+  drawWaveform(d.notes || []);
+  drawPianoRoll(d.notes || []);
+
+  // Model outputs
+  const mdiv = $('modelOutputs'); mdiv.innerHTML = '';
+  if(d.model_outputs) {
+    const byTask = {};
+    d.model_outputs.forEach(o => { (byTask[o.task]=byTask[o.task]||[]).push(o); });
+    Object.entries(byTask).forEach(([task,items]) => {
+      const hdr = document.createElement('div'); hdr.className='collapsible'; hdr.textContent=`${task} (${items.length})`;
+      const body = document.createElement('div'); body.className='collapsible-content';
+      body.innerHTML = items.map(o=>`<div class="model-row"><span class="role">${o.role}</span><span style="color:var(--muted)">${JSON.stringify(o.result).substring(0,90)}</span></div>`).join('');
+      hdr.addEventListener('click',()=>{ hdr.classList.toggle('open'); body.classList.toggle('open'); });
+      mdiv.appendChild(hdr); mdiv.appendChild(body);
+    });
+  }
+
+  // LLM outputs
+  const ldiv = $('llmOutputs'); ldiv.innerHTML = '';
+  if(d.llm_outputs) {
+    d.llm_outputs.forEach(o => {
+      const hdr = document.createElement('div'); hdr.className='collapsible'; hdr.textContent=o.role;
+      const body = document.createElement('div'); body.className='collapsible-content';
+      body.innerHTML = `<b style="color:var(--text)">Prompt:</b> ${o.prompt}<br><b style="color:var(--text)">Result:</b> ${o.result.generated_text||JSON.stringify(o.result)}`;
+      hdr.addEventListener('click',()=>{ hdr.classList.toggle('open'); body.classList.toggle('open'); });
+      ldiv.appendChild(hdr); ldiv.appendChild(body);
+    });
+  }
+}
+
+function drawWaveform(notes) {
+  const c=$('waveCanvas'), ctx=c.getContext('2d');
+  c.width=c.offsetWidth||900; c.height=150;
+  ctx.fillStyle='#05080f'; ctx.fillRect(0,0,c.width,c.height);
+  ctx.strokeStyle='rgba(88,166,255,.4)'; ctx.lineWidth=1; ctx.beginPath();
+  if(!notes.length) { for(let x=0;x<c.width;x++){ctx.moveTo(x,75);ctx.lineTo(x,75+Math.sin(x*.1)*30);} ctx.stroke(); return; }
+  const maxT=Math.max(...notes.map(n=>n.start+(n.duration||n.dur)),1);
+  for(let x=0;x<c.width;x++){
+    const t=(x/c.width)*maxT;
+    const active=notes.some(n=>n.start<=t && t<=n.start+(n.duration||n.dur));
+    const y=active? 30+Math.random()*90 : 75+Math.sin(x*.05)*10;
+    if(x===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+  }
+  ctx.stroke();
+}
+
+function drawPianoRoll(notes) {
+  const c=$('pianoCanvas'), ctx=c.getContext('2d');
+  c.width=c.offsetWidth||900; c.height=150;
+  ctx.fillStyle='#05080f'; ctx.fillRect(0,0,c.width,c.height);
+  if(!notes.length) return;
+  const maxT=Math.max(...notes.map(n=>n.start+(n.duration||n.dur)),1);
+  const minN=Math.min(...notes.map(n=>n.midi||n.note),20);
+  const maxN=Math.max(...notes.map(n=>n.midi||n.note),100);
+  const nRange=maxN-minN+5;
+  notes.forEach(n=>{
+    const x=(n.start/maxT)*c.width;
+    const w=((n.duration||n.dur)/maxT)*c.width;
+    const y=c.height-((n.midi||n.note-minN+2)/nRange)*c.height;
+    const h=c.height/nRange;
+    ctx.fillStyle='#58a6ff'; ctx.globalAlpha=.75;
+    ctx.fillRect(x,y,Math.max(w,2),h);
+    ctx.globalAlpha=1;
+  });
+}
+
+function playMIDI() {
+  if(!currentNotes.length) return;
+  const ctx=new AudioContext();
+  currentNotes.forEach(n=>{
+    const o=ctx.createOscillator(), g=ctx.createGain();
+    o.connect(g); g.connect(ctx.destination);
+    o.type='sine';
+    o.frequency.value=440*Math.pow(2,((n.midi||n.note)-69)/12);
+    g.gain.value=(n.velocity||n.vel||70)/127*.3;
+    o.start(ctx.currentTime+n.start);
+    g.gain.exponentialRampToValueAtTime(.001,ctx.currentTime+n.start+(n.duration||n.dur));
+    o.stop(ctx.currentTime+n.start+(n.duration||n.dur));
+  });
+}
+
+function downloadMIDI() {
+  if(currentMidiUrl) window.location=currentMidiUrl;
+}
+
+async function loadRegistry() {
+  try {
+    const r=await fetch('/registry'); const d=await r.json();
+    $('mlList').innerHTML=d.ml_models.map(m=>`<div class="model-row"><span class="role">${m.role}</span><span style="color:var(--muted)">${m.id}</span></div>`).join('');
+    $('llmList').innerHTML=d.llm_models.map(m=>`<div class="model-row"><span class="role">${m.role}</span><span style="color:var(--muted)">${m.id}</span></div>`).join('');
+  } catch(e){ console.error(e); }
+}
+
+async function loadHistory() {
+  try {
+    const r=await fetch('/history?limit=20'); const d=await r.json();
+    $('historyBody').innerHTML=d.map(row=>`<tr><td>${row.id}</td><td>${row.ts?.slice(0,19)||''}</td><td style="color:var(--accent2);font-weight:700">${row.fartscore}</td><td>${row.note_count}</td><td style="font-size:10px">${row.fingerprint?.slice(0,24)}...</td><td style="font-size:10px">${row.receipt_hash?.slice(0,16)}...</td></tr>`).join('');
+  } catch(e){ console.error(e); }
+}
+
+async function loadLeaderboard() {
+  try {
+    const r=await fetch('/leaderboard'); const d=await r.json();
+    $('leaderboardBody').innerHTML=d.map((row,i)=>`<tr><td style="color:var(--accent);font-weight:700">#${i+1}</td><td style="font-size:10px">${row.fingerprint?.slice(0,28)}...</td><td style="color:var(--accent2);font-weight:700">${row.fartscore}</td><td>${row.note_count}</td><td>${row.ts?.slice(0,19)||''}</td></tr>`).join('');
+  } catch(e){ console.error(e); }
+}
+
+// Auto-enter if hash present
+if(location.hash==='#app') enterApp();
+</script>
+</body>
+</html>
+
+```

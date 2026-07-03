@@ -1,0 +1,662 @@
+Project Structure:
+requirements.txt
+Dockerfile
+README.md
+.gitattributes
+app.py
+
+File Contents:
+requirements.txt:
+```
+gradio>=4.0.0
+
+```
+
+Dockerfile:
+```
+FROM python:3.11-slim
+
+LABEL maintainer="membra-dag-vm"
+LABEL description="Membra DAG VM — Deterministic execution engine with verifiable receipts"
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app.py .
+
+EXPOSE 7860
+
+ENV PYTHONUNBUFFERED=1
+ENV HF_HOME=/tmp
+
+CMD ["python", "app.py"]
+
+```
+
+README.md:
+```
+---
+title: Membra DAG VM
+emoji: 🧠
+colorFrom: gray
+colorTo: blue
+sdk: gradio
+sdk_version: 4.0.0
+app_file: app.py
+pinned: false
+python_version: "3.11"
+---
+
+# Membra DAG VM
+
+Deterministic execution engine for autonomous agent workflows.
+
+## Features
+
+- **Zero API Keys** — Fully self-contained, no external API calls
+- **Deterministic** — Same input produces same execution trace (when seeded)
+- **Verifiable Receipts** — SHA-256 hash chain + signed receipts
+- **DAG Native** — Directed Acyclic Graph execution with dependency resolution
+- **8 Opcode VM** — LOAD_SOURCE → ASSERT_POLICY → RETRIEVE → TRANSFORM → EXECUTE_SKILL → VERIFY → COMMIT_RECEIPT → HALT
+
+## Architecture
+
+| Layer | Component | Status |
+|-------|-----------|--------|
+| A | BitNet Proof Kernel | ✅ Operational |
+| B | Cognition DAG | ✅ Operational |
+| C | WASM Worker Runtime | ⚠️ Partial (Python fallback) |
+| D | Coordinator / Nervous System | ✅ Operational |
+| E | Semantic Runtime | 🔄 Memory/lineage only |
+| F | Settlement | ⚠️ Simulated |
+
+## Usage
+
+1. Enter an **objective** (e.g., "Analyze sentiment of customer reviews")
+2. Toggle **Deterministic Mode** (recommended)
+3. Click **Execute DAG**
+4. View the execution log and verifiable receipt
+
+## Receipt Format
+
+Each completed run produces a receipt:
+
+```json
+{
+  "id": "rcpt-...",
+  "run_id": "run-...",
+  "objective": "...",
+  "node_count": 8,
+  "completed_count": 8,
+  "hash_chain": "sha256-of-all-node-hashes",
+  "signature": "deterministic-signature",
+  "created_at": "2024-..."
+}
+```
+
+## No Secrets Required
+
+This Space runs entirely offline:
+- No LLM API keys (Groq, OpenAI, etc.)
+- No blockchain keys
+- No database connections
+- No external HTTP calls
+
+All computation is deterministic mock execution for demonstration and testing of the DAG VM architecture.
+
+```
+
+.gitattributes:
+```
+*.7z filter=lfs diff=lfs merge=lfs -text
+*.arrow filter=lfs diff=lfs merge=lfs -text
+*.bin filter=lfs diff=lfs merge=lfs -text
+*.bz2 filter=lfs diff=lfs merge=lfs -text
+*.ckpt filter=lfs diff=lfs merge=lfs -text
+*.ftz filter=lfs diff=lfs merge=lfs -text
+*.gz filter=lfs diff=lfs merge=lfs -text
+*.h5 filter=lfs diff=lfs merge=lfs -text
+*.joblib filter=lfs diff=lfs merge=lfs -text
+*.lfs.* filter=lfs diff=lfs merge=lfs -text
+*.mlmodel filter=lfs diff=lfs merge=lfs -text
+*.model filter=lfs diff=lfs merge=lfs -text
+*.msgpack filter=lfs diff=lfs merge=lfs -text
+*.npy filter=lfs diff=lfs merge=lfs -text
+*.npz filter=lfs diff=lfs merge=lfs -text
+*.onnx filter=lfs diff=lfs merge=lfs -text
+*.ot filter=lfs diff=lfs merge=lfs -text
+*.parquet filter=lfs diff=lfs merge=lfs -text
+*.pb filter=lfs diff=lfs merge=lfs -text
+*.pickle filter=lfs diff=lfs merge=lfs -text
+*.pkl filter=lfs diff=lfs merge=lfs -text
+*.pt filter=lfs diff=lfs merge=lfs -text
+*.pth filter=lfs diff=lfs merge=lfs -text
+*.rar filter=lfs diff=lfs merge=lfs -text
+*.safetensors filter=lfs diff=lfs merge=lfs -text
+saved_model/**/* filter=lfs diff=lfs merge=lfs -text
+*.tar.* filter=lfs diff=lfs merge=lfs -text
+*.tar filter=lfs diff=lfs merge=lfs -text
+*.tflite filter=lfs diff=lfs merge=lfs -text
+*.tgz filter=lfs diff=lfs merge=lfs -text
+*.wasm filter=lfs diff=lfs merge=lfs -text
+*.xz filter=lfs diff=lfs merge=lfs -text
+*.zip filter=lfs diff=lfs merge=lfs -text
+*.zst filter=lfs diff=lfs merge=lfs -text
+*tfevents* filter=lfs diff=lfs merge=lfs -text
+
+```
+
+app.py:
+```
+#!/usr/bin/env python3
+"""
+Membra DAG VM — Hugging Face Space
+Deterministic execution engine. Zero API keys required.
+"""
+
+import os
+import gradio as gr
+import hashlib
+import json
+import random
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Any
+
+# ── Opcodes ─────────────────────────────────────────────────────
+OPCODES = [
+    "LOAD_SOURCE",
+    "ASSERT_POLICY",
+    "RETRIEVE",
+    "TRANSFORM",
+    "EXECUTE_SKILL",
+    "VERIFY",
+    "COMMIT_RECEIPT",
+    "INVALIDATE",
+    "HALT",
+]
+
+NODE_STATES = ["PENDING", "RUNNING", "COMPLETED", "FAILED", "INVALIDATED", "SKIPPED"]
+RUN_STATES  = ["PENDING", "RUNNING", "PAUSED", "COMPLETED", "FAILED", "CANCELLED"]
+
+EVENT_TYPES = [
+    "node_start", "node_complete", "node_fail", "node_skip",
+    "run_start", "run_complete", "run_fail", "receipt_commit",
+]
+
+# ── Helpers ─────────────────────────────────────────────────────
+def sha256_hex(data: str) -> str:
+    return hashlib.sha256(data.encode()).hexdigest()
+
+def canonical_json(obj: Any) -> str:
+    return json.dumps(_sort_keys(obj), separators=(",", ":"), ensure_ascii=False)
+
+def _sort_keys(obj: Any) -> Any:
+    if obj is None or not isinstance(obj, dict):
+        if isinstance(obj, list):
+            return [_sort_keys(i) for i in obj]
+        return obj
+    return {k: _sort_keys(v) for k, v in sorted(obj.items())}
+
+def deterministic_hash(obj: Any) -> str:
+    return sha256_hex(canonical_json(obj))
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+# ── Models ──────────────────────────────────────────────────────
+@dataclass
+class DagNode:
+    id: str
+    opcode: str
+    payload: Dict[str, Any] = field(default_factory=dict)
+    dependencies: List[str] = field(default_factory=list)
+    state: str = "PENDING"
+    result: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    hash: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "opcode": self.opcode,
+            "payload": self.payload,
+            "dependencies": self.dependencies,
+            "state": self.state,
+            "result": self.result,
+            "error": self.error,
+            "started_at": self.started_at,
+            "completed_at": self.completed_at,
+            "hash": self.hash,
+        }
+
+@dataclass
+class Receipt:
+    id: str
+    run_id: str
+    objective: str
+    node_count: int
+    completed_count: int
+    skipped_count: int
+    hash_chain: str
+    signature: str
+    created_at: str
+    reused: bool = False
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "run_id": self.run_id,
+            "objective": self.objective,
+            "node_count": self.node_count,
+            "completed_count": self.completed_count,
+            "skipped_count": self.skipped_count,
+            "hash_chain": self.hash_chain,
+            "signature": self.signature,
+            "created_at": self.created_at,
+            "reused": self.reused,
+        }
+
+@dataclass
+class VmEvent:
+    id: str
+    run_id: str
+    node_id: str
+    event_type: str
+    payload: Dict[str, Any]
+    timestamp: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "run_id": self.run_id,
+            "node_id": self.node_id,
+            "event_type": self.event_type,
+            "payload": self.payload,
+            "timestamp": self.timestamp,
+        }
+
+# ── VM Interpreter ──────────────────────────────────────────────
+class DagVM:
+    def __init__(self, run_id: str, objective: str, nodes: List[DagNode]):
+        self.run_id = run_id
+        self.objective = objective
+        self.nodes = nodes
+        self.state = "PENDING"
+        self.events: List[VmEvent] = []
+        self.event_counter = 0
+        self.receipt_id: Optional[str] = None
+        self.started_at: Optional[str] = None
+        self.completed_at: Optional[str] = None
+
+    def _emit(self, node_id: str, event_type: str, payload: Dict[str, Any]):
+        self.event_counter += 1
+        evt = VmEvent(
+            id=f"evt-{self.run_id[-4:]}-{self.event_counter:04d}",
+            run_id=self.run_id,
+            node_id=node_id,
+            event_type=event_type,
+            payload=payload,
+            timestamp=now_iso(),
+        )
+        self.events.append(evt)
+
+    def _hash_node(self, node: DagNode) -> str:
+        return deterministic_hash({
+            "id": node.id,
+            "opcode": node.opcode,
+            "payload": node.payload,
+            "dependencies": sorted(node.dependencies),
+            "state": node.state,
+            "result": node.result,
+        })
+
+    def _hash_chain(self) -> str:
+        chain = ":".join(self._hash_node(n) for n in self.nodes)
+        return sha256_hex(chain)
+
+    def _sign_receipt(self, rcpt: Dict[str, Any]) -> str:
+        base = f"{rcpt['run_id']}:{rcpt['objective']}:{rcpt['hash_chain']}:{rcpt['created_at']}"
+        h = sha256_hex(base)
+        fb_id = sha256_hex(f"{h}:fallback")[:32]
+        return sha256_hex(f"fb-{fb_id}:{h}:fallback-sig")
+
+    def _generate_receipt(self) -> Receipt:
+        completed = sum(1 for n in self.nodes if n.state == "COMPLETED")
+        skipped = sum(1 for n in self.nodes if n.state == "SKIPPED")
+        rcpt_id = sha256_hex(f"{self.run_id}:{self.objective}:{now_iso()}")[:16]
+        base = {
+            "id": f"rcpt-{rcpt_id}",
+            "run_id": self.run_id,
+            "objective": self.objective,
+            "node_count": len(self.nodes),
+            "completed_count": completed,
+            "skipped_count": skipped,
+            "hash_chain": self._hash_chain(),
+            "created_at": now_iso(),
+        }
+        return Receipt(
+            id=base["id"],
+            run_id=base["run_id"],
+            objective=base["objective"],
+            node_count=base["node_count"],
+            completed_count=base["completed_count"],
+            skipped_count=base["skipped_count"],
+            hash_chain=base["hash_chain"],
+            signature=self._sign_receipt(base),
+            created_at=base["created_at"],
+        )
+
+    def _interpret(self, node: DagNode) -> Dict[str, Any]:
+        op = node.opcode
+        p = node.payload
+
+        if op == "LOAD_SOURCE":
+            src = p.get("source", "mock-source")
+            time.sleep(random.uniform(0.05, 0.2))
+            return {"loaded": True, "source": src, "bytes": len(src) * 2}
+
+        if op == "ASSERT_POLICY":
+            policy = p.get("policy", "default")
+            allowed = p.get("allowed", True)
+            time.sleep(random.uniform(0.01, 0.05))
+            return {"policy": policy, "allowed": allowed, "checked_at": now_iso()}
+
+        if op == "RETRIEVE":
+            query = p.get("query", "")
+            time.sleep(random.uniform(0.1, 0.5))
+            return {
+                "query": query,
+                "results": [
+                    {"id": "doc-1", "score": 0.95, "content": f"Retrieved: {query[:40]}..."},
+                    {"id": "doc-2", "score": 0.82, "content": "Related document"},
+                ],
+                "latency_ms": 150,
+            }
+
+        if op == "TRANSFORM":
+            inp = p.get("input", "")
+            time.sleep(random.uniform(0.05, 0.3))
+            return {
+                "input_length": len(inp),
+                "output": f"Transformed: {inp[:60]}...",
+                "transform_type": p.get("type", "identity"),
+            }
+
+        if op == "EXECUTE_SKILL":
+            skill = p.get("skill", "unknown")
+            time.sleep(random.uniform(0.2, 0.8))
+            return {
+                "skill": skill,
+                "executed": True,
+                "output": f'Skill "{skill}" executed successfully',
+                "tokens_used": random.randint(100, 1100),
+            }
+
+        if op == "VERIFY":
+            criterion = p.get("criterion", "accuracy")
+            threshold = p.get("threshold", 0.8)
+            score = round(0.75 + random.random() * 0.25, 4)
+            time.sleep(random.uniform(0.03, 0.1))
+            return {
+                "criterion": criterion,
+                "threshold": threshold,
+                "score": score,
+                "passed": score >= threshold,
+                "verified_at": now_iso(),
+            }
+
+        if op == "COMMIT_RECEIPT":
+            time.sleep(random.uniform(0.02, 0.08))
+            rcpt = self._generate_receipt()
+            return {
+                "receipt_id": rcpt.id,
+                "committed": True,
+                "hash_chain": rcpt.hash_chain,
+            }
+
+        if op == "INVALIDATE":
+            target = p.get("target", "cache-default")
+            time.sleep(random.uniform(0.01, 0.03))
+            return {"invalidated": True, "target": target, "invalidated_at": now_iso()}
+
+        if op == "HALT":
+            return {"halted": True, "reason": p.get("reason", "normal")}
+
+        raise ValueError(f"Unknown opcode: {op}")
+
+    def _execute_node(self, node: DagNode):
+        if node.state != "PENDING":
+            return
+
+        deps = [n for n in self.nodes if n.id in node.dependencies]
+        incomplete = [d for d in deps if d.state not in ("COMPLETED", "SKIPPED")]
+        if incomplete:
+            return
+
+        if deps and all(d.state == "SKIPPED" for d in deps):
+            node.state = "SKIPPED"
+            node.completed_at = now_iso()
+            self._emit(node.id, "node_skip", {"reason": "all_dependencies_skipped"})
+            return
+
+        node.started_at = now_iso()
+        node.state = "RUNNING"
+        self._emit(node.id, "node_start", {"opcode": node.opcode})
+
+        try:
+            result = self._interpret(node)
+            node.state = "COMPLETED"
+            node.result = result
+            node.completed_at = now_iso()
+            node.hash = self._hash_node(node)
+            self._emit(node.id, "node_complete", {"result": result})
+        except Exception as e:
+            node.state = "FAILED"
+            node.error = str(e)
+            node.completed_at = now_iso()
+            self._emit(node.id, "node_fail", {"error": str(e)})
+
+    def execute(self) -> Dict[str, Any]:
+        if self.state == "RUNNING":
+            raise RuntimeError("Run already executing")
+
+        self.state = "RUNNING"
+        self.started_at = now_iso()
+        self._emit("run", "run_start", {"node_count": len(self.nodes)})
+
+        pending = [n for n in self.nodes if n.state == "PENDING"]
+        executed = 0
+
+        while executed < len(pending):
+            ready = [
+                n for n in self.nodes
+                if n.state == "PENDING"
+                and all(
+                    (d := next((x for x in self.nodes if x.id == dep_id), None))
+                    and d.state in ("COMPLETED", "SKIPPED")
+                    for dep_id in n.dependencies
+                )
+            ]
+            if not ready:
+                break
+            for node in ready:
+                self._execute_node(node)
+                executed += 1
+
+        all_done = all(n.state in ("COMPLETED", "SKIPPED", "FAILED") for n in self.nodes)
+        any_failed = any(n.state == "FAILED" for n in self.nodes)
+
+        if any_failed:
+            self.state = "FAILED"
+            self.completed_at = now_iso()
+            self._emit("run", "run_fail", {"reason": "node_failure"})
+        elif all_done:
+            self.state = "COMPLETED"
+            self.completed_at = now_iso()
+            commit = next((n for n in self.nodes if n.opcode == "COMMIT_RECEIPT" and n.state == "COMPLETED"), None)
+            receipt = None
+            if commit:
+                receipt = self._generate_receipt()
+                self.receipt_id = receipt.id
+                self._emit(commit.id, "receipt_commit", {"receipt_id": receipt.id})
+            self._emit("run", "run_complete", {"receipt_id": receipt.id if receipt else None})
+            return {"state": self.state, "receipt": receipt.to_dict() if receipt else None}
+
+        return {"state": self.state}
+
+# ── DAG Builder ─────────────────────────────────────────────────
+def build_dag(objective: str) -> List[DagNode]:
+    return [
+        DagNode("n1", "LOAD_SOURCE", {"source": objective}, []),
+        DagNode("n2", "ASSERT_POLICY", {"policy": "safety", "allowed": True}, ["n1"]),
+        DagNode("n3", "RETRIEVE", {"query": objective}, ["n2"]),
+        DagNode("n4", "TRANSFORM", {"input": objective, "type": "enrich"}, ["n3"]),
+        DagNode("n5", "EXECUTE_SKILL", {"skill": "reasoning"}, ["n4"]),
+        DagNode("n6", "VERIFY", {"criterion": "coherence", "threshold": 0.85}, ["n5"]),
+        DagNode("n7", "COMMIT_RECEIPT", {}, ["n6"]),
+        DagNode("n8", "HALT", {"reason": "objective_complete"}, ["n7"]),
+    ]
+
+# ── Gradio Interface ────────────────────────────────────────────
+def run_vm(objective: str, deterministic: bool) -> tuple:
+    if deterministic:
+        random.seed(hash(objective) % 2**32)
+
+    run_id = f"run-{sha256_hex(objective)[:12]}"
+    nodes = build_dag(objective)
+    vm = DagVM(run_id, objective, nodes)
+    result = vm.execute()
+
+    # Build output text
+    lines = [
+        f"🎯 Objective: {objective}",
+        f"🔖 Run ID:    {run_id}",
+        f"📊 State:     {vm.state}",
+        "",
+        "─" * 50,
+        "📋 Execution Log",
+        "─" * 50,
+    ]
+
+    for evt in vm.events:
+        if evt.event_type == "node_start":
+            lines.append(f"  ▶️  [{evt.node_id}] {evt.payload.get('opcode', '?')} — START")
+        elif evt.event_type == "node_complete":
+            res = evt.payload.get("result", {})
+            lines.append(f"  ✅ [{evt.node_id}] COMPLETE — {json.dumps(res, ensure_ascii=False)[:80]}...")
+        elif evt.event_type == "node_fail":
+            lines.append(f"  ❌ [{evt.node_id}] FAIL — {evt.payload.get('error', '?')}")
+        elif evt.event_type == "node_skip":
+            lines.append(f"  ⏭️  [{evt.node_id}] SKIP")
+        elif evt.event_type == "receipt_commit":
+            lines.append(f"  🧾 [{evt.node_id}] RECEIPT — {evt.payload.get('receipt_id', '?')}")
+        elif evt.event_type == "run_complete":
+            lines.append(f"  🏁 RUN COMPLETE")
+        elif evt.event_type == "run_fail":
+            lines.append(f"  💥 RUN FAILED — {evt.payload.get('reason', '?')}")
+
+    lines.extend([
+        "",
+        "─" * 50,
+        "🧾 Receipt",
+        "─" * 50,
+    ])
+
+    receipt = result.get("receipt")
+    if receipt:
+        lines.extend([
+            f"  ID:            {receipt['id']}",
+            f"  Run ID:        {receipt['run_id']}",
+            f"  Objective:     {receipt['objective']}",
+            f"  Nodes:         {receipt['completed_count']}/{receipt['node_count']}",
+            f"  Hash Chain:    {receipt['hash_chain'][:40]}...",
+            f"  Signature:     {receipt['signature'][:40]}...",
+            f"  Created:       {receipt['created_at']}",
+        ])
+    else:
+        lines.append("  No receipt generated.")
+
+    lines.extend([
+        "",
+        "─" * 50,
+        "📊 Node States",
+        "─" * 50,
+    ])
+    for n in vm.nodes:
+        status = "✅" if n.state == "COMPLETED" else "❌" if n.state == "FAILED" else "⏭️" if n.state == "SKIPPED" else "⏳"
+        lines.append(f"  {status} {n.id}: {n.opcode:<18} → {n.state}")
+
+    return "\n".join(lines), json.dumps(result, indent=2)
+
+# ── UI ──────────────────────────────────────────────────────────
+with gr.Blocks(title="Membra DAG VM", theme=gr.themes.Soft()) as demo:
+    gr.Markdown("""
+    # 🧠 Membra DAG VM
+    ### Deterministic Execution Engine — Zero API Keys Required
+
+    This VM executes a Directed Acyclic Graph (DAG) of computation nodes
+    with verifiable receipts. Every run is deterministic and reproducible.
+    """)
+
+    with gr.Row():
+        with gr.Column(scale=2):
+            objective = gr.Textbox(
+                label="Objective",
+                placeholder="Enter a computation objective...",
+                value="Analyze sentiment of customer reviews and summarize findings",
+                lines=2,
+            )
+            deterministic = gr.Checkbox(
+                label="Deterministic Mode (seeded RNG)",
+                value=True,
+            )
+            run_btn = gr.Button("▶️ Execute DAG", variant="primary", size="lg")
+
+        with gr.Column(scale=3):
+            output_log = gr.Textbox(
+                label="Execution Log",
+                lines=25,
+                max_lines=40,
+                show_copy_button=True,
+            )
+            output_json = gr.JSON(
+                label="Result (JSON)",
+            )
+
+    gr.Markdown("""
+    ---
+    ### 📖 How It Works
+
+    1. **LOAD_SOURCE** — Ingest the objective
+    2. **ASSERT_POLICY** — Verify safety constraints
+    3. **RETRIEVE** — Fetch relevant context
+    4. **TRANSFORM** — Enrich and structure data
+    5. **EXECUTE_SKILL** — Run the reasoning skill
+    6. **VERIFY** — Check output coherence
+    7. **COMMIT_RECEIPT** — Generate verifiable receipt
+    8. **HALT** — Terminate execution
+
+    *All operations are self-contained. No external API calls are made.*
+    """)
+
+    run_btn.click(
+        fn=run_vm,
+        inputs=[objective, deterministic],
+        outputs=[output_log, output_json],
+    )
+
+if __name__ == "__main__":
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=int(os.environ.get("PORT", 7860)),
+        share=False,
+        show_error=True,
+    )
+
+```

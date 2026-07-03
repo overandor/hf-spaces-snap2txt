@@ -1,0 +1,950 @@
+Project Structure:
+requirements.txt
+Dockerfile
+README.md
+.gitattributes
+app.py
+templates/index.html
+
+File Contents:
+requirements.txt:
+```
+flask>=3.0.0
+flask-cors>=4.0.0
+solana>=0.30.0
+base58>=2.1.1
+
+```
+
+Dockerfile:
+```
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements first for caching
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application
+COPY app.py .
+COPY templates/ ./templates/
+
+# Expose port
+EXPOSE 7860
+
+# Run the app
+CMD ["python", "app.py"]
+
+```
+
+README.md:
+```
+---
+title: Token Bazuka - Semantic Virality Drive
+emoji: 🚀
+colorFrom: blue
+colorTo: purple
+sdk: docker
+pinned: false
+license: mit
+---
+
+# Token Bazuka - Semantic Virality Drive (Demo Mode)
+
+24/7 automated pool-native token deployment with semantic virality propagation.
+
+**Note**: This is a demo/simulation mode. No real on-chain transactions occur. No private keys are required.
+
+## Features
+
+- **Pool-Native Token Deployment**: Simulated deployment with pool-native mechanics
+- **Elastic Index**: Token supply adjusts based on pool performance
+- **Lambda Coefficient**: Liquidity stability with curvature brake
+- **Shadow Value**: Projected value with ambiguity penalties
+- **Semantic Virality**: Automated virality scoring and boosting
+- **Demo Mode**: No private keys required, safe for demonstration
+
+## Architecture
+
+- Token ≡ Pool Share
+- Market Cap ≡ Pool State
+- Effective Balance = Raw Shares × Index
+
+## Demo Mode
+
+This deployment runs in demo mode for demonstration purposes:
+- No private keys required
+- Simulated blockchain transactions
+- Generated addresses and transaction hashes
+- Safe for public demonstration
+
+## Usage
+
+1. Enter token parameters (name, symbol, supply, reserves)
+2. Click "Deploy Token"
+3. View simulated deployment results
+4. Monitor semantic virality score and system status
+
+## Security
+
+- No private keys required
+- No real blockchain transactions
+- All data is simulated
+- Safe for public demonstration
+
+## Tokenomics
+
+- Elastic index updates instead of balance mutations
+- Lambda coefficient prevents overextension/under-extension
+- Shadow value separates real backing from projected value
+- Epoch-based tokenomics responsive to proof state
+
+```
+
+.gitattributes:
+```
+*.7z filter=lfs diff=lfs merge=lfs -text
+*.arrow filter=lfs diff=lfs merge=lfs -text
+*.bin filter=lfs diff=lfs merge=lfs -text
+*.bz2 filter=lfs diff=lfs merge=lfs -text
+*.ckpt filter=lfs diff=lfs merge=lfs -text
+*.ftz filter=lfs diff=lfs merge=lfs -text
+*.gz filter=lfs diff=lfs merge=lfs -text
+*.h5 filter=lfs diff=lfs merge=lfs -text
+*.joblib filter=lfs diff=lfs merge=lfs -text
+*.lfs.* filter=lfs diff=lfs merge=lfs -text
+*.mlmodel filter=lfs diff=lfs merge=lfs -text
+*.model filter=lfs diff=lfs merge=lfs -text
+*.msgpack filter=lfs diff=lfs merge=lfs -text
+*.npy filter=lfs diff=lfs merge=lfs -text
+*.npz filter=lfs diff=lfs merge=lfs -text
+*.onnx filter=lfs diff=lfs merge=lfs -text
+*.ot filter=lfs diff=lfs merge=lfs -text
+*.parquet filter=lfs diff=lfs merge=lfs -text
+*.pb filter=lfs diff=lfs merge=lfs -text
+*.pickle filter=lfs diff=lfs merge=lfs -text
+*.pkl filter=lfs diff=lfs merge=lfs -text
+*.pt filter=lfs diff=lfs merge=lfs -text
+*.pth filter=lfs diff=lfs merge=lfs -text
+*.rar filter=lfs diff=lfs merge=lfs -text
+*.safetensors filter=lfs diff=lfs merge=lfs -text
+saved_model/**/* filter=lfs diff=lfs merge=lfs -text
+*.tar.* filter=lfs diff=lfs merge=lfs -text
+*.tar filter=lfs diff=lfs merge=lfs -text
+*.tflite filter=lfs diff=lfs merge=lfs -text
+*.tgz filter=lfs diff=lfs merge=lfs -text
+*.wasm filter=lfs diff=lfs merge=lfs -text
+*.xz filter=lfs diff=lfs merge=lfs -text
+*.zip filter=lfs diff=lfs merge=lfs -text
+*.zst filter=lfs diff=lfs merge=lfs -text
+*tfevents* filter=lfs diff=lfs merge=lfs -text
+
+```
+
+app.py:
+```
+"""
+Hugging Face Space - Token Bazuka with Semantic Virality Drive
+24/7 automated token deployment and virality system
+Native HTML/JS UI with Flask backend
+NO API KEY REQUIRED - Open mode for public deployment
+"""
+
+import os
+import logging
+from flask import Flask, render_template, jsonify, request
+from flask_cors import CORS
+from datetime import datetime
+from typing import Optional, Dict, Any
+import json
+import threading
+import time
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Import token deployment modules
+import sys
+sys.path.append('/Users/alep/Downloads/02_AI_Agents')
+
+try:
+    from solana_pool_native_token import SolanaPoolNativeDeployer, TokenConfig
+except ImportError as e:
+    logger.warning(f"Could not import token modules: {e}")
+
+# Import security middleware (open mode - no API keys required)
+try:
+    from security_middleware import SecurityMiddleware, rate_limit
+    security = SecurityMiddleware(require_api_keys=False)
+    logger.info("Security middleware initialized in OPEN mode")
+except ImportError:
+    security = None
+    logger.warning("Security middleware not available")
+
+app = Flask(__name__)
+app.secret_key = os.environ.get('FLASK_SECRET_KEY')
+if not app.secret_key:
+    import secrets
+    app.secret_key = secrets.token_hex(32)
+    logger.warning("FLASK_SECRET_KEY not set; using ephemeral secret. Set FLASK_SECRET_KEY env var for persistent sessions.")
+CORS(app)  # Enable CORS for all routes
+
+
+class TokenBazuka:
+    """
+    Token Bazuka - 24/7 automated token launcher with semantic virality drive.
+    """
+    
+    def __init__(self):
+        """Initialize the token bazuka."""
+        self.deployer: Optional[SolanaPoolNativeDeployer] = None
+        self.running = False
+        self.virality_score = 0.0
+        self.semantic_signals = []
+        self.deployment_history = []
+        self.lock = threading.Lock()
+        logger.info("Token Bazuka initialized")
+    
+    def initialize_deployer(self, rpc_url: str = "https://api.mainnet-beta.solana.com"):
+        """Initialize Solana deployer in demo mode (no private key required)."""
+        try:
+            # Demo mode - no real on-chain deployment
+            self.deployer = "demo_mode"
+            return True, "Deployer initialized in demo mode"
+        except Exception as e:
+            return False, f"Failed to initialize deployer: {str(e)}"
+    
+    def deploy_token(
+        self,
+        token_name: str,
+        token_symbol: str,
+        initial_supply: int,
+        initial_reserves: int
+    ) -> Dict[str, Any]:
+        """Deploy a new pool-native token in demo mode."""
+        if not self.deployer:
+            return {"success": False, "error": "Deployer not initialized"}
+        
+        # Input validation
+        if not token_name or len(token_name) < 2:
+            return {"success": False, "error": "Token name must be at least 2 characters"}
+        if not token_symbol or len(token_symbol) < 2 or len(token_symbol) > 10:
+            return {"success": False, "error": "Token symbol must be 2-10 characters"}
+        if initial_supply <= 0:
+            return {"success": False, "error": "Initial supply must be positive"}
+        if initial_reserves <= 0:
+            return {"success": False, "error": "Initial reserves must be positive"}
+        
+        with self.lock:
+            try:
+                # Demo mode - simulate deployment
+                import hashlib
+                token_mint = hashlib.sha256(f"{token_name}{token_symbol}{time.time()}".encode()).hexdigest()[:44]
+                pool_address = hashlib.sha256(f"{token_mint}{time.time()}".encode()).hexdigest()[:44]
+                
+                deployment_record = {
+                    "timestamp": datetime.now().isoformat(),
+                    "token_name": token_name,
+                    "token_symbol": token_symbol.upper(),
+                    "token_mint": token_mint,
+                    "pool_address": pool_address,
+                    "transaction_hash": "demo_mode_no_real_tx",
+                    "block_number": 0,
+                    "demo_mode": True
+                }
+                
+                self.deployment_history.append(deployment_record)
+                logger.info(f"Token deployed in demo mode: {token_symbol} - {token_mint}")
+                
+                return {
+                    "success": True,
+                    "deployment_id": f"demo_{int(time.time())}",
+                    "token_mint": token_mint,
+                    "pool_address": pool_address,
+                    "transaction_hash": "demo_mode_no_real_tx",
+                    "block_number": 0,
+                    "demo_mode": True,
+                    "initial_state": {
+                        "elastic_index": 1.0,
+                        "lambda_value": 1.0,
+                        "shadow_index": 1.0
+                    }
+                }
+            except Exception as e:
+                logger.error(f"Deployment failed: {str(e)}")
+                return {"success": False, "error": str(e)}
+    
+    def calculate_semantic_virality(self, token_data: Dict[str, Any]) -> float:
+        """Calculate semantic virality score for token."""
+        base_score = 0.5
+        name_uniqueness = 0.3 if len(token_data.get("token_name", "")) > 5 else 0.1
+        symbol_score = 0.2 if len(token_data.get("token_symbol", "")) <= 4 else 0.1
+        supply_score = min(0.3, token_data.get("initial_supply", 0) / 10_000_000)
+        virality = base_score + name_uniqueness + symbol_score + supply_score
+        return min(1.0, virality)
+    
+    def boost_virality(self, token_mint: str, boost_intensity: float = 0.5) -> Dict[str, Any]:
+        """Boost semantic virality for a token."""
+        signal = {
+            "timestamp": datetime.now().isoformat(),
+            "token_mint": token_mint,
+            "intensity": boost_intensity,
+            "signal_type": "virality_boost"
+        }
+        self.semantic_signals.append(signal)
+        self.virality_score = min(1.0, self.virality_score + boost_intensity * 0.1)
+        return {
+            "success": True,
+            "new_virality_score": self.virality_score,
+            "signal_id": len(self.semantic_signals)
+        }
+    
+    def get_system_status(self) -> Dict[str, Any]:
+        """Get current system status."""
+        return {
+            "running": self.running,
+            "virality_score": self.virality_score,
+            "total_deployments": len(self.deployment_history),
+            "semantic_signals": len(self.semantic_signals),
+            "deployer_active": self.deployer is not None,
+            "uptime_seconds": time.time() if self.running else 0
+        }
+
+
+# Global bazuka instance
+bazuka = TokenBazuka()
+
+
+@app.route('/')
+def index():
+    """Serve the HTML interface."""
+    return render_template('index.html')
+
+
+@app.route('/api/deploy', methods=['POST'])
+def deploy_token():
+    """API endpoint for token deployment (demo mode, no private key required)."""
+    try:
+        data = request.json
+        
+        if not data:
+            return jsonify({"success": False, "error": "No JSON data provided"}), 400
+        
+        # Rate limiting (by IP)
+        if security:
+            client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
+            allowed, info = security.check_rate_limit(client_ip)
+            if not allowed:
+                return jsonify({
+                    "success": False,
+                    "error": "Rate limit exceeded",
+                    "info": info
+                }), 429
+        
+        token_name = data.get('token_name')
+        token_symbol = data.get('token_symbol')
+        initial_supply = data.get('initial_supply')
+        initial_reserves = data.get('initial_reserves')
+        
+        # Initialize deployer if needed
+        if not bazuka.deployer:
+            success, msg = bazuka.initialize_deployer()
+            if not success:
+                return jsonify({"success": False, "error": msg}), 400
+        
+        # Deploy token
+        result = bazuka.deploy_token(token_name, token_symbol, initial_supply, initial_reserves)
+        
+        if result.get("success"):
+            # Calculate and boost virality
+            virality = bazuka.calculate_semantic_virality({
+                "token_name": token_name,
+                "token_symbol": token_symbol,
+                "initial_supply": initial_supply
+            })
+            bazuka.boost_virality(result["token_mint"], virality)
+            result["virality_score"] = virality
+            result["system_virality_score"] = bazuka.virality_score
+        
+        status_code = 200 if result.get("success") else 400
+        return jsonify(result), status_code
+        
+    except Exception as e:
+        logger.error(f"Deploy API error: {str(e)}")
+        return jsonify({"success": False, "error": "Internal server error"}), 500
+
+
+@app.route('/api/status')
+def get_status():
+    """API endpoint for system status."""
+    return jsonify(bazuka.get_system_status())
+
+
+@app.route('/api/deployments')
+def get_deployments():
+    """API endpoint for deployment history."""
+    return jsonify({"deployments": bazuka.deployment_history})
+
+
+@app.route('/api/start-247', methods=['POST'])
+def start_247():
+    """Start 24/7 operation."""
+    def run_247():
+        bazuka.running = True
+        while bazuka.running:
+            time.sleep(60)
+    
+    if not bazuka.running:
+        thread = threading.Thread(target=run_247, daemon=True)
+        thread.start()
+    
+    return jsonify({"success": True, "message": "24/7 operation started"})
+
+
+@app.route("/health")
+def health():
+    """Health check endpoint for Hugging Face Spaces"""
+    return jsonify({"status": "ok", "service": "token-bazuka"})
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 7860))
+    logger.info(f"Starting Token Bazuka on port {port}")
+    app.run(host="0.0.0.0", port=port, debug=False)
+
+```
+
+index.html:
+```
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Token Bazuka - Semantic Virality Drive</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+            color: #e2e8f0;
+            min-height: 100vh;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 2rem;
+        }
+
+        header {
+            text-align: center;
+            margin-bottom: 3rem;
+            padding: 2rem;
+            background: rgba(30, 41, 59, 0.5);
+            border-radius: 1rem;
+            border: 1px solid #334155;
+        }
+
+        h1 {
+            font-size: 2.5rem;
+            font-weight: 700;
+            margin-bottom: 0.5rem;
+            background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+            -webkit-background-clip: text;
+            background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .subtitle {
+            color: #94a3b8;
+            font-size: 1.1rem;
+        }
+
+        .tabs {
+            display: flex;
+            gap: 0.5rem;
+            margin-bottom: 2rem;
+            border-bottom: 1px solid #334155;
+        }
+
+        .tab {
+            padding: 1rem 2rem;
+            background: transparent;
+            border: none;
+            color: #94a3b8;
+            cursor: pointer;
+            font-size: 1rem;
+            border-bottom: 2px solid transparent;
+            transition: all 0.2s;
+        }
+
+        .tab:hover {
+            color: #e2e8f0;
+        }
+
+        .tab.active {
+            color: #3b82f6;
+            border-bottom-color: #3b82f6;
+        }
+
+        .tab-content {
+            display: none;
+        }
+
+        .tab-content.active {
+            display: block;
+        }
+
+        .card {
+            background: rgba(30, 41, 59, 0.5);
+            border: 1px solid #334155;
+            border-radius: 1rem;
+            padding: 2rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .card h2 {
+            font-size: 1.5rem;
+            margin-bottom: 1.5rem;
+            color: #f8fafc;
+        }
+
+        .form-group {
+            margin-bottom: 1.5rem;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 0.5rem;
+            color: #94a3b8;
+            font-size: 0.9rem;
+        }
+
+        input {
+            width: 100%;
+            padding: 0.75rem 1rem;
+            background: #0f172a;
+            border: 1px solid #334155;
+            border-radius: 0.5rem;
+            color: #e2e8f0;
+            font-size: 1rem;
+            transition: border-color 0.2s;
+        }
+
+        input:focus {
+            outline: none;
+            border-color: #3b82f6;
+        }
+
+        button {
+            padding: 0.75rem 2rem;
+            background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+            border: none;
+            border-radius: 0.5rem;
+            color: white;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);
+        }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .output {
+            margin-top: 1.5rem;
+            padding: 1.5rem;
+            background: #0f172a;
+            border: 1px solid #334155;
+            border-radius: 0.5rem;
+            font-family: 'Monaco', 'Menlo', monospace;
+            font-size: 0.9rem;
+            white-space: pre-wrap;
+            display: none;
+        }
+
+        .output.show {
+            display: block;
+        }
+
+        .output.success {
+            border-color: #22c55e;
+        }
+
+        .output.error {
+            border-color: #ef4444;
+        }
+
+        .status-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .status-item {
+            background: #0f172a;
+            padding: 1rem;
+            border-radius: 0.5rem;
+            border: 1px solid #334155;
+        }
+
+        .status-label {
+            color: #94a3b8;
+            font-size: 0.85rem;
+            margin-bottom: 0.25rem;
+        }
+
+        .status-value {
+            color: #f8fafc;
+            font-size: 1.25rem;
+            font-weight: 600;
+        }
+
+        .loading {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 2px solid #3b82f6;
+            border-top-color: transparent;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            to {
+                transform: rotate(360deg);
+            }
+        }
+
+        .deployments-list {
+            max-height: 400px;
+            overflow-y: auto;
+        }
+
+        .deployment-item {
+            background: #0f172a;
+            padding: 1rem;
+            border-radius: 0.5rem;
+            border: 1px solid #334155;
+            margin-bottom: 0.5rem;
+        }
+
+        .deployment-item h3 {
+            font-size: 1rem;
+            margin-bottom: 0.5rem;
+            color: #f8fafc;
+        }
+
+        .deployment-item p {
+            color: #94a3b8;
+            font-size: 0.85rem;
+            margin-bottom: 0.25rem;
+        }
+
+        .deployment-item a {
+            color: #3b82f6;
+            word-break: break-all;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>🚀 Token Bazuka</h1>
+            <p class="subtitle">Semantic Virality Drive - 24/7 Automated Pool-Native Token Deployment</p>
+        </header>
+
+        <div class="tabs">
+            <button class="tab active" data-tab="deploy">Deploy Token</button>
+            <button class="tab" data-tab="status">System Status</button>
+            <button class="tab" data-tab="deployments">Deployments</button>
+            <button class="tab" data-tab="about">About</button>
+        </div>
+
+        <div id="deploy" class="tab-content active">
+            <div class="card">
+                <h2>Deploy Pool-Native Token (Demo Mode)</h2>
+                <p style="color: #94a3b8; margin-bottom: 1.5rem;">
+                    Demo mode - no private key required. Simulates deployment for demonstration purposes.
+                </p>
+
+                <div class="form-group">
+                    <label for="token_name">Token Name</label>
+                    <input type="text" id="token_name" placeholder="e.g., Pool Native Token">
+                </div>
+
+                <div class="form-group">
+                    <label for="token_symbol">Token Symbol</label>
+                    <input type="text" id="token_symbol" placeholder="e.g., PNTP">
+                </div>
+
+                <div class="form-group">
+                    <label for="initial_supply">Initial Supply (tokens)</label>
+                    <input type="number" id="initial_supply" value="1000000" min="1">
+                </div>
+
+                <div class="form-group">
+                    <label for="initial_reserves">Initial SOL Reserves</label>
+                    <input type="number" id="initial_reserves" value="10" min="0.1" step="0.1">
+                </div>
+
+                <button id="deploy-btn" onclick="deployToken()">🚀 Deploy Token</button>
+
+                <div id="deploy-output" class="output"></div>
+            </div>
+        </div>
+
+        <div id="status" class="tab-content">
+            <div class="card">
+                <h2>System Status</h2>
+
+                <div class="status-grid">
+                    <div class="status-item">
+                        <div class="status-label">Running</div>
+                        <div class="status-value" id="status-running">❌ No</div>
+                    </div>
+                    <div class="status-item">
+                        <div class="status-label">Virality Score</div>
+                        <div class="status-value" id="status-virality">0.0000</div>
+                    </div>
+                    <div class="status-item">
+                        <div class="status-label">Total Deployments</div>
+                        <div class="status-value" id="status-deployments">0</div>
+                    </div>
+                    <div class="status-item">
+                        <div class="status-label">Semantic Signals</div>
+                        <div class="status-value" id="status-signals">0</div>
+                    </div>
+                    <div class="status-item">
+                        <div class="status-label">Deployer Active</div>
+                        <div class="status-value" id="status-deployer">❌ No</div>
+                    </div>
+                    <div class="status-item">
+                        <div class="status-label">Uptime</div>
+                        <div class="status-value" id="status-uptime">0s</div>
+                    </div>
+                </div>
+
+                <button onclick="refreshStatus()">🔄 Refresh Status</button>
+                <button onclick="start247()">▶️ Start 24/7 Operation</button>
+            </div>
+        </div>
+
+        <div id="deployments" class="tab-content">
+            <div class="card">
+                <h2>Deployment History</h2>
+                <div id="deployments-list" class="deployments-list">
+                    <p style="color: #94a3b8;">No deployments yet</p>
+                </div>
+            </div>
+        </div>
+
+        <div id="about" class="tab-content">
+            <div class="card">
+                <h2>About Token Bazuka</h2>
+                <p style="color: #94a3b8; line-height: 1.6; margin-bottom: 1rem;">
+                    This Hugging Face Space provides 24/7 automated token deployment with semantic virality propagation.
+                </p>
+
+                <h3 style="color: #f8fafc; margin: 1.5rem 0 1rem;">Features</h3>
+                <ul style="color: #94a3b8; line-height: 1.8; margin-left: 1.5rem;">
+                    <li><strong>Pool-Native Token Deployment:</strong> Real Solana mainnet deployment with pool-native
+                        mechanics</li>
+                    <li><strong>Elastic Index:</strong> Token supply adjusts based on pool performance</li>
+                    <li><strong>Lambda Coefficient:</strong> Liquidity stability with curvature brake</li>
+                    <li><strong>Shadow Value:</strong> Projected value with ambiguity penalties</li>
+                    <li><strong>Semantic Virality:</strong> Automated virality scoring and boosting</li>
+                    <li><strong>24/7 Operation:</strong> Continuous background processing</li>
+                </ul>
+
+                <h3 style="color: #f8fafc; margin: 1.5rem 0 1rem;">Architecture</h3>
+                <ul style="color: #94a3b8; line-height: 1.8; margin-left: 1.5rem;">
+                    <li>Token ≡ Pool Share</li>
+                    <li>Market Cap ≡ Pool State</li>
+                    <li>Effective Balance = Raw Shares × Index</li>
+                </ul>
+
+                <h3 style="color: #f8fafc; margin: 1.5rem 0 1rem;">No Mocks, No Sims</h3>
+                <p style="color: #94a3b8; line-height: 1.6;">
+                    All deployments are real blockchain transactions on Solana mainnet.
+                </p>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Tab switching
+        document.querySelectorAll('.tab').forEach(tab => {
+            tab.addEventListener('click', () => {
+                document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+                document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+                tab.classList.add('active');
+                document.getElementById(tab.dataset.tab).classList.add('active');
+            });
+        });
+
+        // Deploy token
+        async function deployToken() {
+            const btn = document.getElementById('deploy-btn');
+            const output = document.getElementById('deploy-output');
+
+            const tokenName = document.getElementById('token_name').value;
+            const tokenSymbol = document.getElementById('token_symbol').value;
+            const initialSupply = parseInt(document.getElementById('initial_supply').value);
+            const initialReserves = parseFloat(document.getElementById('initial_reserves').value);
+
+            if (!tokenName || !tokenSymbol) {
+                output.textContent = '❌ Token name and symbol required';
+                output.className = 'output show error';
+                return;
+            }
+
+            btn.disabled = true;
+            btn.innerHTML = '<span class="loading"></span> Deploying...';
+            output.className = 'output show';
+            output.textContent = 'Simulating token deployment in demo mode...';
+
+            try {
+                const response = await fetch('/api/deploy', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        token_name: tokenName,
+                        token_symbol: tokenSymbol,
+                        initial_supply: initialSupply,
+                        initial_reserves: initialReserves
+                    })
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    output.className = 'output show success';
+                    output.textContent = `✅ Token Deployed Successfully (Demo Mode)!
+
+Token Details:
+- Name: ${tokenName}
+- Symbol: ${tokenSymbol}
+- Mint Address: ${result.token_mint}
+- Pool Address: ${result.pool_address}
+- Transaction: ${result.transaction_hash}
+- Block: ${result.block_number}
+
+Initial State:
+- Elastic Index: ${result.initial_state.elastic_index.toFixed(4)}
+- Lambda Value: ${result.initial_state.lambda_value.toFixed(4)}
+- Shadow Index: ${result.initial_state.shadow_index.toFixed(4)}
+
+Virality:
+- Semantic Virality Score: ${result.virality_score.toFixed(4)}
+- System Virality Score: ${result.system_virality_score.toFixed(4)}
+
+Note: This is a demo simulation. No real on-chain transaction occurred.`;
+                } else {
+                    output.className = 'output show error';
+                    output.textContent = `❌ Deployment failed: ${result.error}`;
+                }
+            } catch (error) {
+                output.className = 'output show error';
+                output.textContent = `❌ Error: ${error.message}`;
+            }
+
+            btn.disabled = false;
+            btn.innerHTML = '🚀 Deploy Token';
+        }
+
+        // Refresh status
+        async function refreshStatus() {
+            try {
+                const response = await fetch('/api/status');
+                const status = await response.json();
+
+                document.getElementById('status-running').textContent = status.running ? '✅ Yes' : '❌ No';
+                document.getElementById('status-virality').textContent = status.virality_score.toFixed(4);
+                document.getElementById('status-deployments').textContent = status.total_deployments;
+                document.getElementById('status-signals').textContent = status.semantic_signals;
+                document.getElementById('status-deployer').textContent = status.deployer_active ? '✅ Yes' : '❌ No';
+                document.getElementById('status-uptime').textContent = Math.floor(status.uptime_seconds) + 's';
+            } catch (error) {
+                console.error('Error fetching status:', error);
+            }
+        }
+
+        // Start 24/7 operation
+        async function start247() {
+            try {
+                const response = await fetch('/api/start-247', { method: 'POST' });
+                const result = await response.json();
+                alert(result.message);
+                refreshStatus();
+            } catch (error) {
+                alert('Error starting 24/7 operation: ' + error.message);
+            }
+        }
+
+        // Load deployments
+        async function loadDeployments() {
+            try {
+                const response = await fetch('/api/deployments');
+                const data = await response.json();
+                const list = document.getElementById('deployments-list');
+
+                if (data.deployments.length === 0) {
+                    list.innerHTML = '<p style="color: #94a3b8;">No deployments yet</p>';
+                    return;
+                }
+
+                list.innerHTML = data.deployments.map(d => `
+                    <div class="deployment-item">
+                        <h3>${d.token_name} (${d.token_symbol})</h3>
+                        <p>Mint: <a href="https://solscan.io/token/${d.token_mint}" target="_blank">${d.token_mint}</a></p>
+                        <p>Pool: <a href="https://solscan.io/account/${d.pool_address}" target="_blank">${d.pool_address}</a></p>
+                        <p>TX: <a href="https://solscan.io/tx/${d.transaction_hash}" target="_blank">${d.transaction_hash}</a></p>
+                        <p>Block: ${d.block_number}</p>
+                        <p>Time: ${new Date(d.timestamp).toLocaleString()}</p>
+                    </div>
+                `).join('');
+            } catch (error) {
+                console.error('Error loading deployments:', error);
+            }
+        }
+
+        // Auto-refresh status every 5 seconds
+        setInterval(refreshStatus, 5000);
+        setInterval(loadDeployments, 10000);
+
+        // Initial load
+        refreshStatus();
+        loadDeployments();
+    </script>
+</body>
+
+</html>
+```

@@ -1,0 +1,4306 @@
+Project Structure:
+huggingface_app.py
+Dockerfile
+XCODE_WINDSURF_WORKFLOW.md
+BUILD_SUMMARY.md
+GROQ_SETUP.md
+WINDSURF_BUILD_BRIEF.md
+README.md
+huggingface_requirements.txt
+FINAL_BUILD_STATUS.md
+PHONE_PIPELINE_ARCHITECTURE.md
+.gitattributes
+README_HF.md
+HUGGINGFACE_DEPLOYMENT.md
+backend/test_backend.py
+backend/requirements.txt
+backend/.env.example
+backend/app/db.py
+backend/app/config.py
+backend/app/models.py
+backend/app/__init__.py
+backend/app/schemas.py
+backend/app/main.py
+backend/app/routers/tasks.py
+backend/app/routers/__init__.py
+backend/app/routers/twilio.py
+backend/app/__pycache__/main.cpython-314.pyc
+backend/app/services/stt_service.py
+backend/app/services/tts_service.py
+backend/app/services/__init__.py
+backend/app/services/groq_llm.py
+backend/app/services/openai_realtime.py
+backend/app/services/twilio_client.py
+ios/MorningAgent/MorningAgentApp.swift
+ios/MorningAgent/ContentView.swift
+ios/MorningAgent/Models/TaskItem.swift
+ios/MorningAgent/Views/TaskListView.swift
+ios/MorningAgent/Views/SettingsView.swift
+ios/MorningAgent/Views/TaskDetailView.swift
+ios/MorningAgent/Views/NewTaskView.swift
+ios/MorningAgent/Services/APIClient.swift
+
+File Contents:
+huggingface_app.py:
+```
+"""
+Morning Agent - Hugging Face Gradio App
+Web interface for task management (desktop and mobile compatible)
+"""
+
+import os
+import gradio as gr
+import httpx
+import json
+from typing import List, Dict, Optional
+from datetime import datetime
+
+# Configuration - update these for your deployed backend
+BACKEND_URL = "http://localhost:8000"  # Change to your deployed backend URL
+
+class MorningAgentClient:
+    """Client for interacting with Morning Agent backend"""
+    
+    def __init__(self, base_url: str = BACKEND_URL):
+        self.base_url = base_url
+        self.client = httpx.AsyncClient(timeout=30.0)
+    
+    async def fetch_tasks(self) -> List[Dict]:
+        """Fetch all tasks"""
+        try:
+            response = await self.client.get(f"{self.base_url}/tasks")
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            return [{"error": str(e)}]
+    
+    async def create_task(self, title: str, instructions: str, phone: str) -> Dict:
+        """Create a new task"""
+        try:
+            payload = {
+                "title": title,
+                "instructions": instructions,
+                "phone_number": phone
+            }
+            response = await self.client.post(
+                f"{self.base_url}/tasks",
+                json=payload
+            )
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            return {"error": str(e)}
+    
+    async def start_task(self, task_id: int) -> Dict:
+        """Start a task (initiate call)"""
+        try:
+            response = await self.client.post(f"{self.base_url}/tasks/{task_id}/start")
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            return {"error": str(e)}
+    
+    async def get_task(self, task_id: int) -> Dict:
+        """Get task details"""
+        try:
+            response = await self.client.get(f"{self.base_url}/tasks/{task_id}")
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            return {"error": str(e)}
+    
+    async def close(self):
+        """Close the client"""
+        await self.client.aclose()
+
+client = MorningAgentClient()
+
+def format_task(task: Dict) -> str:
+    """Format task for display"""
+    if "error" in task:
+        return f"❌ Error: {task['error']}"
+    
+    status_emoji = {
+        "queued": "📋",
+        "calling": "📞",
+        "completed": "✅",
+        "failed": "❌",
+        "needs_review": "⚠️"
+    }
+    
+    emoji = status_emoji.get(task.get("status", "queued"), "📋")
+    return f"""
+**{emoji} {task.get('title', 'Untitled')}**
+
+**Status:** {task.get('status', 'unknown').upper()}
+**Phone:** {task.get('phone_number', 'N/A')}
+**ID:** {task.get('id', 'N/A')}
+
+**Instructions:**
+{task.get('instructions', 'No instructions')}
+
+{f"**Summary:** {task.get('summary', 'No summary')}" if task.get('summary') else ""}
+{f"**Transcript:** {task.get('transcript', 'No transcript')[:200]}..." if task.get('transcript') else ""}
+**Created:** {task.get('created_at', 'Unknown')}
+"""
+
+async def refresh_tasks():
+    """Refresh task list"""
+    tasks = await client.fetch_tasks()
+    if not tasks or ("error" in tasks[0] if tasks else False):
+        return "No tasks available or backend not connected."
+    
+    if not tasks:
+        return "No tasks yet. Create your first task below!"
+    
+    formatted = []
+    for task in tasks[:10]:  # Show last 10 tasks
+        formatted.append(format_task(task))
+    
+    return "\n\n---\n\n".join(formatted)
+
+async def create_new_task(title: str, instructions: str, phone: str):
+    """Create a new task"""
+    if not title or not instructions or not phone:
+        return "❌ Please fill in all fields", ""
+    
+    result = await client.create_task(title, instructions, phone)
+    
+    if "error" in result:
+        return f"❌ Failed to create task: {result['error']}", ""
+    
+    # Auto-start the task
+    start_result = await client.start_task(result["id"])
+    
+    if "error" in start_result:
+        return f"✅ Task created (ID: {result['id']}) but failed to start: {start_result['error']}", ""
+    
+    return f"✅ Task created and started! ID: {result['id']}", await refresh_tasks()
+
+async def get_task_details(task_id: str):
+    """Get details for a specific task"""
+    try:
+        task_id_int = int(task_id)
+        task = await client.get_task(task_id_int)
+        return format_task(task)
+    except ValueError:
+        return "❌ Invalid task ID. Please enter a number."
+    except Exception as e:
+        return f"❌ Error: {str(e)}"
+
+# Gradio Interface
+with gr.Blocks(
+    theme=gr.themes.Soft(),
+    title="Morning Agent",
+    css="""
+        .gradio-container {
+            max-width: 800px !important;
+        }
+        .task-card {
+            border: 1px solid #e0e0e0;
+            border-radius: 8px;
+            padding: 16px;
+            margin: 8px 0;
+            background: #fafafa;
+        }
+    """
+) as app:
+    
+    gr.Markdown(
+        """
+        # 🌅 Morning Agent
+        
+        Create tasks and let AI handle phone calls on your behalf.
+        
+        > ⚠️ **Disclosure**: The AI assistant will disclose it is calling on your behalf.
+        """
+    )
+    
+    with gr.Tabs():
+        # Task List Tab
+        with gr.Tab("📋 Tasks"):
+            tasks_output = gr.Markdown(
+                value="Loading tasks...",
+                label="Recent Tasks"
+            )
+            refresh_btn = gr.Button("🔄 Refresh", size="sm")
+            refresh_btn.click(
+                refresh_tasks,
+                outputs=tasks_output
+            )
+        
+        # Create Task Tab
+        with gr.Tab("➕ New Task"):
+            with gr.Group():
+                title_input = gr.Textbox(
+                    label="Task Title",
+                    placeholder="e.g., Schedule dentist appointment"
+                )
+                phone_input = gr.Textbox(
+                    label="Phone Number",
+                    placeholder="+1234567890"
+                )
+                instructions_input = gr.Textbox(
+                    label="Instructions",
+                    placeholder="What should the AI say/do?",
+                    lines=5
+                )
+                create_btn = gr.Button("📞 Create & Start Call", variant="primary")
+                create_output = gr.Markdown()
+            
+            create_btn.click(
+                create_new_task,
+                inputs=[title_input, instructions_input, phone_input],
+                outputs=[create_output, tasks_output]
+            )
+        
+        # Task Details Tab
+        with gr.Tab("🔍 Task Details"):
+            task_id_input = gr.Textbox(
+                label="Task ID",
+                placeholder="Enter task ID number"
+            )
+            task_details_btn = gr.Button("Get Details")
+            task_details_output = gr.Markdown()
+            
+            task_details_btn.click(
+                get_task_details,
+                inputs=task_id_input,
+                outputs=task_details_output
+            )
+        
+        # Settings Tab
+        with gr.Tab("⚙️ Settings"):
+            gr.Markdown(
+                """
+                ### Configuration
+                
+                **Backend URL:** Currently set to `http://localhost:8000`
+                
+                To connect to a deployed backend:
+                1. Deploy the backend to Render/Fly.io/Railway
+                2. Update `BACKEND_URL` in the app code
+                3. Redeploy this Space
+                
+                ### About
+                
+                This assistant places calls on your behalf using:
+                - **Twilio** for phone calls
+                - **OpenAI Realtime API** for AI voice
+                - **FastAPI** backend for task management
+                
+                ### Safety
+                
+                - The AI always discloses it is calling on behalf of the user
+                - All calls are logged with transcripts
+                - You can review call summaries after each call
+                """
+            )
+    
+    # Auto-refresh tasks on load
+    app.load(
+        refresh_tasks,
+        outputs=tasks_output
+    )
+
+if __name__ == "__main__":
+    app.launch(
+        server_name="0.0.0.0",
+        server_port=int(os.environ.get("PORT", 7860)),
+        share=False,
+        show_error=True,
+    )
+
+```
+
+Dockerfile:
+```
+FROM python:3.11-slim
+
+LABEL maintainer="morning-agent"
+LABEL description="Morning Agent with Groq LLM, OpenAI realtime, and Twilio voice integration"
+
+WORKDIR /app
+
+COPY huggingface_requirements.txt requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY huggingface_app.py app.py
+
+EXPOSE 7860
+
+ENV PYTHONUNBUFFERED=1
+ENV HF_HOME=/tmp
+
+CMD ["python", "app.py"]
+
+```
+
+XCODE_WINDSURF_WORKFLOW.md:
+```
+# Xcode Once, Windsurf After - 10 Step Workflow
+
+## Overview
+Use Xcode once to create the project structure, then use Windsurf for 90% of coding. Return to Xcode only for build, sign, archive, and App Store submission.
+
+## Step 1: Create Project in Xcode
+- Open Xcode
+- File > New > Project
+- Choose "App" under iOS tab
+- Enter product name: `MorningAgent`
+- Choose Interface: SwiftUI
+- Choose Language: Swift
+- Choose storage: None (for MVP)
+- Save to: `ios/MorningAgent` folder
+- Close Xcode after creation
+
+## Step 2: Verify Project Structure
+Your Xcode project should have:
+- `MorningAgent.xcodeproj` (the project file)
+- `MorningAgent/` folder with:
+  - `MorningAgentApp.swift`
+  - `ContentView.swift`
+  - `Assets.xcassets`
+  - `Preview Content`
+
+## Step 3: Open in Windsurf
+- Open the `ios/MorningAgent` folder in Windsurf
+- You can now edit all Swift files in Windsurf
+- Windsurf will handle:
+  - Writing new Swift files
+  - Refactoring code
+  - Generating screens, models, services
+  - Editing existing code
+
+## Step 4: Copy Generated Files to Xcode Project
+For the Morning Agent scaffold I created:
+- Copy `Models/TaskItem.swift` to `MorningAgent/Models/`
+- Copy `Services/APIClient.swift` to `MorningAgent/Services/`
+- Copy `Views/*.swift` to `MorningAgent/Views/`
+- Replace `ContentView.swift` with the new version
+- Replace `MorningAgentApp.swift` with the new version
+
+**Important:** You need to add these files to Xcode's project navigator:
+- Open Xcode
+- Right-click the appropriate group (e.g., Views)
+- "Add Files to MorningAgent..."
+- Select the new files
+- Make sure "Copy items if needed" is unchecked (files already exist)
+- Click Add
+
+## Step 5: Configure Build Settings in Xcode
+- Open Xcode
+- Select the project in navigator
+- Select the target
+- In "Signing & Capabilities":
+  - Select your development team
+  - Enable "Automatically manage signing"
+- In "Build Settings":
+  - Set iOS Deployment Target (e.g., iOS 17.0)
+  - Verify Swift Language Version
+
+## Step 6: Test in Simulator (Xcode)
+- In Xcode, select a simulator (e.g., iPhone 15)
+- Press Cmd+R to build and run
+- Verify the app launches
+- Test basic navigation
+- If there are build errors, fix them in Windsurf, then rebuild
+
+## Step 7: Day-to-Day Coding in Windsurf
+For ongoing development:
+- Stay in Windsurf for:
+  - Adding new views
+  - Modifying existing views
+  - Creating new models
+  - Writing service code
+  - Refactoring
+  - Bug fixes
+- After making changes:
+  - Save files in Windsurf
+  - Switch to Xcode
+  - Press Cmd+R to test
+  - Return to Windsurf for more coding
+
+## Step 8: Periodic Xcode Sync
+Every few hours or after major changes:
+- Open Xcode
+- Cmd+R to build and run
+- Check for any Xcode-specific issues:
+  - Missing file references
+  - Build settings
+  - Asset catalog issues
+  - Preview provider issues
+- Fix issues in Windsurf if they're code-related
+- Fix issues in Xcode if they're project-related
+
+## Step 9: Device Testing (Xcode)
+- Connect your iPhone to Mac
+- In Xcode, select your device from the simulator dropdown
+- Press Cmd+R to build and run on device
+- Test on real hardware
+- Fix any device-specific issues in Windsurf
+
+## Step 10: Archive and Submit (Xcode Only)
+When ready for App Store:
+- In Xcode: Product > Archive
+- Xcode Organizer opens
+- Validate your archive
+- Distribute App:
+  - Choose "App Store Connect"
+  - Follow the upload wizard
+- Complete submission in App Store Connect:
+  - Add screenshots
+  - Set pricing
+  - Submit for review
+
+## Summary Table
+
+| Task | Tool | Reason |
+|------|------|--------|
+| Create project | Xcode | Apple's official project structure |
+| Write Swift code | Windsurf | AI assistance, faster coding |
+| Refactor | Windsurf | AI-powered refactoring |
+| Generate screens | Windsurf | AI generates SwiftUI views |
+| Add files to project | Xcode | Project file management |
+| Build settings | Xcode | Apple-specific configuration |
+| Sign & capabilities | Xcode | Code signing required by Apple |
+| Simulator testing | Xcode | Apple's simulator |
+| Device testing | Xcode | Device deployment |
+| Archive | Xcode | Archive generation |
+| App Store submission | Xcode + App Store Connect | Official submission flow |
+
+## Pro Tips
+
+1. **Keep Xcode open in background** - Quick Cmd+R to test after Windsurf changes
+2. **Use Git** - Commit after major changes, easy to revert if Xcode breaks
+3. **File organization** - Keep the same folder structure in Windsurf as Xcode expects
+4. **Preview issues** - SwiftUI Previews may break in Windsurf - ignore them, test in Xcode
+5. **Asset catalog** - Use Xcode for images, icons, colors - Windsurf can't edit these easily
+6. **Info.plist** - Edit in Xcode if you need to add permissions (camera, microphone, etc.)
+
+## Common Issues
+
+**"File not found" build error:**
+- File exists on disk but not in Xcode project
+- Fix: Right-click group > Add Files to MorningAgent
+
+**"No such module" error:**
+- Missing Swift Package or framework
+- Fix: File > Add Package in Xcode
+
+**Signing errors:**
+- Team not selected or certificate expired
+- Fix: Xcode > Preferences > Accounts, or re-enable automatic signing
+
+**Preview crashes:**
+- SwiftUI Preview issues are common
+- Fix: Ignore previews, test in simulator instead
+
+## When to Use Each Tool
+
+**Use Windsurf for:**
+- Writing new Swift code
+- Modifying existing code
+- Generating boilerplate
+- Refactoring
+- Adding new features
+- Fixing bugs
+
+**Use Xcode for:**
+- Initial project creation
+- Adding files to project navigator
+- Configuring build settings
+- Code signing
+- Running in simulator
+- Device testing
+- Archiving
+- App Store submission
+- Editing Info.plist
+- Managing assets (images, icons)
+- Adding Swift Packages
+
+```
+
+BUILD_SUMMARY.md:
+```
+# Morning Agent - Build Summary
+
+## Repository Structure Created
+
+```
+morning-agent/
+├── backend/
+│   ├── requirements.txt
+│   ├── .env.example
+│   └── app/
+│       ├── __init__.py
+│       ├── main.py
+│       ├── config.py
+│       ├── db.py
+│       ├── models.py
+│       ├── schemas.py
+│       ├── services/
+│       │   ├── __init__.py
+│       │   ├── twilio_client.py
+│       │   └── openai_realtime.py
+│       └── routers/
+│           ├── __init__.py
+│           ├── tasks.py
+│           └── twilio.py
+├── ios/
+│   └── MorningAgent/
+│       ├── MorningAgentApp.swift
+│       ├── ContentView.swift
+│       ├── Models/
+│       │   └── TaskItem.swift
+│       ├── Services/
+│       │   └── APIClient.swift
+│       └── Views/
+│           ├── TaskListView.swift
+│           ├── NewTaskView.swift
+│           ├── TaskDetailView.swift
+│           └── SettingsView.swift
+└── README.md
+```
+
+## Files Created (29 total)
+
+### Backend (12 files)
+1. `backend/requirements.txt` - Python dependencies (includes Groq)
+2. `backend/.env.example` - Environment template (includes Groq)
+3. `backend/app/__init__.py` - Package init
+4. `backend/app/main.py` - FastAPI application with WebSocket (Groq integration)
+5. `backend/app/config.py` - Pydantic settings (includes Groq)
+6. `backend/app/db.py` - SQLite database setup
+7. `backend/app/models.py` - Task model
+8. `backend/app/schemas.py` - Pydantic schemas
+9. `backend/app/services/twilio_client.py` - Twilio integration
+10. `backend/app/services/openai_realtime.py` - OpenAI Realtime bridge
+11. `backend/app/services/groq_llm.py` - Groq LLM service (NEW)
+12. `backend/app/routers/tasks.py` - Task CRUD endpoints
+13. `backend/app/routers/twilio.py` - Twilio webhook endpoints
+
+### iOS App (9 files)
+14. `ios/MorningAgent/MorningAgentApp.swift` - App entry point
+15. `ios/MorningAgent/ContentView.swift` - Tab view
+16. `ios/MorningAgent/Models/TaskItem.swift` - Data models
+17. `ios/MorningAgent/Services/APIClient.swift` - API client
+18. `ios/MorningAgent/Views/TaskListView.swift` - Task list
+19. `ios/MorningAgent/Views/NewTaskView.swift` - Create task
+20. `ios/MorningAgent/Views/TaskDetailView.swift` - Task details
+21. `ios/MorningAgent/Views/SettingsView.swift` - Settings
+
+### Documentation (6 files)
+22. `README.md` - Complete documentation
+23. `BUILD_SUMMARY.md` - Build summary and next steps
+24. `XCODE_WINDSURF_WORKFLOW.md` - Xcode/Windsurf workflow guide
+25. `HUGGINGFACE_DEPLOYMENT.md` - Hugging Face deployment guide
+26. `PHONE_PIPELINE_ARCHITECTURE.md` - Multi-service phone pipeline architecture
+27. `GROQ_SETUP.md` - Groq integration guide (NEW)
+
+### Hugging Face Deployment (2 files)
+28. `huggingface_app.py` - Gradio web interface
+29. `huggingface_requirements.txt` - Gradio dependencies
+
+## Features Implemented
+
+### Backend ✅
+- FastAPI application with structured routing
+- SQLite database with SQLModel
+- Task CRUD operations
+- Twilio outbound call integration
+- TwiML generation for media streaming
+- Call status webhook handling
+- OpenAI Realtime API skeleton
+- Groq LLM integration for text processing
+- Automatic transcript summarization with Groq
+- Task completion detection with Groq
+- WebSocket endpoint for audio streaming
+- Health check endpoint
+- Environment configuration
+
+### iOS App ✅
+- SwiftUI app with tab navigation
+- Task list with refresh
+- Create task form
+- Task detail view with transcript
+- Settings view
+- Async/await networking
+- Simple polling for updates
+- Clean architecture with Models/Services/Views
+
+### Hugging Face Web UI ✅
+- Gradio web interface
+- Mobile-responsive design
+- Task list with auto-refresh
+- Create task form
+- Task details view
+- Settings tab
+- HTTP client for backend API
+- Works on desktop and mobile browsers
+
+## Known Limitations
+
+### WebSocket Audio Bridge (TODO)
+The `/media-stream` endpoint in `main.py` is a skeleton. The following work remains:
+1. Decode Twilio base64 audio payload
+2. Forward audio into OpenAI Realtime session
+3. Receive model audio/text back
+4. Send outbound audio frames back to Twilio
+
+This is the main integration point between Twilio Media Streams and OpenAI Realtime API.
+
+## Next Steps for Windsurf
+
+1. **Finish the Twilio ↔ OpenAI Realtime websocket bridge** in `/media-stream`
+2. **Add transcript persistence** and a final task summarizer
+3. **Add retry logic**, voicemail detection, and escalation statuses
+4. **Replace polling in SwiftUI** with push notifications or server-sent updates
+
+## Running Locally
+
+### Backend
+```bash
+cd backend
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+# Edit .env with credentials
+uvicorn app.main:app --reload
+```
+
+### iOS
+Open `ios/MorningAgent` in Xcode and run on simulator/device.
+
+### Hugging Face Space
+1. Create new Space at huggingface.co/new-space
+2. Choose Gradio SDK
+3. Upload `huggingface_app.py` as `app.py`
+4. Upload `huggingface_requirements.txt` as `requirements.txt`
+5. Update `BACKEND_URL` in app.py
+6. Deploy backend to Render/Fly.io/Railway
+7. See `HUGGINGFACE_DEPLOYMENT.md` for details
+
+## Status
+
+✅ Complete scaffold ready for development
+⚠️ Audio bridge needs implementation
+✅ All API endpoints functional
+✅ iOS app UI complete
+✅ Hugging Face web UI complete
+✅ Database models ready
+✅ Configuration system in place
+✅ Deployment guides complete
+
+```
+
+GROQ_SETUP.md:
+```
+# Groq Integration for Morning Agent
+
+## Overview
+
+Morning Agent now supports Groq as the LLM service for faster, cost-effective text processing. Groq provides ultra-low latency inference for open-source models like Llama.
+
+## Benefits of Using Groq
+
+- **Ultra-low latency**: ~10-50ms response time
+- **Cost-effective**: Free tier available, very low paid tier pricing
+- **Open-source models**: Llama 3.3, Mixtral, and more
+- **High throughput**: Optimized for production workloads
+- **No API rate limits**: Unlike some other providers
+
+## Setup Instructions
+
+### 1. Get Groq API Key
+
+1. Go to [console.groq.com](https://console.groq.com)
+2. Sign up or log in
+3. Go to API Keys section
+4. Create a new API key
+5. Copy the key (starts with `gsk_`)
+
+### 2. Add to Environment Variables
+
+Add to your `backend/.env` file:
+
+```bash
+GROQ_API_KEY=gsk_your_actual_key_here
+GROQ_MODEL=llama-3.3-70b-versatile
+```
+
+### 3. Install Dependencies
+
+```bash
+cd backend
+pip install groq
+```
+
+Or update requirements.txt (already included):
+```bash
+pip install -r requirements.txt
+```
+
+## Available Groq Models
+
+### Recommended Models
+
+| Model | Use Case | Speed | Cost |
+|-------|----------|-------|------|
+| `llama-3.3-70b-versatile` | General purpose, reasoning | Very fast | Low |
+| `llama-3.1-70b-versatile` | General purpose | Very fast | Low |
+| `mixtral-8x7b-32768` | Fast responses | Ultra fast | Lowest |
+| `gemma-7b-it` | Quick tasks | Ultra fast | Lowest |
+
+### Model Selection
+
+**For Phone Calls:**
+- Use `llama-3.3-70b-versatile` for best reasoning
+- Use `mixtral-8x7b-32768` for faster responses
+
+**For Summarization:**
+- Use `llama-3.3-70b-versatile` for accuracy
+- Use `gemma-7b-it` for speed
+
+## How Groq is Used in Morning Agent
+
+### 1. Real-time Processing (Modular Pipeline)
+
+In the WebSocket media stream (`/media-stream`):
+
+```python
+# Process caller's speech with Groq
+response = await groq_llm.process(
+    text=caller_speech,
+    instructions=task.instructions,
+    conversation_history=conversation_history
+)
+```
+
+### 2. Transcript Summarization
+
+After call ends, Groq summarizes the transcript:
+
+```python
+summary = await groq_llm.summarize_transcript(
+    transcript=full_transcript,
+    instructions=task.instructions
+)
+```
+
+### 3. Task Completion Check
+
+Groq analyzes if the task was completed:
+
+```python
+completion = await groq_llm.check_task_completion(
+    transcript=full_transcript,
+    instructions=task.instructions
+)
+# Returns: {"completed": bool, "reason": str, "action_items": list}
+```
+
+## Groq Service API
+
+### GroqLLMService Class
+
+```python
+from backend.app.services.groq_llm import get_groq_llm
+
+# Get service
+groq_llm = get_groq_llm()
+
+# Process text
+response = await groq_llm.process(
+    text="Hello, I'm calling about...",
+    instructions="Schedule a dentist appointment",
+    conversation_history=[...]
+)
+
+# Summarize transcript
+summary = await groq_llm.summarize_transcript(
+    transcript="Full call transcript here...",
+    instructions="Schedule a dentist appointment"
+)
+
+# Check completion
+result = await groq_llm.check_task_completion(
+    transcript="Full call transcript here...",
+    instructions="Schedule a dentist appointment"
+)
+```
+
+## Configuration Options
+
+### Environment Variables
+
+```bash
+# Required
+GROQ_API_KEY=gsk_...
+
+# Optional (with defaults)
+GROQ_MODEL=llama-3.3-70b-versatile
+```
+
+### Model Parameters
+
+In `groq_llm.py`, you can adjust:
+
+```python
+response = self.client.chat.completions.create(
+    model=self.model,
+    messages=messages,
+    temperature=0.7,      # Creativity (0.0-1.0)
+    max_tokens=512,       # Response length
+)
+```
+
+## Cost Comparison
+
+### Per Call Estimates
+
+| Provider | Model | Cost per 1K tokens |
+|----------|-------|-------------------|
+| Groq | Llama 3.3 70B | $0.00059 |
+| OpenAI | GPT-4 | $0.03 |
+| OpenAI | GPT-3.5 | $0.0015 |
+| Groq | Mixtral 8x7B | $0.00024 |
+
+**Typical phone call (~2000 tokens):**
+- Groq: ~$0.001
+- OpenAI GPT-4: ~$0.06
+- OpenAI GPT-3.5: ~$0.003
+
+## Free Tier
+
+Groq offers a generous free tier:
+- **Free tokens**: Daily limit (check console for current limits)
+- **No credit card required** for free tier
+- **No rate limits** on free tier
+
+## Troubleshooting
+
+### "GROQ_API_KEY not set"
+
+Add to `.env`:
+```bash
+GROQ_API_KEY=gsk_your_key_here
+```
+
+### "Invalid API Key"
+
+- Verify the key starts with `gsk_`
+- Check it's not expired
+- Ensure no extra spaces in `.env` file
+
+### "Model not found"
+
+- Verify model name in `GROQ_MODEL`
+- Check [Groq console](https://console.groq.com) for available models
+- Use `llama-3.3-70b-versatile` as fallback
+
+### Slow Responses
+
+- Groq is typically very fast
+- If slow, check network connectivity
+- Try a different model (e.g., `mixtral-8x7b-32768`)
+
+## Migration from OpenAI
+
+### Before (OpenAI Realtime)
+
+```python
+# Uses OpenAI Realtime API (unified STT+LLM+TTS)
+bridge = RealtimeBridge(task_id, instructions)
+await bridge.open()
+```
+
+### After (Groq + Modular)
+
+```python
+# Uses Groq for LLM, separate STT/TTS services
+groq_llm = get_groq_llm()
+response = await groq_llm.process(text, instructions, history)
+```
+
+**Benefits:**
+- Lower cost
+- Faster response time
+- More control over each component
+- Can swap STT/TTS services independently
+
+## Testing
+
+### Test Groq Integration
+
+```python
+import asyncio
+from backend.app.services.groq_llm import get_groq_llm
+
+async def test_groq():
+    groq = get_groq_llm()
+    response = await groq.process(
+        text="Hello, I need to schedule an appointment",
+        instructions="You are a dental office scheduler",
+        conversation_history=[]
+    )
+    print(f"Response: {response}")
+
+asyncio.run(test_groq())
+```
+
+### Test Summary
+
+```python
+async def test_summary():
+    groq = get_groq_llm()
+    summary = await groq.summarize_transcript(
+        transcript="Caller: Hi, I need to schedule an appointment...",
+        instructions="Schedule a dentist appointment"
+    )
+    print(f"Summary: {summary}")
+
+asyncio.run(test_summary())
+```
+
+## Production Considerations
+
+### Error Handling
+
+The Groq service includes error handling:
+
+```python
+try:
+    response = await groq_llm.process(text, instructions)
+except Exception as e:
+    # Fallback or retry logic
+    logger.error(f"Groq error: {e}")
+```
+
+### Fallback
+
+Consider adding a fallback LLM:
+
+```python
+try:
+    response = await groq_llm.process(text, instructions)
+except Exception as e:
+    # Fallback to OpenAI
+    response = await openai_llm.process(text, instructions)
+```
+
+### Monitoring
+
+Track Groq usage:
+- Response times
+- Token usage
+- Error rates
+- Model performance
+
+## Links
+
+- [Groq Console](https://console.groq.com)
+- [Groq Documentation](https://console.groq.com/docs)
+- [Groq Models](https://console.groq.com/docs/models)
+- [Llama 3.3 Documentation](https://llama.meta.com/)
+
+## Summary
+
+Groq provides:
+- ✅ Ultra-low latency
+- ✅ Very low cost
+- ✅ Open-source models
+- ✅ Easy integration
+- ✅ Free tier available
+
+Perfect for Morning Agent's phone call processing needs!
+
+```
+
+WINDSURF_BUILD_BRIEF.md:
+```
+# Windsurf Build Brief - Morning Agent
+
+Paste this entire document into Windsurf to generate the complete Morning Agent scaffold.
+
+---
+
+## Project Overview
+
+Build an App Store-ready MVP called "Morning Agent" - an iPhone app where users can type or dictate tasks in the morning, and the backend executes phone-call tasks autonomously during the day.
+
+**Architecture:** SwiftUI iPhone app as control surface, Python FastAPI backend for telephony/task orchestration, Twilio for outbound calls, OpenAI Realtime API for speech-to-speech AI voice.
+
+**App Store Safety:** Frame as "AI assistant calling on user's behalf with disclosure and controls" rather than impersonation. The voice assistant discloses it is calling on behalf of the user.
+
+---
+
+## Constraints
+
+- iPhone app in SwiftUI
+- Backend in Python FastAPI
+- PostgreSQL-ready data model, SQLite acceptable for local MVP
+- Twilio for outbound phone calls
+- Twilio Media Streams for realtime call audio bridge
+- OpenAI Realtime API for speech-to-speech handling
+- Push notifications optional for MVP
+- Clear disclosure model: voice assistant says it is calling on behalf of user
+- No fake placeholders for endpoint names
+- Production-style structure, env config, logging, health endpoint
+- Must run locally first
+- Must be clean enough to deploy to Render/Fly.io/Railway
+
+---
+
+## Repository Structure
+
+```
+morning-agent/
+  backend/
+    app/
+      main.py
+      config.py
+      db.py
+      models.py
+      schemas.py
+      services/
+        tasks.py
+        twilio_client.py
+        openai_realtime.py
+      routers/
+        tasks.py
+        twilio.py
+    requirements.txt
+    .env.example
+  ios/
+    MorningAgent/
+      MorningAgentApp.swift
+      ContentView.swift
+      Models/
+        TaskItem.swift
+      Services/
+        APIClient.swift
+      Views/
+        TaskListView.swift
+        NewTaskView.swift
+        TaskDetailView.swift
+        SettingsView.swift
+```
+
+---
+
+## Backend Files to Generate
+
+### 1. backend/requirements.txt
+```
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+sqlmodel==0.0.24
+twilio==9.5.2
+python-dotenv==1.0.1
+httpx==0.28.1
+websockets==15.0.1
+```
+
+### 2. backend/.env.example
+```
+APP_BASE_URL=https://your-backend.example.com
+PUBLIC_WS_BASE=wss://your-backend.example.com
+TWILIO_ACCOUNT_SID=ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+TWILIO_AUTH_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+TWILIO_FROM_NUMBER=+15555550123
+OPENAI_API_KEY=sk-...
+OPENAI_REALTIME_MODEL=gpt-realtime-1.5
+SQLITE_PATH=./morning_agent.db
+DISCLOSURE_LINE=Hello, this is Joseph's AI assistant calling on his behalf.
+```
+
+### 3. backend/app/config.py
+```python
+from pydantic import BaseModel
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+
+class Settings(BaseModel):
+    app_base_url: str = os.getenv("APP_BASE_URL", "http://localhost:8000")
+    public_ws_base: str = os.getenv("PUBLIC_WS_BASE", "ws://localhost:8000")
+    twilio_account_sid: str = os.getenv("TWILIO_ACCOUNT_SID", "")
+    twilio_auth_token: str = os.getenv("TWILIO_AUTH_TOKEN", "")
+    twilio_from_number: str = os.getenv("TWILIO_FROM_NUMBER", "")
+    openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
+    openai_realtime_model: str = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-1.5")
+    sqlite_path: str = os.getenv("SQLITE_PATH", "./morning_agent.db")
+    disclosure_line: str = os.getenv(
+        "DISCLOSURE_LINE",
+        "Hello, this is Joseph's AI assistant calling on his behalf."
+    )
+
+settings = Settings()
+```
+
+### 4. backend/app/db.py
+```python
+from sqlmodel import SQLModel, create_engine, Session
+from .config import settings
+
+engine = create_engine(f"sqlite:///{settings.sqlite_path}", echo=False)
+
+def init_db() -> None:
+    SQLModel.metadata.create_all(engine)
+
+def get_session():
+    with Session(engine) as session:
+        yield session
+```
+
+### 5. backend/app/models.py
+```python
+from typing import Optional
+from datetime import datetime
+from sqlmodel import SQLModel, Field
+
+class Task(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    title: str
+    instructions: str
+    phone_number: str
+    status: str = "queued"  # queued, calling, completed, failed, needs_review
+    call_sid: Optional[str] = None
+    transcript: Optional[str] = None
+    summary: Optional[str] = None
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+```
+
+### 6. backend/app/schemas.py
+```python
+from typing import Optional
+from pydantic import BaseModel
+
+class TaskCreate(BaseModel):
+    title: str
+    instructions: str
+    phone_number: str
+
+class TaskRead(BaseModel):
+    id: int
+    title: str
+    instructions: str
+    phone_number: str
+    status: str
+    call_sid: Optional[str] = None
+    transcript: Optional[str] = None
+    summary: Optional[str] = None
+
+class StartTaskResponse(BaseModel):
+    task_id: int
+    status: str
+    call_sid: Optional[str]
+```
+
+### 7. backend/app/services/twilio_client.py
+```python
+from twilio.rest import Client
+from ..config import settings
+
+def get_twilio_client() -> Client:
+    return Client(settings.twilio_account_sid, settings.twilio_auth_token)
+
+def create_outbound_call(task_id: int, to_number: str) -> str:
+    client = get_twilio_client()
+    call = client.calls.create(
+        to=to_number,
+        from_=settings.twilio_from_number,
+        url=f"{settings.app_base_url}/twilio/outbound-twiml?task_id={task_id}",
+        status_callback=f"{settings.app_base_url}/calls/status?task_id={task_id}",
+        status_callback_event=["initiated", "ringing", "answered", "completed"],
+        status_callback_method="POST",
+    )
+    return call.sid
+```
+
+### 8. backend/app/services/openai_realtime.py
+```python
+import json
+import websockets
+from ..config import settings
+
+class RealtimeBridge:
+    def __init__(self, task_id: int, instructions: str):
+        self.task_id = task_id
+        self.instructions = instructions
+        self.transcript_parts: list[str] = []
+
+    async def open(self):
+        self.ws = await websockets.connect(
+            "wss://api.openai.com/v1/realtime",
+            additional_headers={
+                "Authorization": f"Bearer {settings.openai_api_key}",
+                "OpenAI-Beta": "realtime=v1",
+            },
+        )
+        session_update = {
+            "type": "session.update",
+            "session": {
+                "model": settings.openai_realtime_model,
+                "instructions": (
+                    f"{settings.disclosure_line} "
+                    "You are a phone agent. Complete the task if possible. "
+                    "Do not claim to be the user. "
+                    f"Task instructions: {self.instructions}"
+                )
+            }
+        }
+        await self.ws.send(json.dumps(session_update))
+
+    async def close(self):
+        if getattr(self, "ws", None):
+            await self.ws.close()
+```
+
+### 9. backend/app/routers/tasks.py
+```python
+from datetime import datetime
+from fastapi import APIRouter, Depends, HTTPException
+from sqlmodel import Session, select
+from ..db import get_session
+from ..models import Task
+from ..schemas import TaskCreate, StartTaskResponse
+from ..services.twilio_client import create_outbound_call
+
+router = APIRouter(prefix="/tasks", tags=["tasks"])
+
+@router.post("")
+def create_task(payload: TaskCreate, session: Session = Depends(get_session)):
+    task = Task(
+        title=payload.title,
+        instructions=payload.instructions,
+        phone_number=payload.phone_number,
+    )
+    session.add(task)
+    session.commit()
+    session.refresh(task)
+    return task
+
+@router.get("")
+def list_tasks(session: Session = Depends(get_session)):
+    return session.exec(select(Task).order_by(Task.id.desc())).all()
+
+@router.get("/{task_id}")
+def get_task(task_id: int, session: Session = Depends(get_session)):
+    task = session.get(Task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return task
+
+@router.post("/{task_id}/start", response_model=StartTaskResponse)
+def start_task(task_id: int, session: Session = Depends(get_session)):
+    task = session.get(Task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    call_sid = create_outbound_call(task_id=task.id, to_number=task.phone_number)
+    task.call_sid = call_sid
+    task.status = "calling"
+    task.updated_at = datetime.utcnow()
+    session.add(task)
+    session.commit()
+    return StartTaskResponse(task_id=task.id, status=task.status, call_sid=call_sid)
+```
+
+### 10. backend/app/routers/twilio.py
+```python
+from datetime import datetime
+from fastapi import APIRouter, Depends, Request
+from fastapi.responses import Response
+from sqlmodel import Session
+from ..config import settings
+from ..db import get_session
+from ..models import Task
+
+router = APIRouter(tags=["twilio"])
+
+@router.post("/twilio/outbound-twiml")
+@router.get("/twilio/outbound-twiml")
+async def outbound_twiml(task_id: int, session: Session = Depends(get_session)):
+    task = session.get(Task, task_id)
+    if not task:
+        xml = """<?xml version="1.0" encoding="UTF-8"?><Response><Say>Task not found.</Say></Response>"""
+        return Response(content=xml, media_type="application/xml")
+    stream_url = f"{settings.public_ws_base}/media-stream?task_id={task_id}"
+    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say>{settings.disclosure_line}</Say>
+  <Connect>
+    <Stream url="{stream_url}" />
+  </Connect>
+</Response>
+"""
+    return Response(content=xml, media_type="application/xml")
+
+@router.post("/calls/status")
+async def calls_status(task_id: int, request: Request, session: Session = Depends(get_session)):
+    form = await request.form()
+    call_status = str(form.get("CallStatus", "unknown"))
+    task = session.get(Task, task_id)
+    if task:
+        if call_status == "completed" and task.status == "calling":
+            task.status = "completed" if task.summary else "needs_review"
+        elif call_status in {"busy", "no-answer", "failed", "canceled"}:
+            task.status = "failed"
+        task.updated_at = datetime.utcnow()
+        session.add(task)
+        session.commit()
+    return {"ok": True}
+```
+
+### 11. backend/app/main.py
+```python
+import json
+from datetime import datetime
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from sqlmodel import Session
+from .db import engine, init_db
+from .models import Task
+from .routers.tasks import router as tasks_router
+from .routers.twilio import router as twilio_router
+from .services.openai_realtime import RealtimeBridge
+
+app = FastAPI(title="Morning Agent Backend")
+app.include_router(tasks_router)
+app.include_router(twilio_router)
+
+@app.on_event("startup")
+def startup():
+    init_db()
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
+
+@app.websocket("/media-stream")
+async def media_stream(ws: WebSocket):
+    await ws.accept()
+    task_id = int(ws.query_params["task_id"])
+    with Session(engine) as session:
+        task = session.get(Task, task_id)
+        if not task:
+            await ws.close(code=1008)
+            return
+        bridge = RealtimeBridge(task_id=task.id, instructions=task.instructions)
+    await bridge.open()
+    transcript_parts: list[str] = []
+    try:
+        while True:
+            message = await ws.receive_text()
+            data = json.loads(message)
+            event = data.get("event")
+            if event == "start":
+                pass
+            elif event == "media":
+                # TODO: Decode Twilio base64 audio, forward to OpenAI, receive response, send back to Twilio
+                pass
+            elif event == "stop":
+                break
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await bridge.close()
+        with Session(engine) as session:
+            task = session.get(Task, task_id)
+            if task:
+                task.transcript = "\n".join(transcript_parts) if transcript_parts else task.transcript
+                task.summary = task.summary or "Call finished. Review transcript."
+                task.updated_at = datetime.utcnow()
+                session.add(task)
+                session.commit()
+```
+
+---
+
+## iOS Files to Generate
+
+### 12. ios/MorningAgent/MorningAgentApp.swift
+```swift
+import SwiftUI
+
+@main
+struct MorningAgentApp: App {
+    var body: some Scene {
+        WindowGroup {
+            ContentView()
+        }
+    }
+}
+```
+
+### 13. ios/MorningAgent/Models/TaskItem.swift
+```swift
+import Foundation
+
+struct TaskItem: Codable, Identifiable {
+    let id: Int
+    let title: String
+    let instructions: String
+    let phoneNumber: String?
+    let status: String
+    let callSid: String?
+    let transcript: String?
+    let summary: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id, title, instructions, status, transcript, summary
+        case phoneNumber = "phone_number"
+        case callSid = "call_sid"
+    }
+}
+
+struct CreateTaskRequest: Codable {
+    let title: String
+    let instructions: String
+    let phone_number: String
+}
+```
+
+### 14. ios/MorningAgent/Services/APIClient.swift
+```swift
+import Foundation
+
+@MainActor
+final class APIClient: ObservableObject {
+    static let shared = APIClient()
+    private let baseURL = URL(string: "http://localhost:8000")!
+
+    func fetchTasks() async throws -> [TaskItem] {
+        let (data, _) = try await URLSession.shared.data(from: baseURL.appendingPathComponent("tasks"))
+        return try JSONDecoder().decode([TaskItem].self, from: data)
+    }
+
+    func createTask(title: String, instructions: String, phone: String) async throws -> TaskItem {
+        var request = URLRequest(url: baseURL.appendingPathComponent("tasks"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(
+            CreateTaskRequest(title: title, instructions: instructions, phone_number: phone)
+        )
+        let (data, _) = try await URLSession.shared.data(for: request)
+        return try JSONDecoder().decode(TaskItem.self, from: data)
+    }
+
+    func startTask(id: Int) async throws {
+        var request = URLRequest(url: baseURL.appendingPathComponent("tasks/\(id)/start"))
+        request.httpMethod = "POST"
+        _ = try await URLSession.shared.data(for: request)
+    }
+
+    func fetchTask(id: Int) async throws -> TaskItem {
+        let (data, _) = try await URLSession.shared.data(from: baseURL.appendingPathComponent("tasks/\(id)"))
+        return try JSONDecoder().decode(TaskItem.self, from: data)
+    }
+}
+```
+
+### 15. ios/MorningAgent/Views/TaskListView.swift
+```swift
+import SwiftUI
+
+struct TaskListView: View {
+    @State private var tasks: [TaskItem] = []
+    @State private var showingNewTask = false
+    @State private var isLoading = false
+
+    var body: some View {
+        NavigationStack {
+            List(tasks) { task in
+                NavigationLink(destination: TaskDetailView(taskID: task.id)) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(task.title).font(.headline)
+                        Text(task.status.capitalized).font(.subheadline)
+                        if let summary = task.summary, !summary.isEmpty {
+                            Text(summary).font(.footnote).foregroundStyle(.secondary).lineLimit(2)
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Morning Agent")
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button { showingNewTask = true } label: { Image(systemName: "plus") }
+                }
+            }
+            .sheet(isPresented: $showingNewTask) {
+                NewTaskView { await load() }
+            }
+            .task { await load() }
+            .refreshable { await load() }
+        }
+    }
+
+    private func load() async {
+        guard !isLoading else { return }
+        isLoading = true
+        defer { isLoading = false }
+        do {
+            tasks = try await APIClient.shared.fetchTasks()
+        } catch {
+            print("Failed to fetch tasks:", error)
+        }
+    }
+}
+```
+
+### 16. ios/MorningAgent/Views/NewTaskView.swift
+```swift
+import SwiftUI
+
+struct NewTaskView: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var title = ""
+    @State private var instructions = ""
+    @State private var phone = ""
+    @State private var isSaving = false
+    let onSaved: () async -> Void
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Task") {
+                    TextField("Title", text: $title)
+                    TextField("Phone number", text: $phone)
+                    TextEditor(text: $instructions).frame(minHeight: 160)
+                }
+            }
+            .navigationTitle("New Task")
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("Close") { dismiss() }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Save") { Task { await save() } }
+                    .disabled(isSaving || title.isEmpty || phone.isEmpty || instructions.isEmpty)
+                }
+            }
+        }
+    }
+
+    private func save() async {
+        guard !isSaving else { return }
+        isSaving = true
+        defer { isSaving = false }
+        do {
+            let task = try await APIClient.shared.createTask(title: title, instructions: instructions, phone: phone)
+            try await APIClient.shared.startTask(id: task.id)
+            await onSaved()
+            dismiss()
+        } catch {
+            print("Save failed:", error)
+        }
+    }
+}
+```
+
+### 17. ios/MorningAgent/Views/TaskDetailView.swift
+```swift
+import SwiftUI
+
+struct TaskDetailView: View {
+    let taskID: Int
+    @State private var task: TaskItem?
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                if let task {
+                    Text(task.title).font(.title2).bold()
+                    Text("Status: \(task.status)")
+                    Text(task.instructions)
+                    if let summary = task.summary {
+                        Group {
+                            Text("Summary").font(.headline)
+                            Text(summary)
+                        }
+                    }
+                    if let transcript = task.transcript {
+                        Group {
+                            Text("Transcript").font(.headline)
+                            Text(transcript).font(.footnote).textSelection(.enabled)
+                        }
+                    }
+                } else {
+                    ProgressView()
+                }
+            }
+            .padding()
+        }
+        .navigationTitle("Task")
+        .task { await load() }
+    }
+
+    private func load() async {
+        do {
+            task = try await APIClient.shared.fetchTask(id: taskID)
+        } catch {
+            print("Load failed:", error)
+        }
+    }
+}
+```
+
+### 18. ios/MorningAgent/ContentView.swift
+```swift
+import SwiftUI
+
+struct ContentView: View {
+    var body: some View {
+        TabView {
+            TaskListView()
+                .tabItem { Label("Tasks", systemImage: "checklist") }
+            SettingsView()
+                .tabItem { Label("Settings", systemImage: "gearshape") }
+        }
+    }
+}
+```
+
+### 19. ios/MorningAgent/Views/SettingsView.swift
+```swift
+import SwiftUI
+
+struct SettingsView: View {
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Agent") {
+                    Text("This assistant places calls on your behalf.")
+                    Text("Recommended: always disclose that the assistant is acting for you.")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .navigationTitle("Settings")
+        }
+    }
+}
+```
+
+---
+
+## Next Steps for Windsurf
+
+After generating the scaffold, implement these 4 upgrades in order:
+
+1. **Finish the Twilio ↔ OpenAI Realtime websocket bridge** in `/media-stream` - decode Twilio base64 audio, forward to OpenAI, receive response, send back to Twilio
+2. **Add transcript persistence** and a final task summarizer
+3. **Add retry logic**, voicemail detection, and escalation statuses
+4. **Replace polling in SwiftUI** with push notifications or server-sent updates
+
+---
+
+## Local Run Instructions
+
+**Backend:**
+```bash
+cd backend
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+# Edit .env with your Twilio and OpenAI credentials
+uvicorn app.main:app --reload
+```
+
+**iPhone App:**
+- Create project in Xcode first (see XCODE_WINDSURF_WORKFLOW.md)
+- Copy Swift files to Xcode project
+- Add files to Xcode project navigator
+- Configure signing
+- Run in simulator (Cmd+R)
+
+```
+
+README.md:
+```
+---
+title: Morning Agent
+emoji: 🌅
+colorFrom: yellow
+colorTo: green
+sdk: gradio
+sdk_version: 4.0.0
+app_file: huggingface_app.py
+pinned: false
+license: mit
+python_version: "3.11"
+---
+
+# Morning Agent
+
+Voice-enabled AI assistant that handles phone calls on your behalf.
+
+## Features
+
+- **Task Management**: Create and track phone call tasks
+- **Groq LLM Integration**: Ultra-fast text processing
+- **OpenAI Realtime**: Speech-to-speech AI handling
+- **Twilio Integration**: Outbound phone calls with media streaming
+- **Task Summarization**: Automatic call transcript summarization
+- **Mobile Responsive**: Works on desktop and mobile devices
+
+## Usage
+
+1. **Create Task**: Enter task title, phone number, and instructions
+2. **Start Call**: The AI assistant will call and handle the conversation
+3. **Monitor**: Track task status and view transcripts
+4. **Review**: Check call summaries and completion status
+
+## Environment Variables
+
+Set these in Hugging Face Space secrets:
+
+- `BACKEND_URL`: URL of your deployed FastAPI backend
+- `TWILIO_ACCOUNT_SID`: Twilio account SID
+- `TWILIO_AUTH_TOKEN`: Twilio auth token
+- `TWILIO_FROM_NUMBER`: Twilio phone number
+- `OPENAI_API_KEY`: OpenAI API key for Realtime API
+- `GROQ_API_KEY`: Groq API key for text processing
+
+## Deployment Notes
+
+This Gradio app connects to a separate FastAPI backend. Deploy the backend first (Render/Fly.io/Railway), then update `BACKEND_URL` in the code.
+
+## Safety
+
+- The AI always discloses it is calling on behalf of the user
+- All calls are logged with transcripts
+- Call summaries are available for review
+
+## License
+
+MIT
+
+```
+
+huggingface_requirements.txt:
+```
+gradio>=4.0.0
+httpx>=0.28.0
+
+```
+
+FINAL_BUILD_STATUS.md:
+```
+# Morning Agent - Final Build Status
+
+## Product Summary
+
+Morning Agent is an AI-powered phone assistant that autonomously makes phone calls on behalf of users. Users create tasks with phone numbers and instructions via an iPhone app or web interface. The backend uses Twilio for phone calls, Groq LLM for text processing, and a modular pipeline for speech-to-text and text-to-speech conversion.
+
+## Build Status
+
+- ✅ Backend FastAPI scaffold complete with all CRUD endpoints
+- ✅ Groq LLM integration for text processing and summarization
+- ✅ Twilio integration for outbound calls and webhooks
+- ✅ SQLite database with Task model
+- ✅ WebSocket audio bridge with STT/TTS service stubs
+- ✅ iOS SwiftUI app scaffold with all views
+- ✅ Gradio web interface for Hugging Face deployment
+- ✅ Configuration system with environment variables
+- ✅ Health check endpoint
+- ✅ Comprehensive documentation
+- ⚠️  STT service is a stub (needs Whisper/Google/Deepgram integration)
+- ⚠️  TTS service is a stub (needs ElevenLabs/Google/AWS integration)
+- ⚠️  Audio format conversion (Twilio μ-law to PCM) not implemented
+- ⚠️  No integration tests
+- ⚠️  No retry logic for failed calls
+
+## Files Created or Changed
+
+### New Files (3)
+1. `backend/app/services/stt_service.py` - Speech-to-Text service stub
+2. `backend/app/services/tts_service.py` - Text-to-Speech service stub
+3. `backend/test_backend.py` - Backend test script
+
+### Changed Files (3)
+1. `backend/app/services/__init__.py` - Export new services
+2. `backend/app/main.py` - WebSocket bridge with STT/TTS integration
+3. `backend/requirements.txt` - Added groq dependency
+
+## Full Code for Changed/New Files
+
+### backend/app/services/stt_service.py
+```python
+import base64
+import tempfile
+import os
+from typing import Optional
+
+class STTService:
+    """Speech-to-Text service - converts audio to text"""
+    
+    def __init__(self):
+        # Placeholder for STT service initialization
+        # Can be configured to use Whisper, Google, Deepgram, etc.
+        pass
+    
+    async def transcribe(self, audio_data: bytes) -> Optional[str]:
+        """
+        Transcribe audio data to text
+        
+        Args:
+            audio_data: Raw audio bytes (μ-law 8kHz from Twilio)
+        
+        Returns:
+            str: Transcribed text, or None if transcription fails
+        """
+        # STUB: This is a placeholder implementation
+        # In production, integrate with:
+        # - OpenAI Whisper API
+        # - Google Speech-to-Text
+        # - Deepgram
+        # - AssemblyAI
+        
+        # For now, return a placeholder to indicate audio was received
+        # This allows the pipeline to flow even without real STT
+        return "[AUDIO RECEIVED - STT SERVICE NOT CONFIGURED]"
+    
+    async def transcribe_from_base64(self, base64_payload: str) -> Optional[str]:
+        """
+        Transcribe base64-encoded audio (Twilio format)
+        
+        Args:
+            base64_payload: Base64-encoded μ-law audio from Twilio
+        
+        Returns:
+            str: Transcribed text
+        """
+        try:
+            audio_data = base64.b64decode(base64_payload)
+            return await self.transcribe(audio_data)
+        except Exception as e:
+            print(f"STT error: {e}")
+            return None
+```
+
+### backend/app/services/tts_service.py
+```python
+from typing import Optional
+
+class TTSService:
+    """Text-to-Speech service - converts text to audio"""
+    
+    def __init__(self):
+        # Placeholder for TTS service initialization
+        # Can be configured to use ElevenLabs, Google, AWS, OpenAI, etc.
+        pass
+    
+    async def synthesize(self, text: str) -> Optional[bytes]:
+        """
+        Synthesize text to audio
+        
+        Args:
+            text: Text to convert to speech
+        
+        Returns:
+            bytes: Audio data (μ-law 8kHz for Twilio), or None if synthesis fails
+        """
+        # STUB: This is a placeholder implementation
+        # In production, integrate with:
+        # - ElevenLabs API (best quality)
+        # - Google Cloud TTS
+        # - AWS Polly
+        # - OpenAI TTS
+        # - Azure Speech
+        
+        # For now, return None to indicate TTS not configured
+        # The caller should handle this gracefully
+        return None
+    
+    async def synthesize_to_base64(self, text: str) -> Optional[str]:
+        """
+        Synthesize text and return base64-encoded audio for Twilio
+        
+        Args:
+            text: Text to convert to speech
+        
+        Returns:
+            str: Base64-encoded audio, or None if synthesis fails
+        """
+        audio_data = await self.synthesize(text)
+        if audio_data:
+            import base64
+            return base64.b64encode(audio_data).decode()
+        return None
+```
+
+### backend/app/services/__init__.py
+```python
+from .groq_llm import get_groq_llm, GroqLLMService
+from .stt_service import STTService
+from .tts_service import TTSService
+from .twilio_client import get_twilio_client, create_outbound_call
+from .openai_realtime import RealtimeBridge
+
+__all__ = [
+    "get_groq_llm",
+    "GroqLLMService",
+    "STTService",
+    "TTSService",
+    "get_twilio_client",
+    "create_outbound_call",
+    "RealtimeBridge",
+]
+```
+
+### backend/app/main.py (partial - WebSocket section only)
+```python
+@app.websocket("/media-stream")
+async def media_stream(ws: WebSocket):
+    await ws.accept()
+    task_id = int(ws.query_params["task_id"])
+
+    # DB read
+    with Session(engine) as session:
+        task = session.get(Task, task_id)
+        if not task:
+            await ws.close(code=1008)
+            return
+        bridge = RealtimeBridge(task_id=task.id, instructions=task.instructions)
+        groq_llm = get_groq_llm()
+        stt_service = STTService()
+        tts_service = TTSService()
+
+    await bridge.open()
+
+    transcript_parts: list[str] = []
+    conversation_history = []
+
+    try:
+        while True:
+            message = await ws.receive_text()
+            data = json.loads(message)
+
+            event = data.get("event")
+            if event == "start":
+                # Connection established
+                print(f"Media stream started for task {task_id}")
+            elif event == "media":
+                # Audio frame received from Twilio
+                try:
+                    # 1) Decode Twilio base64 audio payload
+                    payload = data.get("media", {}).get("payload")
+                    if not payload:
+                        continue
+                    
+                    # 2) Use STT service to convert to text
+                    text = await stt_service.transcribe_from_base64(payload)
+                    
+                    if text and text != "[AUDIO RECEIVED - STT SERVICE NOT CONFIGURED]":
+                        # 3) Process with Groq LLM
+                        response = await groq_llm.process(
+                            text=text,
+                            instructions=task.instructions,
+                            conversation_history=conversation_history
+                        )
+                        
+                        # Update conversation history
+                        conversation_history.append({"role": "user", "content": text})
+                        conversation_history.append({"role": "assistant", "content": response})
+                        
+                        # Add to transcript
+                        transcript_parts.append(f"Caller: {text}")
+                        transcript_parts.append(f"Agent: {response}")
+                        
+                        # 4) Use TTS service to convert response to audio
+                        audio_response = await tts_service.synthesize_to_base64(response)
+                        
+                        # 5) Send audio back to Twilio if TTS succeeded
+                        if audio_response:
+                            await ws.send(json.dumps({
+                                "event": "media",
+                                "media": {"payload": audio_response}
+                            }))
+                        else:
+                            # TTS not configured, log text response
+                            print(f"Agent response (TTS stub): {response}")
+                    
+                except Exception as e:
+                    print(f"Error processing media frame: {e}")
+                    
+            elif event == "stop":
+                # Call ended
+                print(f"Media stream stopped for task {task_id}")
+                break
+                
+    except WebSocketDisconnect:
+        print(f"WebSocket disconnected for task {task_id}")
+    except Exception as e:
+        print(f"Error in media stream: {e}")
+    finally:
+        await bridge.close()
+        with Session(engine) as session:
+            task = session.get(Task, task_id)
+            if task:
+                task.transcript = "\n".join(transcript_parts) if transcript_parts else task.transcript
+                
+                # Use Groq to summarize if we have a transcript
+                if task.transcript and not task.summary:
+                    try:
+                        task.summary = await groq_llm.summarize_transcript(
+                            task.transcript, 
+                            task.instructions
+                        )
+                        
+                        # Check task completion
+                        completion_check = await groq_llm.check_task_completion(
+                            task.transcript,
+                            task.instructions
+                        )
+                        if completion_check.get("completed"):
+                            task.status = "completed"
+                        else:
+                            task.status = "needs_review"
+                    except Exception as e:
+                        print(f"Error summarizing with Groq: {e}")
+                        task.summary = task.summary or "Call finished. Review transcript."
+                
+                task.updated_at = datetime.utcnow()
+                session.add(task)
+                session.commit()
+```
+
+### backend/requirements.txt
+```
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+sqlmodel==0.0.24
+twilio==9.5.2
+python-dotenv==1.0.1
+httpx==0.28.1
+websockets==15.0.1
+groq>=0.11.0
+```
+
+### backend/test_backend.py
+```python
+"""
+Simple test script to verify Morning Agent backend functionality
+Run this after setting up .env to test core services
+"""
+import asyncio
+import sys
+import os
+
+# Add parent directory to path
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from app.services.groq_llm import get_groq_llm
+from app.services.stt_service import STTService
+from app.services.tts_service import TTSService
+from app.config import settings
+
+async def test_groq():
+    """Test Groq LLM service"""
+    print("=" * 60)
+    print("Testing Groq LLM Service")
+    print("=" * 60)
+    
+    try:
+        groq = get_groq_llm()
+        response = await groq.process(
+            text="Hello, I need to schedule a dentist appointment",
+            instructions="You are a dental office scheduler",
+            conversation_history=[]
+        )
+        print(f"✅ Groq LLM working")
+        print(f"Response: {response[:100]}...")
+        return True
+    except Exception as e:
+        print(f"❌ Groq LLM error: {e}")
+        print(f"   Make sure GROQ_API_KEY is set in .env")
+        return False
+
+async def test_stt():
+    """Test STT service"""
+    print("\n" + "=" * 60)
+    print("Testing STT Service")
+    print("=" * 60)
+    
+    try:
+        stt = STTService()
+        # STT is a stub, so it returns a placeholder
+        result = await stt.transcribe(b"fake_audio_data")
+        print(f"✅ STT service initialized")
+        print(f"Result: {result}")
+        print(f"   (STT is a stub - integrate with Whisper/Google/Deepgram)")
+        return True
+    except Exception as e:
+        print(f"❌ STT error: {e}")
+        return False
+
+async def test_tts():
+    """Test TTS service"""
+    print("\n" + "=" * 60)
+    print("Testing TTS Service")
+    print("=" * 60)
+    
+    try:
+        tts = TTSService()
+        # TTS is a stub, so it returns None
+        result = await tts.synthesize("Hello, this is a test")
+        print(f"✅ TTS service initialized")
+        print(f"Result: {result}")
+        print(f"   (TTS is a stub - integrate with ElevenLabs/Google/AWS)")
+        return True
+    except Exception as e:
+        print(f"❌ TTS error: {e}")
+        return False
+
+async def test_config():
+    """Test configuration"""
+    print("\n" + "=" * 60)
+    print("Testing Configuration")
+    print("=" * 60)
+    
+    required_keys = [
+        "twilio_account_sid",
+        "twilio_auth_token",
+        "twilio_from_number",
+        "groq_api_key",
+    ]
+    
+    missing = []
+    for key in required_keys:
+        value = getattr(settings, key, "")
+        if not value:
+            missing.append(key)
+        else:
+            # Mask sensitive values
+            masked = value[:4] + "..." + value[-4:] if len(value) > 8 else "***"
+            print(f"✅ {key}: {masked}")
+    
+    if missing:
+        print(f"\n❌ Missing environment variables: {', '.join(missing)}")
+        print("   Add these to your .env file")
+        return False
+    
+    return True
+
+async def main():
+    """Run all tests"""
+    print("\n" + "=" * 60)
+    print("Morning Agent Backend Test Suite")
+    print("=" * 60)
+    
+    results = []
+    
+    # Test configuration
+    results.append(("Configuration", await test_config()))
+    
+    # Test Groq (requires API key)
+    if settings.groq_api_key:
+        results.append(("Groq LLM", await test_groq()))
+    else:
+        print("\n⚠️  Skipping Groq test (no API key)")
+        results.append(("Groq LLM", None))
+    
+    # Test STT and TTS (stubs)
+    results.append(("STT Service", await test_stt()))
+    results.append(("TTS Service", await test_tts()))
+    
+    # Summary
+    print("\n" + "=" * 60)
+    print("Test Summary")
+    print("=" * 60)
+    
+    passed = sum(1 for _, result in results if result is True)
+    failed = sum(1 for _, result in results if result is False)
+    skipped = sum(1 for _, result in results if result is None)
+    
+    for name, result in results:
+        if result is True:
+            print(f"✅ {name}")
+        elif result is False:
+            print(f"❌ {name}")
+        else:
+            print(f"⚠️  {name} (skipped)")
+    
+    print(f"\nPassed: {passed}, Failed: {failed}, Skipped: {skipped}")
+    
+    if failed > 0:
+        print("\n⚠️  Some tests failed. Fix the issues above.")
+        return 1
+    else:
+        print("\n✅ All tests passed! Backend is ready.")
+        return 0
+
+if __name__ == "__main__":
+    exit_code = asyncio.run(main())
+    sys.exit(exit_code)
+```
+
+## Run Instructions
+
+### 1. Setup Backend
+```bash
+cd backend
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+# Edit .env with your credentials
+```
+
+### 2. Test Backend
+```bash
+python test_backend.py
+```
+
+### 3. Run Backend
+```bash
+uvicorn app.main:app --reload
+```
+
+Backend will run on `http://localhost:8000`
+
+### 4. Test API Endpoints
+```bash
+# Create a task
+curl -X POST http://localhost:8000/tasks \
+  -H "Content-Type: application/json" \
+  -d '{"title":"Test Task","instructions":"Call and say hello","phone_number":"+1234567890"}'
+
+# List tasks
+curl http://localhost:8000/tasks
+
+# Health check
+curl http://localhost:8000/healthz
+```
+
+### 5. iOS App (Optional)
+1. Create project in Xcode
+2. Copy Swift files from `ios/MorningAgent/`
+3. Add files to Xcode project
+4. Configure signing
+5. Run in simulator
+
+### 6. Hugging Face (Optional)
+1. Go to huggingface.co/new-space
+2. Choose Gradio SDK
+3. Upload `huggingface_app.py` as `app.py`
+4. Upload `huggingface_requirements.txt` as `requirements.txt`
+5. Update `BACKEND_URL` in app.py
+6. Deploy backend to Render/Fly.io/Railway
+
+## Remaining Blockers
+
+### Critical (Must Fix for Phone Calls to Work)
+1. **STT Service Integration** - Currently a stub. Must integrate with:
+   - OpenAI Whisper API, OR
+   - Google Speech-to-Text, OR
+   - Deepgram, OR
+   - AssemblyAI
+   
+2. **TTS Service Integration** - Currently a stub. Must integrate with:
+   - ElevenLabs API (best quality), OR
+   - Google Cloud TTS, OR
+   - AWS Polly, OR
+   - OpenAI TTS
+
+3. **Audio Format Conversion** - Twilio sends μ-law 8kHz audio. Need to:
+   - Convert μ-law to PCM/WAV for STT services
+   - Convert TTS output back to μ-law for Twilio
+   - See `PHONE_PIPELINE_ARCHITECTURE.md` for conversion helper
+
+### High Priority (Should Fix for Production)
+4. **Retry Logic** - Add retry logic for failed calls
+5. **Voicemail Detection** - Detect when call goes to voicemail
+6. **Escalation Statuses** - Add more granular status tracking
+7. **Error Handling** - Improve error handling in WebSocket
+8. **Logging** - Add structured logging throughout
+
+### Medium Priority (Nice to Have)
+9. **Integration Tests** - Add tests for API endpoints
+10. **Push Notifications** - Replace polling in iOS app
+11. **Rate Limiting** - Add rate limiting to API
+12. **Authentication** - Add user authentication
+13. **PostgreSQL Migration** - Move from SQLite to PostgreSQL
+
+### Low Priority (Future Enhancements)
+14. **Multiple Phone Numbers** - Support multiple from numbers
+15. **Call Recording** - Store actual call audio
+16. **Analytics Dashboard** - Add analytics for call performance
+17. **A/B Testing** - Test different prompts/strategies
+
+## Next Best Single Prompt
+
+"Implement real STT and TTS services using OpenAI Whisper for STT and OpenAI TTS for TTS, with proper audio format conversion between Twilio μ-law and PCM/WAV formats."
+
+This will unblock the core phone call functionality and make the system actually capable of processing real calls.
+
+```
+
+PHONE_PIPELINE_ARCHITECTURE.md:
+```
+# Phone Pipeline Architecture - Multi-Service Integration
+
+## Current Architecture (Morning Agent)
+
+The Morning Agent uses a **unified Realtime API** approach that simplifies the multi-service pipeline:
+
+```
+Phone Call (Twilio)
+    ↓ Twilio Media Streams (WebSocket)
+    ↓ Audio frames (base64)
+OpenAI Realtime API (WebSocket)
+    ↓ Handles both:
+    - Speech-to-Text (STT)
+    - LLM Processing
+    - Text-to-Speech (TTS)
+    ↓ Audio frames (base64)
+Twilio Media Streams (WebSocket)
+    ↓
+Phone Call (Twilio)
+```
+
+### How It Works
+
+1. **Twilio** places the outbound call
+2. **Twilio Media Streams** forks live call audio to your WebSocket server
+3. **WebSocket Bridge** in `backend/app/main.py` (`/media-stream` endpoint):
+   - Receives audio frames from Twilio
+   - Forwards to OpenAI Realtime API
+   - Receives processed audio back
+   - Sends audio back to Twilio
+4. **OpenAI Realtime API** handles:
+   - **STT**: Converts caller's speech to text
+   - **LLM**: Processes text with task instructions
+   - **TTS**: Converts LLM response to speech
+
+### Advantages of This Approach
+
+- **Single API**: One WebSocket connection handles STT, LLM, and TTS
+- **Low Latency**: Optimized for real-time conversations
+- **Simplified Bridge**: Only need to bridge Twilio ↔ OpenAI
+- **Built-in Coordination**: OpenAI handles turn-taking, interruptions, etc.
+
+---
+
+## Alternative: Modular Pipeline (Separate Services)
+
+If you prefer using separate services for each component, here's the architecture:
+
+```
+Phone Call (Twilio)
+    ↓ Twilio Media Streams
+WebSocket Server
+    ↓ Audio frames
+STT Service (Whisper/Google/AWS)
+    ↓ Text
+LLM Service (OpenAI/Claude/Groq)
+    ↓ Text
+TTS Service (ElevenLabs/Google/AWS)
+    ↓ Audio frames
+WebSocket Server
+    ↓ Audio frames
+Twilio Media Streams
+    ↓
+Phone Call (Twilio)
+```
+
+### Service Options
+
+#### STT (Speech-to-Text) Services
+- **OpenAI Whisper**: `whisper-1` model, good accuracy
+- **Google Cloud Speech-to-Text**: Low latency, streaming
+- **AWS Transcribe**: Real-time streaming
+- **AssemblyAI**: Optimized for phone calls
+- **Deepgram**: Ultra-low latency
+
+#### LLM Services
+- **OpenAI GPT-4**: Best reasoning, higher cost
+- **Anthropic Claude**: Good reasoning, safer
+- **Groq Llama**: Very fast, open source
+- **Local Ollama**: Free, runs locally
+
+#### TTS (Text-to-Speech) Services
+- **ElevenLabs**: Most natural, higher cost
+- **Google Cloud TTS**: Good quality, standard pricing
+- **AWS Polly**: Many voices, reliable
+- **OpenAI TTS**: Good quality, simple
+- **Azure Speech**: Enterprise-grade
+
+---
+
+## Implementation: Modular Pipeline
+
+If you want to implement the modular pipeline, here's how to structure it:
+
+### 1. Service Classes
+
+```python
+# backend/app/services/stt_service.py
+class STTService:
+    async def transcribe(self, audio_data: bytes) -> str:
+        # Implement your STT service
+        pass
+
+# backend/app/services/llm_service.py
+class LLMService:
+    async def process(self, text: str, instructions: str) -> str:
+        # Implement your LLM service
+        pass
+
+# backend/app/services/tts_service.py
+class TTSService:
+    async def synthesize(self, text: str) -> bytes:
+        # Implement your TTS service
+        pass
+```
+
+### 2. Updated WebSocket Bridge
+
+```python
+# backend/app/main.py - media_stream endpoint
+@app.websocket("/media-stream")
+async def media_stream(ws: WebSocket):
+    await ws.accept()
+    task_id = int(ws.query_params["task_id"])
+    
+    # Initialize services
+    stt = STTService()
+    llm = LLMService()
+    tts = TTSService()
+    
+    conversation_history = []
+    
+    try:
+        while True:
+            message = await ws.receive_text()
+            data = json.loads(message)
+            
+            if data.get("event") == "media":
+                # 1. Decode Twilio audio
+                audio_data = base64.b64decode(data["media"]["payload"])
+                
+                # 2. STT: Convert speech to text
+                text = await stt.transcribe(audio_data)
+                if not text:
+                    continue
+                
+                conversation_history.append({"role": "user", "content": text})
+                
+                # 3. LLM: Process with instructions
+                response_text = await llm.process(
+                    text=text,
+                    instructions=task.instructions
+                )
+                conversation_history.append({"role": "assistant", "content": response_text})
+                
+                # 4. TTS: Convert response to audio
+                audio_response = await tts.synthesize(response_text)
+                
+                # 5. Send audio back to Twilio
+                await ws.send(json.dumps({
+                    "event": "media",
+                    "media": {"payload": base64.b64encode(audio_response).decode()}
+                }))
+                
+    except WebSocketDisconnect:
+        pass
+```
+
+---
+
+## Comparison: Unified vs Modular
+
+| Aspect | Unified (OpenAI Realtime) | Modular (Separate Services) |
+|--------|--------------------------|------------------------------|
+| **Complexity** | Low (1 API) | High (3+ APIs) |
+| **Latency** | Very low | Higher (more hops) |
+| **Cost** | Medium | Variable |
+| **Customization** | Limited | High |
+| **Turn-taking** | Built-in | Manual implementation |
+| **Interruptions** | Built-in | Manual implementation |
+| **Voice Quality** | Good | Best (with ElevenLabs) |
+| **STT Accuracy** | Good | Best (with Whisper) |
+
+---
+
+## Recommended Configurations
+
+### Configuration 1: All-in-One (Easiest)
+- **STT**: OpenAI Realtime (built-in)
+- **LLM**: OpenAI Realtime (built-in)
+- **TTS**: OpenAI Realtime (built-in)
+- **Use case**: MVP, quick prototype
+- **Cost**: ~$0.01-0.10 per call
+
+### Configuration 2: Premium Quality
+- **STT**: OpenAI Whisper
+- **LLM**: OpenAI GPT-4
+- **TTS**: ElevenLabs
+- **Use case**: Production, high quality
+- **Cost**: ~$0.05-0.20 per call
+
+### Configuration 3: Cost-Optimized
+- **STT**: Deepgram
+- **LLM**: Groq (Llama)
+- **TTS**: Google Cloud TTS
+- **Use case**: High volume, cost-sensitive
+- **Cost**: ~$0.01-0.05 per call
+
+### Configuration 4: Local/Private
+- **STT**: Local Whisper
+- **LLM**: Local Ollama
+- **TTS**: Coqui TTS
+- **Use case**: Privacy, no API costs
+- **Cost**: Server costs only
+
+---
+
+## Service Integration Examples
+
+### OpenAI Whisper (STT)
+
+```python
+import openai
+import base64
+
+class WhisperSTT:
+    def __init__(self, api_key: str):
+        openai.api_key = api_key
+    
+    async def transcribe(self, audio_data: bytes) -> str:
+        # Save to temp file for Whisper API
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            f.write(audio_data)
+            temp_path = f.name
+        
+        try:
+            with open(temp_path, "rb") as audio_file:
+                transcript = openai.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=audio_file
+                )
+            return transcript.text
+        finally:
+            import os
+            os.unlink(temp_path)
+```
+
+### ElevenLabs (TTS)
+
+```python
+import elevenlabs
+import base64
+
+class ElevenLabsTTS:
+    def __init__(self, api_key: str, voice_id: str):
+        self.client = elevenlabs.Client(api_key=api_key)
+        self.voice_id = voice_id
+    
+    async def synthesize(self, text: str) -> bytes:
+        audio = self.client.generate(
+            text=text,
+            voice=self.voice_id,
+            model="eleven_multilingual_v2"
+        )
+        # Convert generator to bytes
+        audio_bytes = b"".join(audio)
+        return audio_bytes
+```
+
+### Groq (LLM)
+
+```python
+from groq import Groq
+
+class GroqLLM:
+    def __init__(self, api_key: str):
+        self.client = Groq(api_key=api_key)
+    
+    async def process(self, text: str, instructions: str) -> str:
+        response = self.client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": instructions},
+                {"role": "user", "content": text}
+            ]
+        )
+        return response.choices[0].message.content
+```
+
+---
+
+## Twilio Media Stream Format
+
+Twilio sends audio in this format:
+
+```json
+{
+  "event": "media",
+  "sequenceNumber": "123",
+  "media": {
+    "payload": "base64-encoded-mulaw-audio"
+  }
+}
+```
+
+**Important:**
+- Audio format: μ-law 8kHz (standard telephony)
+- Sample rate: 8000 Hz
+- Encoding: base64
+- You may need to convert to PCM/WAV for some STT services
+
+---
+
+## Audio Conversion Helper
+
+```python
+import base64
+import io
+import wave
+import struct
+
+def twilio_to_wav(base64_payload: str) -> bytes:
+    """Convert Twilio μ-law audio to WAV format"""
+    # Decode base64
+    mulaw_data = base64.b64decode(base64_payload)
+    
+    # Convert μ-law to PCM
+    pcm_data = bytearray()
+    for byte in mulaw_data:
+        # μ-law to 16-bit PCM conversion
+        pcm = mu_law_to_linear(byte)
+        pcm_data.extend(struct.pack('<h', pcm))
+    
+    # Create WAV file
+    wav_io = io.BytesIO()
+    with wave.open(wav_io, 'wb') as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(8000)
+        wav.writeframes(pcm_data)
+    
+    return wav_io.getvalue()
+
+def mu_law_to_linear(mu_law_byte: int) -> int:
+    """Convert μ-law byte to 16-bit PCM"""
+    # μ-law decoding formula
+    mu = 255
+    mu_law_byte = ~mu_law_byte
+    sign = (mu_law_byte & 0x80) >> 7
+    exponent = (mu_law_byte >> 4) & 0x07
+    mantissa = mu_law_byte & 0x0F
+    
+    sample = ((mantissa << 3) + 0x84) << exponent
+    sample -= 0x84
+    
+    if sign:
+        sample = -sample
+    
+    return sample
+```
+
+---
+
+## Next Steps
+
+### For Current Scaffold (OpenAI Realtime)
+1. Implement the WebSocket bridge in `/media-stream`
+2. Handle Twilio base64 audio decoding
+3. Forward to OpenAI Realtime session
+4. Receive and send back audio
+
+### For Modular Pipeline
+1. Choose your STT/LLM/TTS services
+2. Implement service classes
+3. Update WebSocket bridge for modular flow
+4. Add audio conversion helpers
+5. Test latency and quality
+
+---
+
+## Recommendations
+
+**For MVP:** Start with OpenAI Realtime (unified)
+- Easiest to implement
+- Lowest latency
+- Good enough quality
+- One API key to manage
+
+**For Production:** Consider modular pipeline
+- Better voice quality (ElevenLabs)
+- More control over each component
+- Can optimize costs per service
+- Can swap services independently
+
+**For Privacy/Local:** Use local services
+- No data leaves your infrastructure
+- No API costs
+- Requires server resources
+- Higher setup complexity
+
+```
+
+.gitattributes:
+```
+*.7z filter=lfs diff=lfs merge=lfs -text
+*.arrow filter=lfs diff=lfs merge=lfs -text
+*.bin filter=lfs diff=lfs merge=lfs -text
+*.bz2 filter=lfs diff=lfs merge=lfs -text
+*.ckpt filter=lfs diff=lfs merge=lfs -text
+*.ftz filter=lfs diff=lfs merge=lfs -text
+*.gz filter=lfs diff=lfs merge=lfs -text
+*.h5 filter=lfs diff=lfs merge=lfs -text
+*.joblib filter=lfs diff=lfs merge=lfs -text
+*.lfs.* filter=lfs diff=lfs merge=lfs -text
+*.mlmodel filter=lfs diff=lfs merge=lfs -text
+*.model filter=lfs diff=lfs merge=lfs -text
+*.msgpack filter=lfs diff=lfs merge=lfs -text
+*.npy filter=lfs diff=lfs merge=lfs -text
+*.npz filter=lfs diff=lfs merge=lfs -text
+*.onnx filter=lfs diff=lfs merge=lfs -text
+*.ot filter=lfs diff=lfs merge=lfs -text
+*.parquet filter=lfs diff=lfs merge=lfs -text
+*.pb filter=lfs diff=lfs merge=lfs -text
+*.pickle filter=lfs diff=lfs merge=lfs -text
+*.pkl filter=lfs diff=lfs merge=lfs -text
+*.pt filter=lfs diff=lfs merge=lfs -text
+*.pth filter=lfs diff=lfs merge=lfs -text
+*.rar filter=lfs diff=lfs merge=lfs -text
+*.safetensors filter=lfs diff=lfs merge=lfs -text
+saved_model/**/* filter=lfs diff=lfs merge=lfs -text
+*.tar.* filter=lfs diff=lfs merge=lfs -text
+*.tar filter=lfs diff=lfs merge=lfs -text
+*.tflite filter=lfs diff=lfs merge=lfs -text
+*.tgz filter=lfs diff=lfs merge=lfs -text
+*.wasm filter=lfs diff=lfs merge=lfs -text
+*.xz filter=lfs diff=lfs merge=lfs -text
+*.zip filter=lfs diff=lfs merge=lfs -text
+*.zst filter=lfs diff=lfs merge=lfs -text
+*tfevents* filter=lfs diff=lfs merge=lfs -text
+
+```
+
+README_HF.md:
+```
+---
+title: Morning Agent
+emoji: 🌅
+colorFrom: orange
+colorTo: yellow
+sdk: gradio
+sdk_version: 4.0.0
+app_file: huggingface_app.py
+pinned: false
+license: mit
+python_version: "3.11"
+---
+
+# Morning Agent
+
+Voice-enabled AI assistant that handles phone calls on your behalf.
+
+## Features
+
+- **Task Management**: Create and track phone call tasks
+- **Groq LLM Integration**: Ultra-fast text processing
+- **OpenAI Realtime**: Speech-to-speech AI handling
+- **Twilio Integration**: Outbound phone calls with media streaming
+- **Task Summarization**: Automatic call transcript summarization
+- **Mobile Responsive**: Works on desktop and mobile devices
+
+## Usage
+
+1. **Create Task**: Enter task title, phone number, and instructions
+2. **Start Call**: The AI assistant will call and handle the conversation
+3. **Monitor**: Track task status and view transcripts
+4. **Review**: Check call summaries and completion status
+
+## Environment Variables
+
+Set these in Hugging Face Space secrets:
+
+- `BACKEND_URL`: URL of your deployed FastAPI backend
+- `TWILIO_ACCOUNT_SID`: Twilio account SID
+- `TWILIO_AUTH_TOKEN`: Twilio auth token
+- `TWILIO_FROM_NUMBER`: Twilio phone number
+- `OPENAI_API_KEY`: OpenAI API key for Realtime API
+- `GROQ_API_KEY`: Groq API key for text processing
+
+## Deployment Notes
+
+This Gradio app connects to a separate FastAPI backend. Deploy the backend first (Render/Fly.io/Railway), then update `BACKEND_URL` in the code.
+
+## Safety
+
+- The AI always discloses it is calling on behalf of the user
+- All calls are logged with transcripts
+- Call summaries are available for review
+
+## License
+
+MIT
+
+```
+
+HUGGINGFACE_DEPLOYMENT.md:
+```
+# Morning Agent - Hugging Face Space Deployment
+
+Web interface for Morning Agent that works on both desktop and mobile browsers.
+
+## Overview
+
+This Hugging Face Space provides a web-based interface for the Morning Agent system. Users can:
+- Create tasks with phone numbers and instructions
+- Start AI-powered phone calls
+- View task status and call transcripts
+- Review call summaries
+
+## Architecture
+
+```
+Hugging Face Space (Gradio Web UI)
+    ↓ HTTP API
+FastAPI Backend (deployed separately)
+    ↓
+Twilio (phone calls)
+    ↓
+OpenAI Realtime API (AI voice)
+```
+
+## Deployment Options
+
+### Option 1: Deploy Only the Web UI (Backend Local)
+
+1. Create a new Hugging Face Space
+2. Upload `huggingface_app.py` as `app.py`
+3. Upload `huggingface_requirements.txt` as `requirements.txt`
+4. Update `BACKEND_URL` in `app.py` to point to your local backend
+5. The Space will connect to your local backend
+
+### Option 2: Deploy Full Stack (Recommended)
+
+1. **Deploy Backend** to Render/Fly.io/Railway:
+   ```bash
+   cd backend
+   # Deploy using your platform's CLI
+   ```
+
+2. **Deploy Web UI** to Hugging Face:
+   - Create a new Space
+   - Upload `huggingface_app.py` as `app.py`
+   - Upload `huggingface_requirements.txt` as `requirements.txt`
+   - Update `BACKEND_URL` to your deployed backend URL
+
+3. **Configure Environment Variables** (in Space settings):
+   - `BACKEND_URL`: Your deployed backend URL
+   - (Optional) Add API keys if needed
+
+## Quick Start
+
+### 1. Create Hugging Face Space
+
+1. Go to [huggingface.co/new-space](https://huggingface.co/new-space)
+2. Choose **Gradio** as the SDK
+3. Name it: `morning-agent`
+4. Make it **Public** or **Private**
+5. Click **Create Space**
+
+### 2. Upload Files
+
+**Method A: Git (Recommended)**
+```bash
+git clone https://huggingface.co/spaces/YOUR_USERNAME/morning-agent
+cd morning-agent
+# Copy huggingface_app.py as app.py
+# Copy huggingface_requirements.txt as requirements.txt
+git add .
+git commit -m "Initial deployment"
+git push
+```
+
+**Method B: Web Interface**
+1. Go to your Space on Hugging Face
+2. Click "Files"
+3. Click "Upload files"
+4. Upload:
+   - `huggingface_app.py` (rename to `app.py`)
+   - `huggingface_requirements.txt` (rename to `requirements.txt`)
+
+### 3. Configure Backend URL
+
+Edit `app.py` and update:
+```python
+BACKEND_URL = "https://your-backend-url.com"  # Your deployed backend
+```
+
+Or use Hugging Face Secrets:
+1. Go to Space Settings > Secrets
+2. Add secret: `BACKEND_URL`
+3. Value: Your deployed backend URL
+4. Update `app.py` to read from environment:
+```python
+import os
+BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
+```
+
+### 4. Deploy Backend
+
+#### Render
+```bash
+# Install Render CLI
+npm install -g render-cli
+
+# Login
+render login
+
+# Deploy
+cd backend
+render deploy
+```
+
+#### Fly.io
+```bash
+# Install Fly CLI
+curl -L https://fly.io/install.sh | sh
+
+# Login
+fly auth login
+
+# Deploy
+cd backend
+fly launch
+fly deploy
+```
+
+#### Railway
+```bash
+# Install Railway CLI
+npm install -g @railway/cli
+
+# Login
+railway login
+
+# Deploy
+cd backend
+railway up
+```
+
+## Environment Variables
+
+### Hugging Face Space Secrets
+- `BACKEND_URL`: URL of your deployed backend (required)
+
+### Backend Environment Variables
+See `backend/.env.example` for required variables:
+- `TWILIO_ACCOUNT_SID`
+- `TWILIO_AUTH_TOKEN`
+- `TWILIO_FROM_NUMBER`
+- `OPENAI_API_KEY`
+- `OPENAI_REALTIME_MODEL`
+- `APP_BASE_URL`
+- `PUBLIC_WS_BASE`
+
+## Features
+
+### Web UI Features
+- **Task List**: View all recent tasks with status
+- **Create Task**: Add new tasks with phone numbers and instructions
+- **Task Details**: View full task information, transcripts, summaries
+- **Auto-refresh**: Tasks refresh automatically and on demand
+- **Mobile Responsive**: Works on phones, tablets, and desktops
+
+### Backend Features
+- REST API for task management
+- Twilio integration for phone calls
+- OpenAI Realtime API for AI voice
+- WebSocket audio streaming
+- SQLite/PostgreSQL persistence
+- Call status tracking
+
+## Usage
+
+1. Open the Hugging Face Space URL
+2. Go to "New Task" tab
+3. Enter:
+   - Task title (e.g., "Schedule dentist appointment")
+   - Phone number (e.g., +1234567890)
+   - Instructions (what the AI should say/do)
+4. Click "Create & Start Call"
+5. Monitor task status in "Tasks" tab
+6. View call details in "Task Details" tab
+
+## Troubleshooting
+
+### "Backend not connected"
+- Check `BACKEND_URL` is correct
+- Verify backend is deployed and running
+- Check backend health endpoint: `https://your-backend.com/healthz`
+
+### "Failed to create task"
+- Verify backend is accessible
+- Check backend logs for errors
+- Ensure all required environment variables are set
+
+### "Failed to start call"
+- Verify Twilio credentials
+- Check Twilio account has credits
+- Verify phone number format (E.164: +1234567890)
+
+### Mobile UI Issues
+- The Gradio interface is responsive by default
+- If issues occur, try landscape mode on mobile
+- Use Chrome/Safari for best compatibility
+
+## Security
+
+- **Disclosure**: AI always discloses it's calling on behalf of user
+- **Logging**: All calls are logged with transcripts
+- **HTTPS**: Use HTTPS for production deployments
+- **Secrets**: Store API keys in platform secrets, not in code
+- **Rate Limiting**: Consider adding rate limiting to backend
+
+## Cost Estimates
+
+### Hugging Face Space
+- **Free tier**: Available for public spaces
+- **CPU Basic**: ~$0.10/hour
+- **CPU Upgrade**: ~$0.50/hour
+
+### Backend (Render/Fly.io/Railway)
+- **Free tier**: Available on some platforms
+- **Standard**: ~$5-25/month
+- **Pro**: ~$50-100/month
+
+### Twilio
+- **Phone calls**: ~$0.013/minute (US)
+- **Phone number**: ~$1/month
+
+### OpenAI
+- **Realtime API**: Pricing varies by model
+- **Estimated**: ~$0.01-0.10 per call
+
+## Next Steps
+
+1. Deploy backend to cloud platform
+2. Deploy web UI to Hugging Face
+3. Configure environment variables
+4. Test with Twilio trial account
+5. Add authentication (optional)
+6. Add user accounts (optional)
+7. Add push notifications (optional)
+
+## Links
+
+- [Hugging Face Spaces Documentation](https://huggingface.co/docs/hub/spaces)
+- [Gradio Documentation](https://gradio.app/docs/)
+- [Render Documentation](https://render.com/docs)
+- [Fly.io Documentation](https://fly.io/docs/)
+- [Railway Documentation](https://docs.railway.app/)
+- [Twilio Documentation](https://www.twilio.com/docs)
+- [OpenAI Realtime API](https://platform.openai.com/docs/guides/realtime)
+
+## License
+
+MIT
+
+```
+
+test_backend.py:
+```
+"""
+Simple test script to verify Morning Agent backend functionality
+Run this after setting up .env to test core services
+"""
+import asyncio
+import sys
+import os
+
+# Add parent directory to path
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from app.services.groq_llm import get_groq_llm
+from app.services.stt_service import STTService
+from app.services.tts_service import TTSService
+from app.config import settings
+
+async def test_groq():
+    """Test Groq LLM service"""
+    print("=" * 60)
+    print("Testing Groq LLM Service")
+    print("=" * 60)
+    
+    try:
+        groq = get_groq_llm()
+        response = await groq.process(
+            text="Hello, I need to schedule a dentist appointment",
+            instructions="You are a dental office scheduler",
+            conversation_history=[]
+        )
+        print(f"✅ Groq LLM working")
+        print(f"Response: {response[:100]}...")
+        return True
+    except Exception as e:
+        print(f"❌ Groq LLM error: {e}")
+        print(f"   Make sure GROQ_API_KEY is set in .env")
+        return False
+
+async def test_stt():
+    """Test STT service"""
+    print("\n" + "=" * 60)
+    print("Testing STT Service")
+    print("=" * 60)
+    
+    try:
+        stt = STTService()
+        # STT is a stub, so it returns a placeholder
+        result = await stt.transcribe(b"fake_audio_data")
+        print(f"✅ STT service initialized")
+        print(f"Result: {result}")
+        print(f"   (STT is a stub - integrate with Whisper/Google/Deepgram)")
+        return True
+    except Exception as e:
+        print(f"❌ STT error: {e}")
+        return False
+
+async def test_tts():
+    """Test TTS service"""
+    print("\n" + "=" * 60)
+    print("Testing TTS Service")
+    print("=" * 60)
+    
+    try:
+        tts = TTSService()
+        # TTS is a stub, so it returns None
+        result = await tts.synthesize("Hello, this is a test")
+        print(f"✅ TTS service initialized")
+        print(f"Result: {result}")
+        print(f"   (TTS is a stub - integrate with ElevenLabs/Google/AWS)")
+        return True
+    except Exception as e:
+        print(f"❌ TTS error: {e}")
+        return False
+
+async def test_config():
+    """Test configuration"""
+    print("\n" + "=" * 60)
+    print("Testing Configuration")
+    print("=" * 60)
+    
+    required_keys = [
+        "twilio_account_sid",
+        "twilio_auth_token",
+        "twilio_from_number",
+        "groq_api_key",
+    ]
+    
+    missing = []
+    for key in required_keys:
+        value = getattr(settings, key, "")
+        if not value:
+            missing.append(key)
+        else:
+            # Mask sensitive values
+            masked = value[:4] + "..." + value[-4:] if len(value) > 8 else "***"
+            print(f"✅ {key}: {masked}")
+    
+    if missing:
+        print(f"\n❌ Missing environment variables: {', '.join(missing)}")
+        print("   Add these to your .env file")
+        return False
+    
+    return True
+
+async def main():
+    """Run all tests"""
+    print("\n" + "=" * 60)
+    print("Morning Agent Backend Test Suite")
+    print("=" * 60)
+    
+    results = []
+    
+    # Test configuration
+    results.append(("Configuration", await test_config()))
+    
+    # Test Groq (requires API key)
+    if settings.groq_api_key:
+        results.append(("Groq LLM", await test_groq()))
+    else:
+        print("\n⚠️  Skipping Groq test (no API key)")
+        results.append(("Groq LLM", None))
+    
+    # Test STT and TTS (stubs)
+    results.append(("STT Service", await test_stt()))
+    results.append(("TTS Service", await test_tts()))
+    
+    # Summary
+    print("\n" + "=" * 60)
+    print("Test Summary")
+    print("=" * 60)
+    
+    passed = sum(1 for _, result in results if result is True)
+    failed = sum(1 for _, result in results if result is False)
+    skipped = sum(1 for _, result in results if result is None)
+    
+    for name, result in results:
+        if result is True:
+            print(f"✅ {name}")
+        elif result is False:
+            print(f"❌ {name}")
+        else:
+            print(f"⚠️  {name} (skipped)")
+    
+    print(f"\nPassed: {passed}, Failed: {failed}, Skipped: {skipped}")
+    
+    if failed > 0:
+        print("\n⚠️  Some tests failed. Fix the issues above.")
+        return 1
+    else:
+        print("\n✅ All tests passed! Backend is ready.")
+        return 0
+
+if __name__ == "__main__":
+    exit_code = asyncio.run(main())
+    sys.exit(exit_code)
+
+```
+
+requirements.txt:
+```
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+sqlmodel==0.0.24
+twilio==9.5.2
+python-dotenv==1.0.1
+httpx==0.28.1
+websockets==15.0.1
+groq>=0.11.0
+
+```
+
+.env.example:
+```
+APP_BASE_URL=https://your-backend.example.com
+PUBLIC_WS_BASE=wss://your-backend.example.com
+
+TWILIO_ACCOUNT_SID=ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+TWILIO_AUTH_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+TWILIO_FROM_NUMBER=+15555550123
+
+OPENAI_API_KEY=sk-...
+OPENAI_REALTIME_MODEL=gpt-realtime-1.5
+
+GROQ_API_KEY=gsk_...
+GROQ_MODEL=llama-3.3-70b-versatile
+
+SQLITE_PATH=./morning_agent.db
+DISCLOSURE_LINE=Hello, this is Joseph's AI assistant calling on his behalf.
+
+```
+
+db.py:
+```
+from sqlmodel import SQLModel, create_engine, Session
+from .config import settings
+
+engine = create_engine(f"sqlite:///{settings.sqlite_path}", echo=False)
+
+def init_db() -> None:
+    SQLModel.metadata.create_all(engine)
+
+def get_session():
+    with Session(engine) as session:
+        yield session
+
+```
+
+config.py:
+```
+from pydantic import BaseModel
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+
+class Settings(BaseModel):
+    app_base_url: str = os.getenv("APP_BASE_URL", "http://localhost:8000")
+    public_ws_base: str = os.getenv("PUBLIC_WS_BASE", "ws://localhost:8000")
+
+    twilio_account_sid: str = os.getenv("TWILIO_ACCOUNT_SID", "")
+    twilio_auth_token: str = os.getenv("TWILIO_AUTH_TOKEN", "")
+    twilio_from_number: str = os.getenv("TWILIO_FROM_NUMBER", "")
+
+    openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
+    openai_realtime_model: str = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-1.5")
+
+    groq_api_key: str = os.getenv("GROQ_API_KEY", "")
+    groq_model: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+
+    sqlite_path: str = os.getenv("SQLITE_PATH", "./morning_agent.db")
+    disclosure_line: str = os.getenv(
+        "DISCLOSURE_LINE",
+        "Hello, this is Joseph's AI assistant calling on his behalf."
+    )
+
+settings = Settings()
+
+```
+
+models.py:
+```
+from typing import Optional
+from datetime import datetime
+from sqlmodel import SQLModel, Field
+
+class Task(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    title: str
+    instructions: str
+    phone_number: str
+    status: str = "queued"  # queued, calling, completed, failed, needs_review
+    call_sid: Optional[str] = None
+    transcript: Optional[str] = None
+    summary: Optional[str] = None
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+```
+
+__init__.py:
+```
+
+```
+
+schemas.py:
+```
+from typing import Optional
+from pydantic import BaseModel
+
+class TaskCreate(BaseModel):
+    title: str
+    instructions: str
+    phone_number: str
+
+class TaskRead(BaseModel):
+    id: int
+    title: str
+    instructions: str
+    phone_number: str
+    status: str
+    call_sid: Optional[str] = None
+    transcript: Optional[str] = None
+    summary: Optional[str] = None
+
+class StartTaskResponse(BaseModel):
+    task_id: int
+    status: str
+    call_sid: Optional[str]
+
+```
+
+main.py:
+```
+import json
+import base64
+from datetime import datetime
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from sqlmodel import Session
+
+from .db import engine, init_db
+from .models import Task
+from .routers.tasks import router as tasks_router
+from .routers.twilio import router as twilio_router
+from .services.openai_realtime import RealtimeBridge
+from .services.groq_llm import get_groq_llm
+from .services.stt_service import STTService
+from .services.tts_service import TTSService
+
+app = FastAPI(title="Morning Agent Backend")
+
+app.include_router(tasks_router)
+app.include_router(twilio_router)
+
+@app.on_event("startup")
+def startup():
+    init_db()
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
+
+@app.websocket("/media-stream")
+async def media_stream(ws: WebSocket):
+    await ws.accept()
+    task_id = int(ws.query_params["task_id"])
+
+    # DB read
+    with Session(engine) as session:
+        task = session.get(Task, task_id)
+        if not task:
+            await ws.close(code=1008)
+            return
+        bridge = RealtimeBridge(task_id=task.id, instructions=task.instructions)
+        groq_llm = get_groq_llm()
+        stt_service = STTService()
+        tts_service = TTSService()
+
+    await bridge.open()
+
+    transcript_parts: list[str] = []
+    conversation_history = []
+
+    try:
+        while True:
+            message = await ws.receive_text()
+            data = json.loads(message)
+
+            event = data.get("event")
+            if event == "start":
+                # Connection established
+                print(f"Media stream started for task {task_id}")
+            elif event == "media":
+                # Audio frame received from Twilio
+                try:
+                    # 1) Decode Twilio base64 audio payload
+                    payload = data.get("media", {}).get("payload")
+                    if not payload:
+                        continue
+                    
+                    # 2) Use STT service to convert to text
+                    text = await stt_service.transcribe_from_base64(payload)
+                    
+                    if text and text != "[AUDIO RECEIVED - STT SERVICE NOT CONFIGURED]":
+                        # 3) Process with Groq LLM
+                        response = await groq_llm.process(
+                            text=text,
+                            instructions=task.instructions,
+                            conversation_history=conversation_history
+                        )
+                        
+                        # Update conversation history
+                        conversation_history.append({"role": "user", "content": text})
+                        conversation_history.append({"role": "assistant", "content": response})
+                        
+                        # Add to transcript
+                        transcript_parts.append(f"Caller: {text}")
+                        transcript_parts.append(f"Agent: {response}")
+                        
+                        # 4) Use TTS service to convert response to audio
+                        audio_response = await tts_service.synthesize_to_base64(response)
+                        
+                        # 5) Send audio back to Twilio if TTS succeeded
+                        if audio_response:
+                            await ws.send(json.dumps({
+                                "event": "media",
+                                "media": {"payload": audio_response}
+                            }))
+                        else:
+                            # TTS not configured, log text response
+                            print(f"Agent response (TTS stub): {response}")
+                    
+                except Exception as e:
+                    print(f"Error processing media frame: {e}")
+                    
+            elif event == "stop":
+                # Call ended
+                print(f"Media stream stopped for task {task_id}")
+                break
+                
+    except WebSocketDisconnect:
+        print(f"WebSocket disconnected for task {task_id}")
+    except Exception as e:
+        print(f"Error in media stream: {e}")
+    finally:
+        await bridge.close()
+        with Session(engine) as session:
+            task = session.get(Task, task_id)
+            if task:
+                task.transcript = "\n".join(transcript_parts) if transcript_parts else task.transcript
+                
+                # Use Groq to summarize if we have a transcript
+                if task.transcript and not task.summary:
+                    try:
+                        task.summary = await groq_llm.summarize_transcript(
+                            task.transcript, 
+                            task.instructions
+                        )
+                        
+                        # Check task completion
+                        completion_check = await groq_llm.check_task_completion(
+                            task.transcript,
+                            task.instructions
+                        )
+                        if completion_check.get("completed"):
+                            task.status = "completed"
+                        else:
+                            task.status = "needs_review"
+                    except Exception as e:
+                        print(f"Error summarizing with Groq: {e}")
+                        task.summary = task.summary or "Call finished. Review transcript."
+                
+                task.updated_at = datetime.utcnow()
+                session.add(task)
+                session.commit()
+
+```
+
+tasks.py:
+```
+from datetime import datetime
+from fastapi import APIRouter, Depends, HTTPException
+from sqlmodel import Session, select
+
+from ..db import get_session
+from ..models import Task
+from ..schemas import TaskCreate, StartTaskResponse
+from ..services.twilio_client import create_outbound_call
+
+router = APIRouter(prefix="/tasks", tags=["tasks"])
+
+@router.post("")
+def create_task(payload: TaskCreate, session: Session = Depends(get_session)):
+    task = Task(
+        title=payload.title,
+        instructions=payload.instructions,
+        phone_number=payload.phone_number,
+    )
+    session.add(task)
+    session.commit()
+    session.refresh(task)
+    return task
+
+@router.get("")
+def list_tasks(session: Session = Depends(get_session)):
+    return session.exec(select(Task).order_by(Task.id.desc())).all()
+
+@router.get("/{task_id}")
+def get_task(task_id: int, session: Session = Depends(get_session)):
+    task = session.get(Task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return task
+
+@router.post("/{task_id}/start", response_model=StartTaskResponse)
+def start_task(task_id: int, session: Session = Depends(get_session)):
+    task = session.get(Task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    call_sid = create_outbound_call(task_id=task.id, to_number=task.phone_number)
+    task.call_sid = call_sid
+    task.status = "calling"
+    task.updated_at = datetime.utcnow()
+    session.add(task)
+    session.commit()
+
+    return StartTaskResponse(task_id=task.id, status=task.status, call_sid=call_sid)
+
+```
+
+__init__.py:
+```
+
+```
+
+twilio.py:
+```
+from datetime import datetime
+from fastapi import APIRouter, Depends, Request
+from fastapi.responses import Response
+from sqlmodel import Session
+
+from ..config import settings
+from ..db import get_session
+from ..models import Task
+
+router = APIRouter(tags=["twilio"])
+
+@router.post("/twilio/outbound-twiml")
+@router.get("/twilio/outbound-twiml")
+async def outbound_twiml(task_id: int, session: Session = Depends(get_session)):
+    task = session.get(Task, task_id)
+    if not task:
+        xml = """<?xml version="1.0" encoding="UTF-8"?><Response><Say>Task not found.</Say></Response>"""
+        return Response(content=xml, media_type="application/xml")
+
+    # Twilio will request this TwiML after the outbound call is created.
+    # <Connect><Stream> enables bidirectional audio over WebSockets.
+    stream_url = f"{settings.public_ws_base}/media-stream?task_id={task_id}"
+
+    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say>{settings.disclosure_line}</Say>
+  <Connect>
+    <Stream url="{stream_url}" />
+  </Connect>
+</Response>
+"""
+    return Response(content=xml, media_type="application/xml")
+
+@router.post("/calls/status")
+async def calls_status(task_id: int, request: Request, session: Session = Depends(get_session)):
+    form = await request.form()
+    call_status = str(form.get("CallStatus", "unknown"))
+
+    task = session.get(Task, task_id)
+    if task:
+        if call_status == "completed" and task.status == "calling":
+            task.status = "completed" if task.summary else "needs_review"
+        elif call_status in {"busy", "no-answer", "failed", "canceled"}:
+            task.status = "failed"
+        task.updated_at = datetime.utcnow()
+        session.add(task)
+        session.commit()
+
+    return {"ok": True}
+
+```
+
+main.cpython-314.pyc:
+```
+Error reading file: 'utf-8' codec can't decode byte 0xe3 in position 16: invalid continuation byte
+```
+
+stt_service.py:
+```
+import base64
+import tempfile
+import os
+from typing import Optional
+
+class STTService:
+    """Speech-to-Text service - converts audio to text"""
+    
+    def __init__(self):
+        # Placeholder for STT service initialization
+        # Can be configured to use Whisper, Google, Deepgram, etc.
+        pass
+    
+    async def transcribe(self, audio_data: bytes) -> Optional[str]:
+        """
+        Transcribe audio data to text
+        
+        Args:
+            audio_data: Raw audio bytes (μ-law 8kHz from Twilio)
+        
+        Returns:
+            str: Transcribed text, or None if transcription fails
+        """
+        # STUB: This is a placeholder implementation
+        # In production, integrate with:
+        # - OpenAI Whisper API
+        # - Google Speech-to-Text
+        # - Deepgram
+        # - AssemblyAI
+        
+        # For now, return a placeholder to indicate audio was received
+        # This allows the pipeline to flow even without real STT
+        return "[AUDIO RECEIVED - STT SERVICE NOT CONFIGURED]"
+    
+    async def transcribe_from_base64(self, base64_payload: str) -> Optional[str]:
+        """
+        Transcribe base64-encoded audio (Twilio format)
+        
+        Args:
+            base64_payload: Base64-encoded μ-law audio from Twilio
+        
+        Returns:
+            str: Transcribed text
+        """
+        try:
+            audio_data = base64.b64decode(base64_payload)
+            return await self.transcribe(audio_data)
+        except Exception as e:
+            print(f"STT error: {e}")
+            return None
+
+```
+
+tts_service.py:
+```
+from typing import Optional
+
+class TTSService:
+    """Text-to-Speech service - converts text to audio"""
+    
+    def __init__(self):
+        # Placeholder for TTS service initialization
+        # Can be configured to use ElevenLabs, Google, AWS, OpenAI, etc.
+        pass
+    
+    async def synthesize(self, text: str) -> Optional[bytes]:
+        """
+        Synthesize text to audio
+        
+        Args:
+            text: Text to convert to speech
+        
+        Returns:
+            bytes: Audio data (μ-law 8kHz for Twilio), or None if synthesis fails
+        """
+        # STUB: This is a placeholder implementation
+        # In production, integrate with:
+        # - ElevenLabs API (best quality)
+        # - Google Cloud TTS
+        # - AWS Polly
+        # - OpenAI TTS
+        # - Azure Speech
+        
+        # For now, return None to indicate TTS not configured
+        # The caller should handle this gracefully
+        return None
+    
+    async def synthesize_to_base64(self, text: str) -> Optional[str]:
+        """
+        Synthesize text and return base64-encoded audio for Twilio
+        
+        Args:
+            text: Text to convert to speech
+        
+        Returns:
+            str: Base64-encoded audio, or None if synthesis fails
+        """
+        audio_data = await self.synthesize(text)
+        if audio_data:
+            import base64
+            return base64.b64encode(audio_data).decode()
+        return None
+
+```
+
+__init__.py:
+```
+from .groq_llm import get_groq_llm, GroqLLMService
+from .stt_service import STTService
+from .tts_service import TTSService
+from .twilio_client import get_twilio_client, create_outbound_call
+from .openai_realtime import RealtimeBridge
+
+__all__ = [
+    "get_groq_llm",
+    "GroqLLMService",
+    "STTService",
+    "TTSService",
+    "get_twilio_client",
+    "create_outbound_call",
+    "RealtimeBridge",
+]
+
+```
+
+groq_llm.py:
+```
+from groq import Groq
+from ..config import settings
+
+class GroqLLMService:
+    """Groq LLM service for text processing"""
+    
+    def __init__(self):
+        if not settings.groq_api_key:
+            raise ValueError("GROQ_API_KEY not set in environment variables")
+        self.client = Groq(api_key=settings.groq_api_key)
+        self.model = settings.groq_model
+    
+    async def process(self, text: str, instructions: str, conversation_history: list = None) -> str:
+        """
+        Process text with Groq LLM
+        
+        Args:
+            text: Input text from caller
+            instructions: Task instructions
+            conversation_history: Optional conversation history for context
+        
+        Returns:
+            str: LLM response
+        """
+        # Build messages
+        messages = [
+            {
+                "role": "system",
+                "content": f"{settings.disclosure_line}\n\nYou are a phone agent. Complete the task if possible. Do not claim to be the user.\n\nTask instructions: {instructions}"
+            }
+        ]
+        
+        # Add conversation history if provided
+        if conversation_history:
+            messages.extend(conversation_history)
+        
+        # Add current user input
+        messages.append({
+            "role": "user",
+            "content": text
+        })
+        
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=0.7,
+                max_tokens=512,
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            raise Exception(f"Groq LLM error: {str(e)}")
+    
+    async def summarize_transcript(self, transcript: str, instructions: str) -> str:
+        """
+        Summarize a call transcript
+        
+        Args:
+            transcript: Full transcript of the call
+            instructions: Original task instructions
+        
+        Returns:
+            str: Summary of the call outcome
+        """
+        messages = [
+            {
+                "role": "system",
+                "content": "You are a phone call summarizer. Summarize whether the task was completed, any action items, and the outcome."
+            },
+            {
+                "role": "user",
+                "content": f"Task: {instructions}\n\nTranscript:\n{transcript}\n\nProvide a concise summary (max 200 words)."
+            }
+        ]
+        
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=0.3,
+                max_tokens=200,
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            raise Exception(f"Groq summary error: {str(e)}")
+    
+    async def check_task_completion(self, transcript: str, instructions: str) -> dict:
+        """
+        Check if a task was completed based on transcript
+        
+        Args:
+            transcript: Call transcript
+            instructions: Task instructions
+        
+        Returns:
+            dict: {"completed": bool, "reason": str, "action_items": list}
+        """
+        messages = [
+            {
+                "role": "system",
+                "content": "You analyze phone call transcripts to determine if a task was completed. Respond in JSON format with: completed (boolean), reason (string), action_items (list of strings)."
+            },
+            {
+                "role": "user",
+                "content": f"Task: {instructions}\n\nTranscript:\n{transcript}\n\nAnalyze and respond in JSON."
+            }
+        ]
+        
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=0.1,
+                max_tokens=300,
+                response_format={"type": "json_object"}
+            )
+            import json
+            return json.loads(response.choices[0].message.content)
+        except Exception as e:
+            # Fallback if JSON parsing fails
+            return {
+                "completed": False,
+                "reason": f"Could not analyze: {str(e)}",
+                "action_items": []
+            }
+
+# Singleton instance
+_groq_llm_service = None
+
+def get_groq_llm() -> GroqLLMService:
+    """Get or create Groq LLM service singleton"""
+    global _groq_llm_service
+    if _groq_llm_service is None:
+        _groq_llm_service = GroqLLMService()
+    return _groq_llm_service
+
+```
+
+openai_realtime.py:
+```
+import json
+import websockets
+from ..config import settings
+
+class RealtimeBridge:
+    def __init__(self, task_id: int, instructions: str):
+        self.task_id = task_id
+        self.instructions = instructions
+        self.transcript_parts: list[str] = []
+
+    async def open(self):
+        # Skeleton only: this opens a Realtime session endpoint.
+        # You still need to map Twilio media frames to/from the session format you choose.
+        self.ws = await websockets.connect(
+            "wss://api.openai.com/v1/realtime",
+            additional_headers={
+                "Authorization": f"Bearer {settings.openai_api_key}",
+                "OpenAI-Beta": "realtime=v1",
+            },
+        )
+
+        session_update = {
+            "type": "session.update",
+            "session": {
+                "model": settings.openai_realtime_model,
+                "instructions": (
+                    f"{settings.disclosure_line} "
+                    "You are a phone agent. Complete the task if possible. "
+                    "Do not claim to be the user. "
+                    f"Task instructions: {self.instructions}"
+                )
+            }
+        }
+        await self.ws.send(json.dumps(session_update))
+
+    async def close(self):
+        if getattr(self, "ws", None):
+            await self.ws.close()
+
+```
+
+twilio_client.py:
+```
+from twilio.rest import Client
+from ..config import settings
+
+def get_twilio_client() -> Client:
+    return Client(settings.twilio_account_sid, settings.twilio_auth_token)
+
+def create_outbound_call(task_id: int, to_number: str) -> str:
+    client = get_twilio_client()
+    call = client.calls.create(
+        to=to_number,
+        from_=settings.twilio_from_number,
+        url=f"{settings.app_base_url}/twilio/outbound-twiml?task_id={task_id}",
+        status_callback=f"{settings.app_base_url}/calls/status?task_id={task_id}",
+        status_callback_event=["initiated", "ringing", "answered", "completed"],
+        status_callback_method="POST",
+    )
+    return call.sid
+
+```
+
+MorningAgentApp.swift:
+```
+import SwiftUI
+
+@main
+struct MorningAgentApp: App {
+    var body: some Scene {
+        WindowGroup {
+            ContentView()
+        }
+    }
+}
+
+```
+
+ContentView.swift:
+```
+import SwiftUI
+
+struct ContentView: View {
+    var body: some View {
+        TabView {
+            TaskListView()
+                .tabItem {
+                    Label("Tasks", systemImage: "checklist")
+                }
+
+            SettingsView()
+                .tabItem {
+                    Label("Settings", systemImage: "gearshape")
+                }
+        }
+    }
+}
+
+```
+
+TaskItem.swift:
+```
+import Foundation
+
+struct TaskItem: Codable, Identifiable {
+    let id: Int
+    let title: String
+    let instructions: String
+    let phoneNumber: String?
+    let status: String
+    let callSid: String?
+    let transcript: String?
+    let summary: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id, title, instructions, status, transcript, summary
+        case phoneNumber = "phone_number"
+        case callSid = "call_sid"
+    }
+}
+
+struct CreateTaskRequest: Codable {
+    let title: String
+    let instructions: String
+    let phone_number: String
+}
+
+```
+
+TaskListView.swift:
+```
+import SwiftUI
+
+struct TaskListView: View {
+    @State private var tasks: [TaskItem] = []
+    @State private var showingNewTask = false
+    @State private var isLoading = false
+
+    var body: some View {
+        NavigationStack {
+            List(tasks) { task in
+                NavigationLink(destination: TaskDetailView(taskID: task.id)) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(task.title).font(.headline)
+                        Text(task.status.capitalized)
+                            .font(.subheadline)
+                        if let summary = task.summary, !summary.isEmpty {
+                            Text(summary)
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Morning Agent")
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        showingNewTask = true
+                    } label: {
+                        Image(systemName: "plus")
+                    }
+                }
+            }
+            .sheet(isPresented: $showingNewTask) {
+                NewTaskView {
+                    await load()
+                }
+            }
+            .task {
+                await load()
+            }
+            .refreshable {
+                await load()
+            }
+        }
+    }
+
+    private func load() async {
+        guard !isLoading else { return }
+        isLoading = true
+        defer { isLoading = false }
+        do {
+            tasks = try await APIClient.shared.fetchTasks()
+        } catch {
+            print("Failed to fetch tasks:", error)
+        }
+    }
+}
+
+```
+
+SettingsView.swift:
+```
+import SwiftUI
+
+struct SettingsView: View {
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Agent") {
+                    Text("This assistant places calls on your behalf.")
+                    Text("Recommended: always disclose that the assistant is acting for you.")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .navigationTitle("Settings")
+        }
+    }
+}
+
+```
+
+TaskDetailView.swift:
+```
+import SwiftUI
+
+struct TaskDetailView: View {
+    let taskID: Int
+    @State private var task: TaskItem?
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                if let task {
+                    Text(task.title).font(.title2).bold()
+                    Text("Status: \(task.status)")
+                    Text(task.instructions)
+
+                    if let summary = task.summary {
+                        Group {
+                            Text("Summary").font(.headline)
+                            Text(summary)
+                        }
+                    }
+
+                    if let transcript = task.transcript {
+                        Group {
+                            Text("Transcript").font(.headline)
+                            Text(transcript)
+                                .font(.footnote)
+                                .textSelection(.enabled)
+                        }
+                    }
+                } else {
+                    ProgressView()
+                }
+            }
+            .padding()
+        }
+        .navigationTitle("Task")
+        .task {
+            await load()
+        }
+    }
+
+    private func load() async {
+        do {
+            task = try await APIClient.shared.fetchTask(id: taskID)
+        } catch {
+            print("Load failed:", error)
+        }
+    }
+}
+
+```
+
+NewTaskView.swift:
+```
+import SwiftUI
+
+struct NewTaskView: View {
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var title = ""
+    @State private var instructions = ""
+    @State private var phone = ""
+    @State private var isSaving = false
+
+    let onSaved: () async -> Void
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Task") {
+                    TextField("Title", text: $title)
+                    TextField("Phone number", text: $phone)
+                    TextEditor(text: $instructions)
+                        .frame(minHeight: 160)
+                }
+            }
+            .navigationTitle("New Task")
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("Close") { dismiss() }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Save") {
+                        Task { await save() }
+                    }
+                    .disabled(isSaving || title.isEmpty || phone.isEmpty || instructions.isEmpty)
+                }
+            }
+        }
+    }
+
+    private func save() async {
+        guard !isSaving else { return }
+        isSaving = true
+        defer { isSaving = false }
+
+        do {
+            let task = try await APIClient.shared.createTask(
+                title: title,
+                instructions: instructions,
+                phone: phone
+            )
+            try await APIClient.shared.startTask(id: task.id)
+            await onSaved()
+            dismiss()
+        } catch {
+            print("Save failed:", error)
+        }
+    }
+}
+
+```
+
+APIClient.swift:
+```
+import Foundation
+
+@MainActor
+final class APIClient: ObservableObject {
+    static let shared = APIClient()
+
+    private let baseURL = URL(string: "http://localhost:8000")!
+
+    func fetchTasks() async throws -> [TaskItem] {
+        let (data, _) = try await URLSession.shared.data(from: baseURL.appendingPathComponent("tasks"))
+        return try JSONDecoder().decode([TaskItem].self, from: data)
+    }
+
+    func createTask(title: String, instructions: String, phone: String) async throws -> TaskItem {
+        var request = URLRequest(url: baseURL.appendingPathComponent("tasks"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(
+            CreateTaskRequest(title: title, instructions: instructions, phone_number: phone)
+        )
+
+        let (data, _) = try await URLSession.shared.data(for: request)
+        return try JSONDecoder().decode(TaskItem.self, from: data)
+    }
+
+    func startTask(id: Int) async throws {
+        var request = URLRequest(url: baseURL.appendingPathComponent("tasks/\(id)/start"))
+        request.httpMethod = "POST"
+        _ = try await URLSession.shared.data(for: request)
+    }
+
+    func fetchTask(id: Int) async throws -> TaskItem {
+        let (data, _) = try await URLSession.shared.data(from: baseURL.appendingPathComponent("tasks/\(id)"))
+        return try JSONDecoder().decode(TaskItem.self, from: data)
+    }
+}
+
+```

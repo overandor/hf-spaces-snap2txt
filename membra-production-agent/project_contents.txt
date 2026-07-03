@@ -1,0 +1,2249 @@
+Project Structure:
+scanner.py
+render.yaml
+payments.py
+requirements.txt
+Dockerfile
+README.md
+api.py
+.gitignore
+appraiser.py
+agent.py
+.gitattributes
+readiness.py
+main.py
+dashboard/index.html
+
+File Contents:
+scanner.py:
+```
+#!/usr/bin/env python3
+"""
+Workspace Scanner — recursively inventories all projects and files.
+Identifies git repos, language ecosystems, and project boundaries.
+"""
+
+import fnmatch
+import json
+import os
+import hashlib
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Iterator
+
+
+PROJECT_INDICATORS = [
+    ".git",
+    "package.json",
+    "Cargo.toml",
+    "pyproject.toml",
+    "setup.py",
+    "setup.cfg",
+    "requirements.txt",
+    "Pipfile",
+    "go.mod",
+    "pom.xml",
+    "build.gradle",
+    "CMakeLists.txt",
+    "Makefile",
+    "Dockerfile",
+    "docker-compose.yml",
+    "docker-compose.yaml",
+    "poetry.lock",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "Cargo.lock",
+    "Anchor.toml",
+    "next.config.js",
+    "nuxt.config.ts",
+    "vite.config.ts",
+    "vite.config.js",
+    "tsconfig.json",
+    ".github",
+]
+
+SKIP_DIRS = {
+    ".git",
+    "node_modules",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".tox",
+    ".pytest_cache",
+    ".mypy_cache",
+    "dist",
+    "build",
+    ".next",
+    ".nuxt",
+    "target",
+    "coverage",
+    ".idea",
+    ".vscode",
+    ".gradle",
+    ".npm",
+    ".yarn",
+    ".pnpm-store",
+    "out",
+    "public",
+}
+
+SKIP_PATTERNS = [
+    "*.pyc",
+    "*.pyo",
+    "*.so",
+    "*.dylib",
+    "*.dll",
+    "*.class",
+    "*.o",
+    "*.a",
+    ".DS_Store",
+    "Thumbs.db",
+    "*.swp",
+    "*.swo",
+    "*~",
+    "*.log",
+    "*.tmp",
+    "*.temp",
+    "*.pid",
+    "*.sock",
+    "*.zip",
+    "*.tar",
+    "*.gz",
+    "*.rar",
+    "*.7z",
+    "*.dmg",
+    "*.pkg",
+    "*.deb",
+    "*.rpm",
+    "*.exe",
+    "*.bin",
+    "*.iso",
+]
+
+
+@dataclass
+class FileEntry:
+    path: str
+    rel_path: str
+    size: int
+    hash: str
+    ext: str
+    is_binary: bool = False
+
+
+@dataclass
+class Project:
+    root: str
+    name: str
+    project_type: str = "unknown"
+    indicators: List[str] = field(default_factory=list)
+    files: List[FileEntry] = field(default_factory=list)
+    languages: Dict[str, int] = field(default_factory=dict)
+    total_size: int = 0
+    total_files: int = 0
+    secrets_found: List[Dict] = field(default_factory=list)
+
+
+@dataclass
+class ScanResult:
+    scanned_at: str
+    root_path: str
+    projects: List[Project] = field(default_factory=list)
+    loose_files: List[FileEntry] = field(default_factory=list)
+    total_size: int = 0
+    total_files: int = 0
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def is_binary(path: Path) -> bool:
+    try:
+        with open(path, "rb") as f:
+            chunk = f.read(1024)
+            return b"\x00" in chunk
+    except Exception:
+        return True
+
+
+def should_skip_dir(dir_name: str) -> bool:
+    return dir_name in SKIP_DIRS or dir_name.startswith(".")
+
+
+def should_skip_file(file_name: str) -> bool:
+    for pat in SKIP_PATTERNS:
+        if fnmatch.fnmatch(file_name, pat):
+            return True
+    if file_name.startswith("."):
+        return True
+    return False
+
+
+def detect_project_type(indicators: List[str], files: List[str]) -> str:
+    types = []
+    if "package.json" in indicators:
+        types.append("nodejs")
+    if "Cargo.toml" in indicators:
+        types.append("rust")
+    if any(i in indicators for i in ("pyproject.toml", "setup.py", "requirements.txt", "Pipfile", "poetry.lock")):
+        types.append("python")
+    if "go.mod" in indicators:
+        types.append("go")
+    if any(i in indicators for i in ("pom.xml", "build.gradle")):
+        types.append("jvm")
+    if "CMakeLists.txt" in indicators or "Makefile" in indicators:
+        types.append("cpp")
+    if "Anchor.toml" in indicators:
+        types.append("solana")
+    if "Dockerfile" in indicators or "docker-compose.yml" in indicators or "docker-compose.yaml" in indicators:
+        types.append("docker")
+    if ".git" in indicators:
+        types.append("git")
+    return " + ".join(types) if types else "unknown"
+
+
+def scan_workspace(root: Path, max_depth: int = 6) -> ScanResult:
+    result = ScanResult(
+        scanned_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        root_path=str(root.expanduser().resolve()),
+    )
+
+    # First pass: identify project roots
+    project_roots: Dict[str, List[str]] = {}
+    for dirpath, dirnames, filenames in os.walk(result.root_path):
+        depth = len(Path(dirpath).relative_to(result.root_path).parts)
+        if depth > max_depth:
+            dirnames.clear()
+            continue
+
+        dirnames[:] = [d for d in dirnames if not should_skip_dir(d)]
+
+        indicators = [f for f in filenames if f in PROJECT_INDICATORS]
+        if ".git" in dirnames:
+            indicators.append(".git")
+        if indicators:
+            project_roots[dirpath] = indicators
+
+    # Second pass: build file lists per project / loose files
+    assigned_dirs: Set[str] = set()
+    project_objs: Dict[str, Project] = {}
+
+    for proj_root, indicators in sorted(project_roots.items(), key=lambda x: len(x[0]), reverse=True):
+        # Skip if already assigned to a deeper project
+        if any(proj_root.startswith(a + os.sep) for a in assigned_dirs):
+            continue
+        assigned_dirs.add(proj_root)
+        proj = Project(
+            root=proj_root,
+            name=Path(proj_root).name,
+            indicators=indicators,
+            project_type=detect_project_type(indicators, []),
+        )
+        project_objs[proj_root] = proj
+
+    # Collect files
+    for dirpath, dirnames, filenames in os.walk(result.root_path):
+        dirnames[:] = [d for d in dirnames if not should_skip_dir(d)]
+        rel_base = Path(result.root_path)
+
+        # Find which project this belongs to
+        current_proj: Optional[Project] = None
+        for proj_root in assigned_dirs:
+            if dirpath == proj_root or dirpath.startswith(proj_root + os.sep):
+                current_proj = project_objs.get(proj_root)
+                break
+
+        for f in filenames:
+            if should_skip_file(f):
+                continue
+            fp = Path(dirpath) / f
+            try:
+                size = fp.stat().st_size
+                rel = str(fp.relative_to(rel_base))
+                entry = FileEntry(
+                    path=str(fp),
+                    rel_path=rel,
+                    size=size,
+                    hash=sha256_file(fp),
+                    ext=Path(f).suffix.lower(),
+                    is_binary=is_binary(fp),
+                )
+                if current_proj is not None:
+                    current_proj.files.append(entry)
+                    current_proj.total_size += size
+                    current_proj.total_files += 1
+                    if entry.ext:
+                        current_proj.languages[entry.ext] = current_proj.languages.get(entry.ext, 0) + 1
+                else:
+                    result.loose_files.append(entry)
+                    result.total_size += size
+                    result.total_files += 1
+            except Exception:
+                continue
+
+    result.projects = list(project_objs.values())
+    result.total_size = sum(p.total_size for p in result.projects) + sum(f.size for f in result.loose_files)
+    result.total_files = sum(p.total_files for p in result.projects) + len(result.loose_files)
+    return result
+
+
+def scan_to_json(root: Path, out_path: Optional[Path] = None) -> Path:
+    result = scan_workspace(root)
+    data = {
+        "scanned_at": result.scanned_at,
+        "root_path": result.root_path,
+        "total_projects": len(result.projects),
+        "total_files": result.total_files,
+        "total_size_mb": round(result.total_size / (1024 * 1024), 2),
+        "projects": [
+            {
+                "root": p.root,
+                "name": p.name,
+                "project_type": p.project_type,
+                "indicators": p.indicators,
+                "total_files": p.total_files,
+                "total_size_mb": round(p.total_size / (1024 * 1024), 2),
+                "languages": p.languages,
+                "files": [asdict(f) for f in p.files[:200]],  # cap per project
+            }
+            for p in result.projects
+        ],
+        "loose_files_count": len(result.loose_files),
+    }
+    path = out_path or (root / "SCAN_RESULT.json")
+    path.write_text(json.dumps(data, indent=2, default=str))
+    return path
+
+
+if __name__ == "__main__":
+    import sys
+    root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("/Users/alep/Downloads")
+    out = scan_to_json(root)
+    print(f"Scan complete: {out}")
+    print(f"  Projects: {len(json.loads(out.read_text())['projects'])}")
+    print(f"  Total files: {json.loads(out.read_text())['total_files']}")
+
+```
+
+render.yaml:
+```
+services:
+  - type: web
+    name: production-agent-service
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn api:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+
+```
+
+payments.py:
+```
+#!/usr/bin/env python3
+"""
+Stripe Payment Integration
+Handles checkout sessions, payment verification, and usage credits.
+"""
+
+import os
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Optional
+
+STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+
+# Pricing tiers (credits = number of project appraisals)
+PRICING_TIERS = {
+    "starter": {"price_cents": 1900, "credits": 5, "label": "Starter — 5 Projects"},
+    "pro": {"price_cents": 4900, "credits": 20, "label": "Pro — 20 Projects"},
+    "enterprise": {"price_cents": 14900, "credits": 100, "label": "Enterprise — 100 Projects"},
+}
+
+
+try:
+    import stripe
+    stripe.api_key = STRIPE_SECRET_KEY
+    STRIPE_AVAILABLE = bool(STRIPE_SECRET_KEY)
+except ImportError:
+    stripe = None  # type: ignore
+    STRIPE_AVAILABLE = False
+
+
+@dataclass
+class PaymentIntent:
+    tier: str
+    session_id: str
+    url: str
+    status: str
+    credits: int
+
+
+class PaymentManager:
+    def __init__(self):
+        self.enabled = STRIPE_AVAILABLE and stripe is not None
+
+    def create_checkout_session(self, tier: str, success_url: str, cancel_url: str) -> Optional[PaymentIntent]:
+        if not self.enabled:
+            return None
+        if tier not in PRICING_TIERS:
+            return None
+        tier_info = PRICING_TIERS[tier]
+        try:
+            session = stripe.checkout.Session.create(  # type: ignore
+                payment_method_types=["card"],
+                line_items=[{
+                    "price_data": {
+                        "currency": "usd",
+                        "product_data": {"name": tier_info["label"]},
+                        "unit_amount": tier_info["price_cents"],
+                    },
+                    "quantity": 1,
+                }],
+                mode="payment",
+                success_url=success_url,
+                cancel_url=cancel_url,
+                metadata={"tier": tier, "credits": str(tier_info["credits"])},
+            )
+            return PaymentIntent(
+                tier=tier,
+                session_id=session.id,
+                url=session.url,
+                status=session.status,
+                credits=tier_info["credits"],
+            )
+        except Exception as e:
+            print(f"Stripe checkout error: {e}")
+            return None
+
+    def verify_session(self, session_id: str) -> Optional[dict]:
+        if not self.enabled or not stripe:
+            return None
+        try:
+            session = stripe.checkout.Session.retrieve(session_id)
+            return {
+                "id": session.id,
+                "status": session.status,
+                "payment_status": session.payment_status,
+                "tier": session.metadata.get("tier") if session.metadata else None,
+                "credits": int(session.metadata.get("credits", 0)) if session.metadata else 0,
+                "amount_total": session.amount_total,
+            }
+        except Exception as e:
+            print(f"Stripe verify error: {e}")
+            return None
+
+    def handle_webhook(self, payload: bytes, sig_header: str) -> Optional[dict]:
+        if not self.enabled or not stripe:
+            return None
+        try:
+            event = stripe.Webhook.construct_event(  # type: ignore
+                payload, sig_header, STRIPE_WEBHOOK_SECRET
+            )
+            if event["type"] == "checkout.session.completed":
+                session = event["data"]["object"]
+                return {
+                    "event": "payment_completed",
+                    "session_id": session["id"],
+                    "tier": session.get("metadata", {}).get("tier"),
+                    "credits": int(session.get("metadata", {}).get("credits", 0)),
+                }
+            return {"event": event["type"], "raw": event}
+        except Exception as e:
+            print(f"Webhook error: {e}")
+            return None
+
+
+# Simple in-memory credit tracker (replace with DB in production)
+_user_credits: dict = {}
+
+
+def get_credits(user_id: str) -> int:
+    return _user_credits.get(user_id, 0)
+
+
+def add_credits(user_id: str, amount: int) -> int:
+    _user_credits[user_id] = _user_credits.get(user_id, 0) + amount
+    return _user_credits[user_id]
+
+
+def consume_credit(user_id: str) -> bool:
+    current = _user_credits.get(user_id, 0)
+    if current > 0:
+        _user_credits[user_id] = current - 1
+        return True
+    return False
+
+
+def get_pricing() -> dict:
+    return {
+        "currency": "usd",
+        "tiers": {
+            k: {
+                "price_usd": v["price_cents"] / 100,
+                "credits": v["credits"],
+                "label": v["label"],
+            }
+            for k, v in PRICING_TIERS.items()
+        },
+    }
+
+```
+
+requirements.txt:
+```
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9
+stripe>=8.0.0
+
+```
+
+Dockerfile:
+```
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+ENV PORT=7860
+EXPOSE 7860
+
+CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "7860"]
+
+```
+
+README.md:
+```
+# Production Agent Service
+
+Autonomous workspace scanner, production readiness evaluator, codebase appraiser, and paid API service.
+
+## Features
+
+- **Scan** any directory tree and auto-detect project boundaries (git, package.json, Cargo.toml, etc.)
+- **Readiness Scoring** across 9 dimensions: CI/CD, tests, docs, typing, linting, Docker, secrets, dependencies, structure
+- **Deterministic Appraisal** — file-level LOC valuation with language/domain rate tables (no LLM required)
+- **Secret Detection** — scans staged and uncommitted files for API keys, tokens, private keys
+- **Payment Integration** — Stripe checkout with tiered pricing (Basic free, Pro $29, Enterprise $99)
+- **Dashboard** — built-in dark-mode web UI at `/ui` and `/dashboard`
+
+## Quick Start
+
+```bash
+pip install -r requirements.txt
+python main.py
+```
+
+Open `http://localhost:8000/ui` for the dashboard.
+
+## API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/scan` | POST | Scan workspace, return project inventory |
+| `/api/batch-appraise` | POST | Scan + appraise every project found |
+| `/api/appraise` | POST | Appraise a single project path |
+| `/api/appraisals` | GET | List all appraisals |
+| `/api/pricing` | GET | Show pricing tiers |
+| `/api/payment/intent` | POST | Create payment intent |
+| `/api/payment/confirm` | POST | Confirm payment |
+| `/ui` | GET | Dashboard |
+
+## Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `STRIPE_SECRET_KEY` | Stripe secret key for live payments |
+| `STRIPE_WEBHOOK_SECRET` | Stripe webhook endpoint secret |
+| `PORT` | Server port (default 8000) |
+
+## Architecture
+
+```
+scanner.py      →  Project boundary detection + file inventory
+readiness.py    →  Production readiness scoring engine
+appraiser.py    →  Deterministic LOC-based valuation
+agent.py        →  Orchestrates scan + readiness + appraisal
+payments.py     →  Stripe checkout + credit tracking
+api.py          →  FastAPI service layer
+dashboard/      →  Static HTML dashboard
+```
+
+## Deployment
+
+### Render (Recommended)
+1. Push this repo to GitHub
+2. Create a new Web Service on [Render](https://render.com)
+3. Connect your GitHub repo
+4. Set environment variables:
+   - `STRIPE_SECRET_KEY`
+   - `STRIPE_WEBHOOK_SECRET`
+5. Deploy — Render will use `render.yaml` automatically
+
+### Docker
+```bash
+docker build -t production-agent .
+docker run -p 8000:8000 -e STRIPE_SECRET_KEY=sk_... production-agent
+```
+
+### Fly.io
+```bash
+fly launch --dockerfile Dockerfile
+fly secrets set STRIPE_SECRET_KEY=sk_...
+```
+
+## Machine Scan Results
+
+A full scan of `/Users/alep/Downloads` has already been completed:
+- **347 projects** detected and appraised
+- **Total estimated value: $2,272,600**
+- **Average readiness: 37.7 / 100**
+- **Grade distribution:** 275 F, 55 D, 17 C
+
+The full report is saved at `/Users/alep/Downloads/PRODUCTION_AGENT_REPORT.json`.
+
+## License
+
+MIT
+
+```
+
+api.py:
+```
+#!/usr/bin/env python3
+"""
+Production Agent Service API
+FastAPI backend with scan, appraise, and payment endpoints.
+"""
+
+import json
+import os
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, List, Optional, Any
+
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+from starlette.middleware.base import BaseHTTPMiddleware
+
+from scanner import scan_workspace
+from appraiser import appraise_project, report_to_dict
+
+# Optional Stripe integration
+try:
+    import stripe
+    STRIPE_AVAILABLE = True
+except ImportError:
+    STRIPE_AVAILABLE = False
+
+API_KEY = os.environ.get("MEMBRA_API_KEY", "")
+ADMIN_KEY = os.environ.get("MEMBRA_ADMIN_KEY", "")
+
+class AuthMiddleware(BaseHTTPMiddleware):
+    PUBLIC_PATHS = {"/", "/health", "/ui", "/dashboard", "/api/pricing"}
+
+    async def dispatch(self, request: Request, call_next):
+        if request.method == "OPTIONS":
+            return await call_next(request)
+        if request.url.path in self.PUBLIC_PATHS or request.url.path.startswith("/dashboard/"):
+            return await call_next(request)
+        auth = request.headers.get("authorization", "")
+        if not auth.startswith("Bearer "):
+            return JSONResponse(
+                {"error": "Unauthorized. Provide Bearer token in Authorization header."},
+                status_code=401,
+            )
+        token = auth[7:]
+        if token not in (API_KEY, ADMIN_KEY):
+            return JSONResponse(
+                {"error": "Unauthorized. Invalid token."},
+                status_code=401,
+            )
+        return await call_next(request)
+
+app = FastAPI(title="Production Agent Service", version="2.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+app.add_middleware(AuthMiddleware)
+
+# In-memory storage (replace with Redis/DB for production)
+SCANS: Dict[str, Dict[str, Any]] = {}
+APPRAISALS: Dict[str, Dict[str, Any]] = {}
+PAYMENTS: Dict[str, Dict[str, Any]] = {}
+
+PRICING = {
+    "basic": {"price_usd": 0, "label": "Basic Scan", "features": ["Project inventory", "Basic readiness score", "Security secrets check"]},
+    "pro": {"price_usd": 2900, "label": "Pro Appraisal", "features": ["Full appraisal report", "Monetization scoring", "Action plan", "Priority support"]},
+    "enterprise": {"price_usd": 9900, "label": "Enterprise Suite", "features": ["Everything in Pro", "Custom CI/CD setup", "Deployment packaging", "Dedicated agent"]},
+}
+
+DATA_DIR = Path(__file__).parent / "data"
+DATA_DIR.mkdir(exist_ok=True)
+DASHBOARD_DIR = Path(__file__).parent / "dashboard"
+
+# ---------------------------------------------------------------------------
+# Models
+# ---------------------------------------------------------------------------
+
+class ScanRequest(BaseModel):
+    root_path: str = "/Users/alep/Downloads"
+    max_depth: int = 6
+
+class AppraiseRequest(BaseModel):
+    project_path: str
+    project_type: str = "unknown"
+
+class PaymentIntentRequest(BaseModel):
+    tier: str
+    email: str
+
+class PaymentConfirmRequest(BaseModel):
+    payment_intent_id: str
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _load_state():
+    global SCANS, APPRAISALS
+    scan_file = DATA_DIR / "scans.json"
+    appr_file = DATA_DIR / "appraisals.json"
+    if scan_file.is_file():
+        SCANS = json.loads(scan_file.read_text())
+    if appr_file.is_file():
+        APPRAISALS = json.loads(appr_file.read_text())
+
+
+def _save_state():
+    (DATA_DIR / "scans.json").write_text(json.dumps(SCANS, indent=2, default=str))
+    (DATA_DIR / "appraisals.json").write_text(json.dumps(APPRAISALS, indent=2, default=str))
+
+
+_load_state()
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/")
+def root():
+    return {"service": "Production Agent Service", "version": "2.0.0", "status": "online"}
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()}
+
+
+@app.post("/api/scan")
+def create_scan(req: ScanRequest):
+    scan_id = str(uuid.uuid4())[:8]
+    root = Path(req.root_path).expanduser().resolve()
+    if not root.is_dir():
+        raise HTTPException(status_code=400, detail="Invalid root path")
+
+    result = scan_workspace(root, max_depth=req.max_depth)
+    data = {
+        "scan_id": scan_id,
+        "root_path": str(root),
+        "scanned_at": result.scanned_at,
+        "total_projects": len(result.projects),
+        "total_files": result.total_files,
+        "total_size_mb": round(result.total_size / (1024 * 1024), 2),
+        "projects": [
+            {
+                "name": p.name,
+                "root": p.root,
+                "type": p.project_type,
+                "files": p.total_files,
+                "size_mb": round(p.total_size / (1024 * 1024), 2),
+                "languages": p.languages,
+            }
+            for p in result.projects
+        ],
+    }
+    SCANS[scan_id] = data
+    _save_state()
+    return data
+
+
+@app.get("/api/scans")
+def list_scans():
+    return {"scans": list(SCANS.values())}
+
+
+@app.get("/api/scan/{scan_id}")
+def get_scan(scan_id: str):
+    if scan_id not in SCANS:
+        raise HTTPException(status_code=404, detail="Scan not found")
+    return SCANS[scan_id]
+
+
+@app.post("/api/appraise")
+def create_appraisal(req: AppraiseRequest):
+    appr_id = str(uuid.uuid4())[:8]
+    root = Path(req.project_path).expanduser().resolve()
+    if not root.is_dir():
+        raise HTTPException(status_code=400, detail="Invalid project path")
+
+    report = appraise_project(root, project_type=req.project_type)
+    data = report_to_dict(report)
+    data["appraisal_id"] = appr_id
+    APPRAISALS[appr_id] = data
+    _save_state()
+    return data
+
+
+@app.get("/api/appraisals")
+def list_appraisals(project_name: Optional[str] = Query(None)):
+    results = list(APPRAISALS.values())
+    if project_name:
+        results = [r for r in results if project_name.lower() in r["project_name"].lower()]
+    return {"appraisals": results}
+
+
+@app.get("/api/appraisal/{appraisal_id}")
+def get_appraisal(appraisal_id: str):
+    if appraisal_id not in APPRAISALS:
+        raise HTTPException(status_code=404, detail="Appraisal not found")
+    return APPRAISALS[appraisal_id]
+
+
+@app.get("/api/pricing")
+def get_pricing():
+    return PRICING
+
+
+@app.post("/api/payment/intent")
+def create_payment_intent(req: PaymentIntentRequest):
+    tier = PRICING.get(req.tier)
+    if not tier:
+        raise HTTPException(status_code=400, detail="Invalid tier")
+
+    pi_id = f"pi_{uuid.uuid4().hex[:16]}"
+    PAYMENTS[pi_id] = {
+        "payment_intent_id": pi_id,
+        "tier": req.tier,
+        "amount_usd": tier["price_usd"],
+        "email": req.email,
+        "status": "requires_payment_method",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    # If Stripe is configured, use real Stripe; otherwise return mock intent
+    stripe_key = os.environ.get("STRIPE_SECRET_KEY", "")
+    if STRIPE_AVAILABLE and stripe_key and not stripe_key.startswith("sk_test_dummy"):
+        stripe.api_key = stripe_key
+        try:
+            intent = stripe.PaymentIntent.create(
+                amount=tier["price_usd"],
+                currency="usd",
+                receipt_email=req.email,
+                metadata={"tier": req.tier},
+            )
+            PAYMENTS[pi_id]["stripe_payment_intent_id"] = intent.id
+            PAYMENTS[pi_id]["client_secret"] = intent.client_secret
+            PAYMENTS[pi_id]["status"] = intent.status
+        except Exception as e:
+            PAYMENTS[pi_id]["error"] = str(e)
+    else:
+        PAYMENTS[pi_id]["client_secret"] = f"{pi_id}_secret_mock"
+    _save_state()
+    return PAYMENTS[pi_id]
+
+
+@app.post("/api/payment/confirm")
+def confirm_payment(req: PaymentConfirmRequest):
+    # Find by intent ID
+    for pi_id, data in PAYMENTS.items():
+        if data.get("stripe_payment_intent_id") == req.payment_intent_id or pi_id == req.payment_intent_id:
+            data["status"] = "succeeded"
+            data["confirmed_at"] = datetime.now(timezone.utc).isoformat()
+            _save_state()
+            return data
+    raise HTTPException(status_code=404, detail="Payment intent not found")
+
+
+@app.get("/api/payments")
+def list_payments():
+    return {"payments": list(PAYMENTS.values())}
+
+
+@app.post("/api/batch-appraise")
+def batch_appraise(req: ScanRequest):
+    """Scan and appraise every project found in the workspace."""
+    root = Path(req.root_path).expanduser().resolve()
+    if not root.is_dir():
+        raise HTTPException(status_code=400, detail="Invalid root path")
+
+    result = scan_workspace(root, max_depth=req.max_depth)
+    reports = []
+    for proj in result.projects:
+        try:
+            report = appraise_project(Path(proj.root), project_type=proj.project_type)
+            data = report_to_dict(report)
+            data["appraisal_id"] = str(uuid.uuid4())[:8]
+            APPRAISALS[data["appraisal_id"]] = data
+            reports.append(data)
+        except Exception as e:
+            reports.append({"project_name": proj.name, "error": str(e)})
+
+    _save_state()
+    return {
+        "scanned_at": result.scanned_at,
+        "total_projects": len(result.projects),
+        "appraised": len([r for r in reports if "error" not in r]),
+        "failed": len([r for r in reports if "error" in r]),
+        "reports": reports,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Dashboard
+# ---------------------------------------------------------------------------
+
+if DASHBOARD_DIR.is_dir():
+    app.mount("/dashboard", StaticFiles(directory=DASHBOARD_DIR, html=True), name="dashboard")
+
+
+@app.get("/ui", response_class=HTMLResponse)
+def serve_dashboard():
+    index = DASHBOARD_DIR / "index.html"
+    if index.is_file():
+        return HTMLResponse(content=index.read_text(), status_code=200)
+    # Fallback inline dashboard
+    return HTMLResponse(content=_INLINE_DASHBOARD, status_code=200)
+
+
+# ---------------------------------------------------------------------------
+# Inline dashboard HTML (used if dashboard/ directory is missing)
+# ---------------------------------------------------------------------------
+
+_INLINE_DASHBOARD = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Production Agent Service</title>
+<style>
+:root{--bg:#0b0f19;--card:#111827;--accent:#10b981;--accent2:#3b82f6;--text:#e5e7eb;--muted:#9ca3af;--danger:#ef4444;--warn:#f59e0b;}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,sans-serif;line-height:1.5}
+.container{max-width:1200px;margin:0 auto;padding:24px}
+header{display:flex;align-items:center;justify-content:space-between;margin-bottom:32px}
+h1{font-size:1.6rem}
+.badge{background:var(--accent);color:#000;font-size:.75rem;font-weight:700;padding:4px 10px;border-radius:999px}
+.grid{display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}
+.card{background:var(--card);border:1px solid #1f2937;border-radius:12px;padding:20px}
+.card h2{font-size:1.1rem;margin-bottom:12px}
+.metric{font-size:2rem;font-weight:700;color:var(--accent)}
+.btn{background:var(--accent2);color:#fff;border:none;padding:10px 16px;border-radius:8px;cursor:pointer;font-size:.9rem}
+.btn:hover{opacity:.9}
+.btn.secondary{background:#374151}
+table{width:100%;border-collapse:collapse;margin-top:12px;font-size:.85rem}
+th,td{padding:10px 8px;text-align:left;border-bottom:1px solid #1f2937}
+th{color:var(--muted);font-weight:600}
+.grade-A{color:var(--accent);font-weight:700}
+.grade-B{color:#34d399;font-weight:700}
+.grade-C{color:var(--warn);font-weight:700}
+.grade-D{color:var(--danger);font-weight:700}
+.grade-F{color:#7f1d1d;font-weight:700}
+pre{background:#0b0f19;border:1px solid #1f2937;border-radius:8px;padding:12px;overflow:auto;max-height:400px;font-size:.8rem}
+.tabs{display:flex;gap:8px;margin-bottom:16px}
+.tab{padding:8px 14px;border-radius:8px;background:#1f2937;color:var(--muted);cursor:pointer;border:none}
+.tab.active{background:var(--accent2);color:#fff}
+.section{display:none}
+.section.active{display:block}
+input,select{background:#0b0f19;border:1px solid #374151;color:var(--text);padding:10px 12px;border-radius:8px;width:100%;margin-bottom:10px}
+.pricing-card{border:1px solid #1f2937;border-radius:12px;padding:20px;text-align:center}
+.price{font-size:2rem;font-weight:700;color:var(--accent)}
+.features{text-align:left;margin:12px 0;padding-left:18px;color:var(--muted)}
+.features li{margin-bottom:6px}
+</style>
+</head>
+<body>
+<div class="container">
+<header><h1>Production Agent Service</h1><span class="badge">ONLINE</span></header>
+<div class="tabs">
+<button class="tab active" onclick="showTab('dashboard')">Dashboard</button>
+<button class="tab" onclick="showTab('scan')">Scan</button>
+<button class="tab" onclick="showTab('appraisals')">Appraisals</button>
+<button class="tab" onclick="showTab('pricing')">Pricing</button>
+</div>
+
+<div id="dashboard" class="section active">
+<div class="grid">
+<div class="card"><h2>Total Scans</h2><div class="metric" id="totalScans">0</div></div>
+<div class="card"><h2>Total Appraisals</h2><div class="metric" id="totalAppraisals">0</div></div>
+<div class="card"><h2>Avg Score</h2><div class="metric" id="avgScore">-</div></div>
+<div class="card"><h2>Total Est. Value</h2><div class="metric" id="totalValue">$0</div></div>
+</div>
+<div class="card" style="margin-top:16px"><h2>Latest Appraisals</h2><table><thead><tr><th>Project</th><th>Type</th><th>Score</th><th>Grade</th><th>Value</th></tr></thead><tbody id="latestBody"></tbody></table></div>
+</div>
+
+<div id="scan" class="section">
+<div class="card">
+<h2>Scan Workspace</h2>
+<input type="text" id="scanPath" value="/Users/alep/Downloads" placeholder="Root path">
+<button class="btn" onclick="runScan()">Scan Now</button>
+<button class="btn secondary" onclick="batchAppraise()">Scan + Appraise All</button>
+<pre id="scanResult">Ready to scan.</pre>
+</div>
+</div>
+
+<div id="appraisals" class="section">
+<div class="card">
+<h2>All Appraisals</h2>
+<table><thead><tr><th>Project</th><th>Type</th><th>Score</th><th>Grade</th><th>Value</th><th>Secrets</th></tr></thead><tbody id="apprBody"></tbody></table>
+</div>
+</div>
+
+<div id="pricing" class="section">
+<div class="grid">
+<div class="pricing-card"><h3>Basic</h3><div class="price">Free</div><ul class="features"><li>Project inventory</li><li>Basic readiness score</li><li>Security secrets check</li></ul><button class="btn secondary" onclick="alert('Basic is free — just scan!')">Start Free</button></div>
+<div class="pricing-card"><h3>Pro</h3><div class="price">$29</div><ul class="features"><li>Full appraisal report</li><li>Monetization scoring</li><li>Action plan</li><li>Priority support</li></ul><button class="btn" onclick="createPayment('pro')">Buy Pro</button></div>
+<div class="pricing-card"><h3>Enterprise</h3><div class="price">$99</div><ul class="features"><li>Everything in Pro</li><li>Custom CI/CD setup</li><li>Deployment packaging</li><li>Dedicated agent</li></ul><button class="btn" onclick="createPayment('enterprise')">Buy Enterprise</button></div>
+</div>
+<div class="card" style="margin-top:16px"><h2>Payment Status</h2><pre id="paymentResult">No payments yet.</pre></div>
+</div>
+
+</div>
+<script>
+const API = location.origin + '/api';
+async function fetchJSON(url,opts){try{const r=await fetch(url,opts);return await r.json()}catch(e){return {error:e.message}}}
+function showTab(id){document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));document.querySelectorAll('.section').forEach(s=>s.classList.remove('active'));event.target.classList.add('active');document.getElementById(id).classList.add('active');if(id==='appraisals')loadAppraisals();if(id==='dashboard')loadDashboard();}
+async function loadDashboard(){const a=(await fetchJSON(API+'/appraisals')).appraisals||[];document.getElementById('totalAppraisals').textContent=a.length;const s=(await fetchJSON(API+'/scans')).scans||[];document.getElementById('totalScans').textContent=s.length;const scores=a.filter(x=>x.overall_score).map(x=>x.overall_score);document.getElementById('avgScore').textContent=scores.length?(scores.reduce((a,b)=>a+b,0)/scores.length).toFixed(1):'-';const tv=a.reduce((sum,x)=>sum+(x.estimated_value_usd||0),0);document.getElementById('totalValue').textContent='$'+tv.toLocaleString();const tb=document.getElementById('latestBody');tb.innerHTML='';a.slice(0,10).forEach(r=>{const g='grade-'+r.readiness_grade;tb.innerHTML+=`<tr><td>${r.project_name}</td><td>${r.project_type}</td><td>${r.overall_score}</td><td class="${g}">${r.readiness_grade}</td><td>$${(r.estimated_value_usd||0).toLocaleString()}</td></tr>`;});}
+async function runScan(){const path=document.getElementById('scanPath').value;document.getElementById('scanResult').textContent='Scanning...';const res=await fetchJSON(API+'/scan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({root_path:path})});document.getElementById('scanResult').textContent=JSON.stringify(res,null,2);loadDashboard();}
+async function batchAppraise(){const path=document.getElementById('scanPath').value;document.getElementById('scanResult').textContent='Scanning and appraising all projects...';const res=await fetchJSON(API+'/batch-appraise',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({root_path:path})});document.getElementById('scanResult').textContent=JSON.stringify(res,null,2);loadDashboard();}
+async function loadAppraisals(){const a=(await fetchJSON(API+'/appraisals')).appraisals||[];const tb=document.getElementById('apprBody');tb.innerHTML='';a.forEach(r=>{const g='grade-'+r.readiness_grade;const sc=(r.secrets||[]).length;tb.innerHTML+=`<tr><td>${r.project_name}</td><td>${r.project_type}</td><td>${r.overall_score}</td><td class="${g}">${r.readiness_grade}</td><td>$${(r.estimated_value_usd||0).toLocaleString()}</td><td>${sc?'<span style=color:var(--danger)>Yes ('+sc+')</span>':'No'}</td></tr>`;});}
+async function createPayment(tier){const email=prompt('Enter email:');if(!email)return;const res=await fetchJSON(API+'/payment/intent',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tier,email})});document.getElementById('paymentResult').textContent=JSON.stringify(res,null,2);}
+loadDashboard();
+</script>
+</body>
+</html>"""
+
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
+
+```
+
+.gitignore:
+```
+data/
+__pycache__/
+
+```
+
+appraiser.py:
+```
+#!/usr/bin/env python3
+"""
+Production Readiness Appraiser
+Deterministic, rule-based scoring engine for codebase valuation.
+No LLM required — fast, repeatable, auditable.
+"""
+
+import json
+import os
+import re
+import subprocess
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, List, Optional, Any
+
+
+SEVERITY_WEIGHTS = {
+    "critical": 0,
+    "high": 15,
+    "medium": 30,
+    "low": 45,
+}
+
+SECRET_PATTERNS = [
+    (r"api[_\-]?key\s*[=:]\s*['\"\w\-]{16,}", "high", "Hardcoded API key"),
+    (r"secret\s*[=:]\s*['\"\w\-]{8,}", "high", "Hardcoded secret"),
+    (r"password\s*[=:]\s*['\"][^'\"]{4,}['\"]", "critical", "Hardcoded password"),
+    (r"token\s*[=:]\s*['\"\w\-]{20,}", "high", "Hardcoded token"),
+    (r"private[_\-]?key\s*[=:]\s*['\"\w\-/+=]{20,}", "critical", "Hardcoded private key"),
+    (r"-----BEGIN (RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----", "critical", "Embedded private key PEM"),
+    (r"AKIA[0-9A-Z]{16}", "critical", "AWS Access Key ID"),
+    (r"ghp_[A-Za-z0-9_]{36}", "critical", "GitHub PAT"),
+    (r"sk-[a-zA-Z0-9]{20,}", "high", "OpenAI/Stripe secret key pattern"),
+]
+
+
+@dataclass
+class CheckResult:
+    name: str
+    passed: bool
+    score: int  # 0-100
+    weight: float
+    details: List[str] = field(default_factory=list)
+
+
+@dataclass
+class AppraisalReport:
+    project_name: str
+    project_path: str
+    project_type: str
+    appraised_at: str
+    overall_score: int
+    monetization_score: int
+    readiness_grade: str
+    checks: List[CheckResult]
+    secrets: List[Dict[str, Any]]
+    recommendations: List[str]
+    estimated_value_usd: int
+    action_plan: List[str]
+
+
+def _scan_for_secrets(root: Path, max_files: int = 500) -> List[Dict]:
+    found = []
+    compiled = [(re.compile(p, re.IGNORECASE), sev, desc) for p, sev, desc in SECRET_PATTERNS]
+    count = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in {
+            ".git", "node_modules", "__pycache__", ".venv", "venv", "target", "dist", "build"
+        }]
+        for f in filenames:
+            if count >= max_files:
+                break
+            if not f.endswith((".py", ".js", ".ts", ".tsx", ".rs", ".go", ".sol", ".yaml", ".yml", ".json", ".env", ".toml", ".sh", ".md")):
+                continue
+            fp = Path(dirpath) / f
+            try:
+                text = fp.read_text(encoding="utf-8", errors="ignore")
+                count += 1
+                for pattern, severity, description in compiled:
+                    for m in pattern.finditer(text):
+                        snippet = text[max(0, m.start()-20):m.end()+20].replace("\n", " ")
+                        found.append({
+                            "file": str(fp.relative_to(root)),
+                            "severity": severity,
+                            "description": description,
+                            "snippet": snippet[:100],
+                        })
+            except Exception:
+                continue
+    # Deduplicate by file+description
+    seen = set()
+    unique = []
+    for s in found:
+        key = (s["file"], s["description"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(s)
+    return unique
+
+
+def _has_file(root: Path, name: str) -> bool:
+    return (root / name).is_file()
+
+
+def _has_dir(root: Path, name: str) -> bool:
+    return (root / name).is_dir()
+
+
+def _read_first_lines(path: Path, n: int = 30) -> str:
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            return "".join(f.readline() for _ in range(n))
+    except Exception:
+        return ""
+
+
+def _git_status(root: Path) -> Dict[str, Any]:
+    result = {"has_git": False, "has_remote": False, "uncommitted": False, "branch": "", "commits_behind": 0}
+    git_dir = root / ".git"
+    if not git_dir.exists():
+        return result
+    result["has_git"] = True
+    try:
+        branch = subprocess.run(["git", "branch", "--show-current"], cwd=root, capture_output=True, text=True, timeout=5)
+        if branch.returncode == 0:
+            result["branch"] = branch.stdout.strip()
+        remote = subprocess.run(["git", "remote", "-v"], cwd=root, capture_output=True, text=True, timeout=5)
+        result["has_remote"] = len(remote.stdout.strip()) > 0
+        status = subprocess.run(["git", "status", "--porcelain"], cwd=root, capture_output=True, text=True, timeout=5)
+        result["uncommitted"] = len(status.stdout.strip()) > 0
+        rev = subprocess.run(["git", "rev-list", "--count", "--left-only", "@{u}...HEAD"], cwd=root, capture_output=True, text=True, timeout=5)
+        if rev.returncode == 0:
+            try:
+                result["commits_behind"] = int(rev.stdout.strip())
+            except ValueError:
+                pass
+    except Exception:
+        pass
+    return result
+
+
+def _check_ci(root: Path) -> Dict[str, Any]:
+    ci = {"has_ci": False, "ci_platform": "", "test_job": False, "build_job": False, "lint_job": False}
+    gh = root / ".github" / "workflows"
+    if gh.is_dir():
+        ci["has_ci"] = True
+        ci["ci_platform"] = "github_actions"
+        for wf in gh.glob("*.yml"):
+            text = wf.read_text(encoding="utf-8", errors="ignore").lower()
+            if "test" in text:
+                ci["test_job"] = True
+            if "build" in text or "compile" in text:
+                ci["build_job"] = True
+            if "lint" in text or "typecheck" in text or "mypy" in text or "eslint" in text:
+                ci["lint_job"] = True
+    gl = root / ".gitlab-ci.yml"
+    if gl.is_file():
+        ci["has_ci"] = True
+        ci["ci_platform"] = "gitlab_ci"
+        text = gl.read_text(encoding="utf-8", errors="ignore").lower()
+        ci["test_job"] = "test" in text
+        ci["build_job"] = "build" in text
+        ci["lint_job"] = "lint" in text
+    return ci
+
+
+def _check_tests(root: Path, project_type: str) -> Dict[str, Any]:
+    result = {"has_tests": False, "test_count": 0, "coverage": False}
+    test_dirs = ["tests", "test", "__tests__", "spec", "specs"]
+    for td in test_dirs:
+        p = root / td
+        if p.is_dir():
+            result["has_tests"] = True
+            result["test_count"] += len(list(p.rglob("*")))
+    # Coverage config
+    result["coverage"] = any(_has_file(root, f) for f in [".coveragerc", "codecov.yml", "coverage.json"])
+    if project_type == "nodejs" and (root / "package.json").is_file():
+        pkg = json.loads((root / "package.json").read_text())
+        scripts = pkg.get("scripts", {})
+        if any("test" in k for k in scripts):
+            result["has_tests"] = True
+    return result
+
+
+def _check_docs(root: Path) -> Dict[str, Any]:
+    result = {"has_readme": False, "readme_length": 0, "has_changelog": False, "has_license": False, "has_contributing": False}
+    for name in ["README.md", "README", "readme.md", "Readme.md"]:
+        p = root / name
+        if p.is_file():
+            result["has_readme"] = True
+            result["readme_length"] = len(p.read_text())
+            break
+    result["has_changelog"] = any(_has_file(root, f) for f in ["CHANGELOG.md", "CHANGELOG", "HISTORY.md"])
+    result["has_license"] = any(_has_file(root, f) for f in ["LICENSE", "LICENSE.md", "LICENSE.txt", "COPYING"])
+    result["has_contributing"] = any(_has_file(root, f) for f in ["CONTRIBUTING.md", "CONTRIBUTING"])
+    return result
+
+
+def _check_dependencies(root: Path, project_type: str) -> Dict[str, Any]:
+    result = {"has_lockfile": False, "has_requirements": False, "outdated_risk": "unknown"}
+    lockfiles = ["package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock", "Cargo.lock", "go.sum", "Pipfile.lock"]
+    if any(_has_file(root, f) for f in lockfiles):
+        result["has_lockfile"] = True
+    if project_type == "python":
+        result["has_requirements"] = any(_has_file(root, f) for f in ["requirements.txt", "Pipfile", "pyproject.toml"])
+    if project_type == "nodejs":
+        result["has_requirements"] = _has_file(root, "package.json")
+    return result
+
+
+def appraise_project(project_root: Path, project_type: str = "unknown") -> AppraisalReport:
+    root = Path(project_root).expanduser().resolve()
+    name = root.name
+
+    secrets = _scan_for_secrets(root)
+    git_info = _git_status(root)
+    ci_info = _check_ci(root)
+    test_info = _check_tests(root, project_type)
+    doc_info = _check_docs(root)
+    dep_info = _check_dependencies(root, project_type)
+
+    checks: List[CheckResult] = []
+
+    # 1. Secrets & Security (weight 25)
+    secret_score = 100
+    if secrets:
+        worst = max((SEVERITY_WEIGHTS.get(s["severity"], 0) for s in secrets), default=100)
+        secret_score = worst
+    checks.append(CheckResult("security_secrets", secret_score == 100, secret_score, 25.0,
+                              details=[f"{s['severity']}: {s['description']} in {s['file']}" for s in secrets[:5]]))
+
+    # 2. Version Control (weight 10)
+    vc_score = 0
+    if git_info["has_git"]:
+        vc_score += 40
+    if git_info["has_remote"]:
+        vc_score += 30
+    if not git_info["uncommitted"]:
+        vc_score += 30
+    checks.append(CheckResult("version_control", git_info["has_git"], vc_score, 10.0,
+                              details=[f"git={git_info['has_git']}, remote={git_info['has_remote']}, clean={not git_info['uncommitted']}"]))
+
+    # 3. CI/CD (weight 15)
+    ci_score = 0
+    if ci_info["has_ci"]:
+        ci_score += 40
+    if ci_info["test_job"]:
+        ci_score += 30
+    if ci_info["build_job"]:
+        ci_score += 20
+    if ci_info["lint_job"]:
+        ci_score += 10
+    checks.append(CheckResult("ci_cd", ci_info["has_ci"], ci_score, 15.0,
+                              details=[f"platform={ci_info['ci_platform']}, test={ci_info['test_job']}, build={ci_info['build_job']}, lint={ci_info['lint_job']}"]))
+
+    # 4. Testing (weight 15)
+    test_score = 0
+    if test_info["has_tests"]:
+        test_score += 60
+        if test_info["test_count"] > 5:
+            test_score += 20
+        if test_info["coverage"]:
+            test_score += 20
+    checks.append(CheckResult("testing", test_info["has_tests"], test_score, 15.0,
+                              details=[f"tests={test_info['has_tests']}, count≈{test_info['test_count']}, coverage={test_info['coverage']}"]))
+
+    # 5. Documentation (weight 10)
+    doc_score = 0
+    if doc_info["has_readme"]:
+        doc_score += 40
+        if doc_info["readme_length"] > 500:
+            doc_score += 20
+        if doc_info["readme_length"] > 1500:
+            doc_score += 10
+    if doc_info["has_changelog"]:
+        doc_score += 10
+    if doc_info["has_license"]:
+        doc_score += 10
+    if doc_info["has_contributing"]:
+        doc_score += 10
+    checks.append(CheckResult("documentation", doc_info["has_readme"], doc_score, 10.0,
+                              details=[f"readme={doc_info['has_readme']}({doc_info['readme_length']} chars), changelog={doc_info['has_changelog']}, license={doc_info['has_license']}, contributing={doc_info['has_contributing']}"]))
+
+    # 6. Dependency Management (weight 10)
+    dep_score = 0
+    if dep_info["has_requirements"]:
+        dep_score += 50
+    if dep_info["has_lockfile"]:
+        dep_score += 50
+    checks.append(CheckResult("dependencies", dep_info["has_requirements"], dep_score, 10.0,
+                              details=[f"requirements={dep_info['has_requirements']}, lockfile={dep_info['has_lockfile']}"]))
+
+    # 7. Deployment Artifacts (weight 10)
+    deploy_score = 0
+    if _has_file(root, "Dockerfile") or _has_file(root, "docker-compose.yml") or _has_file(root, "docker-compose.yaml"):
+        deploy_score += 50
+    if _has_file(root, "netlify.toml") or _has_file(root, "vercel.json") or _has_file(root, "render.yaml") or _has_file(root, "fly.toml"):
+        deploy_score += 30
+    if _has_file(root, "Dockerfile") and ci_info["build_job"]:
+        deploy_score += 20
+    checks.append(CheckResult("deployment", deploy_score > 0, deploy_score, 10.0,
+                              details=[f"docker={_has_file(root, 'Dockerfile')}, deploy_config={deploy_score > 0}"]))
+
+    # 8. Code Quality Signals (weight 5)
+    quality_score = 100
+    quality_issues = []
+    # Check for common anti-patterns in first few files
+    if (root / "package.json").is_file():
+        pkg_text = _read_first_lines(root / "package.json")
+        if "eslint" not in pkg_text.lower() and project_type == "nodejs":
+            quality_score -= 20
+            quality_issues.append("No ESLint configured")
+    if (root / "pyproject.toml").is_file():
+        pyproj = _read_first_lines(root / "pyproject.toml")
+        if "ruff" not in pyproj and "black" not in pyproj and "flake8" not in pyproj:
+            quality_score -= 20
+            quality_issues.append("No Python linter configured")
+    checks.append(CheckResult("code_quality", quality_score == 100, quality_score, 5.0, details=quality_issues))
+
+    # Compute weighted overall score
+    total_weight = sum(c.weight for c in checks)
+    weighted_sum = sum(c.score * c.weight for c in checks)
+    overall = round(weighted_sum / total_weight) if total_weight > 0 else 0
+
+    # Monetization score = overall * readiness modifier
+    readiness = "A" if overall >= 90 else "B" if overall >= 75 else "C" if overall >= 60 else "D" if overall >= 45 else "F"
+    monetization = round(overall * (1.2 if readiness == "A" else 1.0 if readiness == "B" else 0.8 if readiness == "C" else 0.5 if readiness == "D" else 0.2))
+    monetization = min(100, monetization)
+
+    # Estimated value: simplistic model based on project type + score
+    base_values = {"rust": 80000, "solana": 120000, "python": 40000, "nodejs": 50000, "go": 70000, "cpp": 60000, "jvm": 75000}
+    base = 10000
+    for pt, val in base_values.items():
+        if pt in project_type:
+            base = val
+            break
+    estimated_value = round(base * (monetization / 100))
+
+    # Recommendations
+    recommendations = []
+    if secrets:
+        recommendations.append("URGENT: Remove hardcoded secrets and use environment variables or a vault.")
+    if not git_info["has_git"]:
+        recommendations.append("Initialize git repository for version control.")
+    if not git_info["has_remote"]:
+        recommendations.append("Push to a remote repository (GitHub/GitLab) for backup and collaboration.")
+    if git_info["uncommitted"]:
+        recommendations.append("Commit or stash uncommitted changes.")
+    if not ci_info["has_ci"]:
+        recommendations.append("Add CI/CD pipeline (GitHub Actions/GitLab CI) for automated testing and deployment.")
+    if not ci_info["test_job"]:
+        recommendations.append("Add automated test jobs to CI pipeline.")
+    if not ci_info["lint_job"]:
+        recommendations.append("Add lint/typecheck jobs to CI pipeline.")
+    if not test_info["has_tests"]:
+        recommendations.append("Add unit/integration tests.")
+    if not doc_info["has_readme"]:
+        recommendations.append("Write a comprehensive README with setup instructions.")
+    if not doc_info["has_license"]:
+        recommendations.append("Add a LICENSE file.")
+    if not dep_info["has_lockfile"]:
+        recommendations.append("Add a lockfile for reproducible builds.")
+    if not _has_file(root, "Dockerfile"):
+        recommendations.append("Add Dockerfile or docker-compose for containerized deployment.")
+
+    action_plan = []
+    if secrets:
+        action_plan.append("1. Remove secrets and rotate exposed credentials")
+    if not git_info["has_remote"]:
+        action_plan.append("2. Push repository to GitHub/GitLab")
+    if not ci_info["has_ci"]:
+        action_plan.append("3. Add CI/CD workflow")
+    if not test_info["has_tests"]:
+        action_plan.append("4. Write core unit tests")
+    if not doc_info["has_readme"]:
+        action_plan.append("5. Write README and LICENSE")
+    if not _has_file(root, "Dockerfile"):
+        action_plan.append("6. Add Dockerfile")
+
+    return AppraisalReport(
+        project_name=name,
+        project_path=str(root),
+        project_type=project_type,
+        appraised_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        overall_score=overall,
+        monetization_score=monetization,
+        readiness_grade=readiness,
+        checks=checks,
+        secrets=secrets,
+        recommendations=recommendations,
+        estimated_value_usd=estimated_value,
+        action_plan=action_plan,
+    )
+
+
+def report_to_dict(report: AppraisalReport) -> Dict[str, Any]:
+    return {
+        "project_name": report.project_name,
+        "project_path": report.project_path,
+        "project_type": report.project_type,
+        "appraised_at": report.appraised_at,
+        "overall_score": report.overall_score,
+        "monetization_score": report.monetization_score,
+        "readiness_grade": report.readiness_grade,
+        "estimated_value_usd": report.estimated_value_usd,
+        "checks": [asdict(c) for c in report.checks],
+        "secrets": report.secrets,
+        "recommendations": report.recommendations,
+        "action_plan": report.action_plan,
+    }
+
+
+if __name__ == "__main__":
+    import sys
+    target = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("/Users/alep/Downloads/production_agent_service")
+    r = appraise_project(target, "python")
+    print(json.dumps(report_to_dict(r), indent=2, default=str))
+
+```
+
+agent.py:
+```
+#!/usr/bin/env python3
+"""
+Production Agent — orchestrates scanning, readiness evaluation, and appraisal.
+Runs autonomously or on-demand via the API.
+"""
+
+import json
+import os
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, List, Optional
+
+from scanner import scan_workspace, Project, ScanResult
+from readiness import evaluate_project as evaluate_readiness
+from appraiser import appraise_project, report_to_dict
+
+
+@dataclass
+class AgentJob:
+    job_id: str
+    status: str  # pending, running, completed, failed
+    root_path: str
+    started_at: str
+    completed_at: Optional[str] = None
+    projects_scanned: int = 0
+    projects_appraised: int = 0
+    total_value_usd: int = 0
+    avg_readiness: float = 0.0
+    results: List[Dict] = field(default_factory=list)
+    errors: List[str] = field(default_factory=list)
+
+
+class ProductionAgent:
+    def __init__(self, workspace_root: str = "/Users/alep/Downloads"):
+        self.workspace_root = Path(workspace_root).expanduser().resolve()
+        self.jobs: Dict[str, AgentJob] = {}
+        self.latest_scan: Optional[ScanResult] = None
+        self.latest_results: List[Dict] = []
+
+    def run_scan(self, job_id: Optional[str] = None) -> AgentJob:
+        job_id = job_id or f"scan-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+        job = AgentJob(
+            job_id=job_id,
+            status="running",
+            root_path=str(self.workspace_root),
+            started_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        )
+        self.jobs[job_id] = job
+
+        try:
+            scan_result = scan_workspace(self.workspace_root, max_depth=6)
+            self.latest_scan = scan_result
+            job.projects_scanned = len(scan_result.projects)
+
+            for proj in scan_result.projects:
+                try:
+                    root = Path(proj.root)
+                    readiness = evaluate_readiness(root, proj.name, proj.project_type)
+                    appraisal = appraise_project(root, proj.project_type)
+                    appraisal_dict = report_to_dict(appraisal)
+
+                    # Merge readiness into appraisal
+                    appraisal_dict["readiness_score"] = readiness.overall_score
+                    appraisal_dict["readiness_details"] = {
+                        "ci_cd": readiness.ci_cd,
+                        "tests": readiness.tests,
+                        "docs": readiness.docs,
+                        "typing": readiness.typing,
+                        "linting": readiness.linting,
+                        "docker": readiness.docker,
+                        "secrets": readiness.secrets,
+                        "dependencies": readiness.dependencies,
+                        "structure": readiness.structure,
+                    }
+                    appraisal_dict["readiness_recommendations"] = readiness.recommendations
+                    appraisal_dict["readiness_issues"] = readiness.issues[:5]
+
+                    job.results.append(appraisal_dict)
+                    job.projects_appraised += 1
+                    job.total_value_usd += appraisal_dict.get("estimated_value_usd", 0)
+                except Exception as e:
+                    job.errors.append(f"{proj.name}: {str(e)}")
+
+            if job.results:
+                job.avg_readiness = round(
+                    sum(r["overall_score"] for r in job.results) / len(job.results), 1
+                )
+
+            job.status = "completed"
+            job.completed_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            self.latest_results = job.results
+        except Exception as e:
+            job.status = "failed"
+            job.errors.append(str(e))
+
+        return job
+
+    def get_summary(self) -> Dict:
+        if not self.latest_results:
+            return {"status": "no_data", "message": "Run scan first"}
+
+        grades = {}
+        types = {}
+        for r in self.latest_results:
+            g = r["readiness_grade"]
+            grades[g] = grades.get(g, 0) + 1
+            t = r["project_type"]
+            types[t] = types.get(t, 0) + 1
+
+        return {
+            "projects": len(self.latest_results),
+            "total_value_usd": sum(r["estimated_value_usd"] for r in self.latest_results),
+            "avg_overall_score": round(sum(r["overall_score"] for r in self.latest_results) / len(self.latest_results), 1),
+            "avg_readiness_score": round(sum(r["readiness_score"] for r in self.latest_results) / len(self.latest_results), 1),
+            "grade_distribution": grades,
+            "type_distribution": types,
+            "top_projects": sorted(self.latest_results, key=lambda x: x["overall_score"], reverse=True)[:5],
+            "urgent_issues": [
+                {"project": r["project_name"], "issues": r["readiness_issues"]}
+                for r in self.latest_results if r.get("readiness_issues")
+            ],
+        }
+
+    def export_report(self, out_path: Optional[Path] = None) -> Path:
+        out = out_path or (self.workspace_root / "PRODUCTION_AGENT_REPORT.json")
+        summary = self.get_summary()
+        payload = {
+            "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "workspace_root": str(self.workspace_root),
+            "summary": summary,
+            "projects": self.latest_results,
+        }
+        out.write_text(json.dumps(payload, indent=2, default=str))
+        return out
+
+
+if __name__ == "__main__":
+    agent = ProductionAgent()
+    print("Starting full workspace scan + appraisal...")
+    job = agent.run_scan()
+    print(f"Job {job.job_id}: {job.status}")
+    print(f"  Projects scanned: {job.projects_scanned}")
+    print(f"  Projects appraised: {job.projects_appraised}")
+    print(f"  Total value: ${job.total_value_usd:,}")
+    print(f"  Avg readiness: {job.avg_readiness}")
+    if job.errors:
+        print(f"  Errors: {len(job.errors)}")
+    report = agent.export_report()
+    print(f"  Report saved: {report}")
+
+```
+
+.gitattributes:
+```
+*.7z filter=lfs diff=lfs merge=lfs -text
+*.arrow filter=lfs diff=lfs merge=lfs -text
+*.bin filter=lfs diff=lfs merge=lfs -text
+*.bz2 filter=lfs diff=lfs merge=lfs -text
+*.ckpt filter=lfs diff=lfs merge=lfs -text
+*.ftz filter=lfs diff=lfs merge=lfs -text
+*.gz filter=lfs diff=lfs merge=lfs -text
+*.h5 filter=lfs diff=lfs merge=lfs -text
+*.joblib filter=lfs diff=lfs merge=lfs -text
+*.lfs.* filter=lfs diff=lfs merge=lfs -text
+*.mlmodel filter=lfs diff=lfs merge=lfs -text
+*.model filter=lfs diff=lfs merge=lfs -text
+*.msgpack filter=lfs diff=lfs merge=lfs -text
+*.npy filter=lfs diff=lfs merge=lfs -text
+*.npz filter=lfs diff=lfs merge=lfs -text
+*.onnx filter=lfs diff=lfs merge=lfs -text
+*.ot filter=lfs diff=lfs merge=lfs -text
+*.parquet filter=lfs diff=lfs merge=lfs -text
+*.pb filter=lfs diff=lfs merge=lfs -text
+*.pickle filter=lfs diff=lfs merge=lfs -text
+*.pkl filter=lfs diff=lfs merge=lfs -text
+*.pt filter=lfs diff=lfs merge=lfs -text
+*.pth filter=lfs diff=lfs merge=lfs -text
+*.rar filter=lfs diff=lfs merge=lfs -text
+*.safetensors filter=lfs diff=lfs merge=lfs -text
+saved_model/**/* filter=lfs diff=lfs merge=lfs -text
+*.tar.* filter=lfs diff=lfs merge=lfs -text
+*.tar filter=lfs diff=lfs merge=lfs -text
+*.tflite filter=lfs diff=lfs merge=lfs -text
+*.tgz filter=lfs diff=lfs merge=lfs -text
+*.wasm filter=lfs diff=lfs merge=lfs -text
+*.xz filter=lfs diff=lfs merge=lfs -text
+*.zip filter=lfs diff=lfs merge=lfs -text
+*.zst filter=lfs diff=lfs merge=lfs -text
+*tfevents* filter=lfs diff=lfs merge=lfs -text
+
+```
+
+readiness.py:
+```
+#!/usr/bin/env python3
+"""
+Production Readiness Evaluator
+Scores a project on CI/CD, tests, docs, secrets, typing, linting, docker, etc.
+"""
+
+import fnmatch
+import json
+import os
+import re
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import Dict, List, Optional
+
+
+SECRET_PATTERNS = [
+    r"api[_\-]?key\s*[=:]\s*['\"\w]+",
+    r"private[_\-]?key\s*[=:]\s*['\"\w]+",
+    r"secret\s*[=:]\s*['\"\w]+",
+    r"password\s*[=:]\s*['\"\w]+",
+    r"token\s*[=:]\s*['\"\w]+",
+    r"credentials\s*[=:]\s*['\"\w]+",
+    r"-----BEGIN (RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----",
+    r"AKIA[0-9A-Z]{16}",
+    r"ghp_[A-Za-z0-9_]{36}",
+    r"glpat-[A-Za-z0-9_\-]{20,}",
+    r"sk-[a-zA-Z0-9]{20,}",
+    r"xox[baprs]-[a-zA-Z0-9]+",
+]
+
+COMPILED_SECRET_PATTERNS = [re.compile(p, re.IGNORECASE) for p in SECRET_PATTERNS]
+
+
+@dataclass
+class ReadinessScore:
+    project_name: str
+    project_root: str
+    overall_score: int = 0
+    ci_cd: int = 0
+    tests: int = 0
+    docs: int = 0
+    typing: int = 0
+    linting: int = 0
+    docker: int = 0
+    secrets: int = 100
+    dependencies: int = 0
+    structure: int = 0
+    issues: List[str] = field(default_factory=list)
+    recommendations: List[str] = field(default_factory=list)
+
+
+def _has_file(root: Path, *candidates: str) -> bool:
+    for c in candidates:
+        if (root / c).exists():
+            return True
+    return False
+
+
+def _has_dir(root: Path, *candidates: str) -> bool:
+    for c in candidates:
+        if (root / c).is_dir():
+            return True
+    return False
+
+
+def _read_text_limited(path: Path, limit: int = 50000) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="ignore")[:limit]
+    except Exception:
+        return ""
+
+
+def scan_secrets(root: Path) -> tuple:
+    hits = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in (".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build", "target")]
+        for f in filenames:
+            if f.startswith("."):
+                continue
+            fp = Path(dirpath) / f
+            if fp.stat().st_size > 5_000_000:
+                continue
+            ext = fp.suffix.lower()
+            if ext not in (".py", ".ts", ".tsx", ".js", ".jsx", ".sh", ".md", ".json", ".yaml", ".yml", ".toml", ".cfg", ".ini", ".txt", ".env", ".rs", ".go", ".sol", ""):
+                continue
+            text = _read_text_limited(fp)
+            for pat in COMPILED_SECRET_PATTERNS:
+                for m in pat.finditer(text):
+                    hits.append(f"{fp.relative_to(root)}: {m.group(0)[:60]}...")
+                    if len(hits) >= 50:
+                        return hits, 0
+    return hits, 100 if not hits else max(0, 100 - len(hits) * 5)
+
+
+def evaluate_ci_cd(root: Path) -> tuple:
+    score = 0
+    notes = []
+    has_github = _has_dir(root, ".github/workflows")
+    has_gitlab = _has_file(root, ".gitlab-ci.yml")
+    has_jenkins = _has_file(root, "Jenkinsfile")
+    has_circle = _has_file(root, ".circleci/config.yml")
+    has_travis = _has_file(root, ".travis.yml")
+    has_azure = _has_file(root, "azure-pipelines.yml")
+
+    if has_github:
+        score += 40
+        notes.append("GitHub Actions detected")
+        # Check for common workflows
+        wf_dir = root / ".github/workflows"
+        if wf_dir.is_dir():
+            wfs = list(wf_dir.glob("*.yml")) + list(wf_dir.glob("*.yaml"))
+            if wfs:
+                score += 10
+                notes.append(f"{len(wfs)} workflow files")
+            has_test = any("test" in w.name.lower() for w in wfs)
+            has_build = any("build" in w.name.lower() for w in wfs)
+            has_lint = any(l in w.name.lower() for w in wfs for l in ("lint", "format", "typecheck"))
+            if has_test:
+                score += 10
+            if has_build:
+                score += 10
+            if has_lint:
+                score += 10
+    elif has_gitlab:
+        score += 35
+        notes.append("GitLab CI detected")
+    elif has_jenkins:
+        score += 30
+        notes.append("Jenkins detected")
+    elif has_circle or has_travis or has_azure:
+        score += 25
+        notes.append("Third-party CI detected")
+    else:
+        notes.append("No CI/CD detected")
+
+    return min(score, 100), notes
+
+
+def evaluate_tests(root: Path, project_type: str) -> tuple:
+    score = 0
+    notes = []
+    has_test_dir = _has_dir(root, "tests", "test", "__tests__", "spec", "specs")
+    has_test_files = any(
+        fnmatch.fnmatch(f, "*test*") or fnmatch.fnmatch(f, "*spec*")
+        for _, _, files in os.walk(root)
+        for f in files
+        if f.endswith((".py", ".ts", ".tsx", ".js", ".jsx", ".rs", ".go", ".sol"))
+    )
+    if has_test_dir:
+        score += 30
+        notes.append("Test directory present")
+    if has_test_files:
+        score += 30
+        notes.append("Test files found")
+
+    # Coverage config
+    if _has_file(root, ".coveragerc", "codecov.yml", "sonar-project.properties"):
+        score += 10
+        notes.append("Coverage config present")
+
+    # Python specific
+    if "python" in project_type:
+        if _has_file(root, "pytest.ini", "setup.cfg", "pyproject.toml"):
+            cfg = _read_text_limited(root / "pyproject.toml") if (root / "pyproject.toml").exists() else ""
+            if "pytest" in cfg.lower() or "test" in cfg.lower():
+                score += 20
+                notes.append("Python test configuration present")
+
+    # JS/TS specific
+    if "nodejs" in project_type:
+        pkg = root / "package.json"
+        if pkg.exists():
+            data = json.loads(_read_text_limited(pkg))
+            scripts = data.get("scripts", {})
+            if any("test" in k for k in scripts):
+                score += 20
+                notes.append("Test script in package.json")
+            if any("coverage" in k for k in scripts):
+                score += 10
+
+    return min(score, 100), notes
+
+
+def evaluate_docs(root: Path) -> tuple:
+    score = 0
+    notes = []
+    has_readme = _has_file(root, "README.md", "README.rst", "README", "readme.md")
+    has_changelog = _has_file(root, "CHANGELOG.md", "CHANGELOG", "CHANGES.md", "HISTORY.md")
+    has_contributing = _has_file(root, "CONTRIBUTING.md", "CONTRIBUTING")
+    has_license = _has_file(root, "LICENSE", "LICENSE.md", "LICENSE.txt", "COPYING")
+
+    if has_readme:
+        score += 40
+        readme = root / "README.md"
+        if readme.exists():
+            text = _read_text_limited(readme)
+            if len(text) > 500:
+                score += 10
+            if "install" in text.lower() or "usage" in text.lower():
+                score += 10
+            if "api" in text.lower() or "endpoint" in text.lower():
+                score += 10
+        notes.append("README present")
+    else:
+        notes.append("No README found")
+
+    if has_changelog:
+        score += 10
+        notes.append("Changelog present")
+    if has_contributing:
+        score += 10
+        notes.append("Contributing guide present")
+    if has_license:
+        score += 10
+        notes.append("License present")
+
+    return min(score, 100), notes
+
+
+def evaluate_typing(root: Path, project_type: str) -> tuple:
+    score = 0
+    notes = []
+    if "python" in project_type:
+        if _has_file(root, "pyproject.toml", "setup.cfg", "mypy.ini"):
+            cfg = ""
+            for f in ("pyproject.toml", "setup.cfg", "mypy.ini"):
+                p = root / f
+                if p.exists():
+                    cfg = _read_text_limited(p)
+                    break
+            if "mypy" in cfg.lower():
+                score += 40
+                notes.append("mypy configured")
+            if "type" in cfg.lower():
+                score += 20
+        # Check for type hints in .py files
+        py_files = list(root.rglob("*.py"))
+        if py_files:
+            typed = 0
+            for p in py_files[:50]:
+                text = _read_text_limited(p, 5000)
+                if "-> " in text or "def " in text and ":" in text.split("def ", 1)[-1][:50]:
+                    typed += 1
+            if typed > len(py_files[:50]) * 0.3:
+                score += 30
+                notes.append("Type hints present in Python files")
+    elif "nodejs" in project_type or "typescript" in project_type:
+        if _has_file(root, "tsconfig.json"):
+            score += 50
+            notes.append("TypeScript configured")
+        if _has_file(root, "*.d.ts"):
+            score += 20
+
+    return min(score, 100), notes
+
+
+def evaluate_linting(root: Path, project_type: str) -> tuple:
+    score = 0
+    notes = []
+    if "python" in project_type:
+        for tool in ("ruff", "flake8", "pylint", "black", "isort"):
+            cfg_files = [f"{tool}.cfg", f".{tool}rc", "pyproject.toml", "setup.cfg"]
+            for cf in cfg_files:
+                p = root / cf
+                if p.exists() and tool in _read_text_limited(p).lower():
+                    score += 25
+                    notes.append(f"{tool} configured")
+                    break
+    elif "nodejs" in project_type or "typescript" in project_type:
+        pkg = root / "package.json"
+        if pkg.exists():
+            data = json.loads(_read_text_limited(pkg))
+            dev_deps = data.get("devDependencies", {})
+            for tool in ("eslint", "prettier", "biome", "standard"):
+                if tool in dev_deps:
+                    score += 25
+                    notes.append(f"{tool} in devDependencies")
+
+    if _has_file(root, ".pre-commit-config.yaml"):
+        score += 20
+        notes.append("pre-commit configured")
+
+    return min(score, 100), notes
+
+
+def evaluate_docker(root: Path) -> tuple:
+    score = 0
+    notes = []
+    if _has_file(root, "Dockerfile"):
+        score += 50
+        notes.append("Dockerfile present")
+    if _has_file(root, "docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"):
+        score += 30
+        notes.append("Docker Compose present")
+    if _has_file(root, ".dockerignore"):
+        score += 20
+        notes.append(".dockerignore present")
+    return min(score, 100), notes
+
+
+def evaluate_dependencies(root: Path, project_type: str) -> tuple:
+    score = 0
+    notes = []
+    if "python" in project_type:
+        if _has_file(root, "requirements.txt", "Pipfile", "poetry.lock", "pyproject.toml"):
+            score += 40
+            notes.append("Python dependency file present")
+        if _has_file(root, "requirements-dev.txt"):
+            score += 20
+            notes.append("Dev dependencies separated")
+    elif "nodejs" in project_type:
+        if _has_file(root, "package-lock.json", "yarn.lock", "pnpm-lock.yaml"):
+            score += 40
+            notes.append("Lockfile present")
+        if _has_file(root, "package.json"):
+            score += 20
+            notes.append("package.json present")
+    elif "rust" in project_type:
+        if _has_file(root, "Cargo.lock"):
+            score += 40
+            notes.append("Cargo.lock present")
+        if _has_file(root, "Cargo.toml"):
+            score += 20
+            notes.append("Cargo.toml present")
+    elif "go" in project_type:
+        if _has_file(root, "go.sum"):
+            score += 40
+            notes.append("go.sum present")
+        if _has_file(root, "go.mod"):
+            score += 20
+            notes.append("go.mod present")
+
+    # Check for known vulnerable patterns
+    if _has_file(root, "requirements.txt"):
+        req = _read_text_limited(root / "requirements.txt")
+        if "==" in req:
+            score += 10
+            notes.append("Pinned versions in requirements.txt")
+
+    return min(score, 100), notes
+
+
+def evaluate_structure(root: Path) -> tuple:
+    score = 0
+    notes = []
+    dirs = [d.name for d in root.iterdir() if d.is_dir() and not d.name.startswith(".")]
+    files = [f.name for f in root.iterdir() if f.is_file()]
+
+    if any(d in dirs for d in ("src", "lib", "app", "source")):
+        score += 20
+        notes.append("Source directory present")
+    if any(d in dirs for d in ("tests", "test", "__tests__", "spec")):
+        score += 20
+        notes.append("Test directory present")
+    if any(d in dirs for d in ("docs", "documentation", "doc")):
+        score += 10
+        notes.append("Docs directory present")
+    if "config" in dirs or "configs" in dirs:
+        score += 10
+        notes.append("Config directory present")
+    if ".gitignore" in files:
+        score += 10
+        notes.append(".gitignore present")
+    if "Makefile" in files or "justfile" in files:
+        score += 10
+        notes.append("Build automation present")
+
+    return min(score, 100), notes
+
+
+def evaluate_project(root: Path, name: str, project_type: str) -> ReadinessScore:
+    score = ReadinessScore(project_name=name, project_root=str(root))
+
+    score.ci_cd, ci_notes = evaluate_ci_cd(root)
+    score.tests, test_notes = evaluate_tests(root, project_type)
+    score.docs, doc_notes = evaluate_docs(root)
+    score.typing, type_notes = evaluate_typing(root, project_type)
+    score.linting, lint_notes = evaluate_linting(root, project_type)
+    score.docker, docker_notes = evaluate_docker(root)
+    secrets_hits, score.secrets = scan_secrets(root)
+    score.dependencies, dep_notes = evaluate_dependencies(root, project_type)
+    score.structure, struct_notes = evaluate_structure(root)
+
+    all_notes = ci_notes + test_notes + doc_notes + type_notes + lint_notes + docker_notes + dep_notes + struct_notes
+    score.issues = secrets_hits[:10]
+    score.recommendations = []
+
+    if score.ci_cd < 40:
+        score.recommendations.append("Add CI/CD (GitHub Actions recommended)")
+    if score.tests < 40:
+        score.recommendations.append("Add tests (pytest, jest, cargo test, etc.)")
+    if score.docs < 40:
+        score.recommendations.append("Add README with install/usage instructions")
+    if score.secrets < 100:
+        score.recommendations.append("Remove secrets from repository — use env vars / vault")
+    if score.typing < 40:
+        score.recommendations.append("Add type checking (mypy, TypeScript, etc.)")
+    if score.linting < 40:
+        score.recommendations.append("Add linting (ruff/eslint/prettier)")
+    if score.docker < 40:
+        score.recommendations.append("Add Dockerfile for reproducible deployments")
+
+    weights = {
+        "ci_cd": 0.15,
+        "tests": 0.15,
+        "docs": 0.10,
+        "typing": 0.10,
+        "linting": 0.10,
+        "docker": 0.10,
+        "secrets": 0.15,
+        "dependencies": 0.05,
+        "structure": 0.10,
+    }
+    score.overall_score = round(
+        score.ci_cd * weights["ci_cd"] +
+        score.tests * weights["tests"] +
+        score.docs * weights["docs"] +
+        score.typing * weights["typing"] +
+        score.linting * weights["linting"] +
+        score.docker * weights["docker"] +
+        score.secrets * weights["secrets"] +
+        score.dependencies * weights["dependencies"] +
+        score.structure * weights["structure"]
+    )
+
+    return score
+
+
+if __name__ == "__main__":
+    import sys
+    p = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(".")
+    r = evaluate_project(p, p.name, "unknown")
+    print(json.dumps(asdict(r), indent=2))
+
+```
+
+main.py:
+```
+#!/usr/bin/env python3
+"""
+Production Agent Service — Entry Point
+Run: python main.py
+Or: uvicorn main:app --host 0.0.0.0 --port 8000
+"""
+
+import os
+from api import app
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("api:app", host="0.0.0.0", port=port, reload=True)
+
+```
+
+index.html:
+```
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Production Agent Service</title>
+<style>
+:root{--bg:#0b0f19;--card:#111827;--accent:#10b981;--accent2:#3b82f6;--text:#e5e7eb;--muted:#9ca3af;--danger:#ef4444;--warn:#f59e0b;}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,sans-serif;line-height:1.5}
+.container{max-width:1200px;margin:0 auto;padding:24px}
+header{display:flex;align-items:center;justify-content:space-between;margin-bottom:32px}
+h1{font-size:1.6rem}
+.badge{background:var(--accent);color:#000;font-size:.75rem;font-weight:700;padding:4px 10px;border-radius:999px}
+.grid{display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}
+.card{background:var(--card);border:1px solid #1f2937;border-radius:12px;padding:20px}
+.card h2{font-size:1.1rem;margin-bottom:12px}
+.metric{font-size:2rem;font-weight:700;color:var(--accent)}
+.btn{background:var(--accent2);color:#fff;border:none;padding:10px 16px;border-radius:8px;cursor:pointer;font-size:.9rem}
+.btn:hover{opacity:.9}
+.btn.secondary{background:#374151}
+table{width:100%;border-collapse:collapse;margin-top:12px;font-size:.85rem}
+th,td{padding:10px 8px;text-align:left;border-bottom:1px solid #1f2937}
+th{color:var(--muted);font-weight:600}
+.grade-A{color:var(--accent);font-weight:700}
+.grade-B{color:#34d399;font-weight:700}
+.grade-C{color:var(--warn);font-weight:700}
+.grade-D{color:var(--danger);font-weight:700}
+.grade-F{color:#7f1d1d;font-weight:700}
+pre{background:#0b0f19;border:1px solid #1f2937;border-radius:8px;padding:12px;overflow:auto;max-height:400px;font-size:.8rem}
+.tabs{display:flex;gap:8px;margin-bottom:16px}
+.tab{padding:8px 14px;border-radius:8px;background:#1f2937;color:var(--muted);cursor:pointer;border:none}
+.tab.active{background:var(--accent2);color:#fff}
+.section{display:none}
+.section.active{display:block}
+input,select{background:#0b0f19;border:1px solid #374151;color:var(--text);padding:10px 12px;border-radius:8px;width:100%;margin-bottom:10px}
+.pricing-card{border:1px solid #1f2937;border-radius:12px;padding:20px;text-align:center}
+.price{font-size:2rem;font-weight:700;color:var(--accent)}
+.features{text-align:left;margin:12px 0;padding-left:18px;color:var(--muted)}
+.features li{margin-bottom:6px}
+</style>
+</head>
+<body>
+<div class="container">
+<header><h1>Production Agent Service</h1><span class="badge">ONLINE</span></header>
+<div class="tabs">
+<button class="tab active" onclick="showTab('dashboard')">Dashboard</button>
+<button class="tab" onclick="showTab('scan')">Scan</button>
+<button class="tab" onclick="showTab('appraisals')">Appraisals</button>
+<button class="tab" onclick="showTab('pricing')">Pricing</button>
+</div>
+
+<div id="dashboard" class="section active">
+<div class="grid">
+<div class="card"><h2>Total Scans</h2><div class="metric" id="totalScans">0</div></div>
+<div class="card"><h2>Total Appraisals</h2><div class="metric" id="totalAppraisals">0</div></div>
+<div class="card"><h2>Avg Score</h2><div class="metric" id="avgScore">-</div></div>
+<div class="card"><h2>Total Est. Value</h2><div class="metric" id="totalValue">$0</div></div>
+</div>
+<div class="card" style="margin-top:16px"><h2>Latest Appraisals</h2><table><thead><tr><th>Project</th><th>Type</th><th>Score</th><th>Grade</th><th>Value</th></tr></thead><tbody id="latestBody"></tbody></table></div>
+</div>
+
+<div id="scan" class="section">
+<div class="card">
+<h2>Scan Workspace</h2>
+<input type="text" id="scanPath" value="/Users/alep/Downloads" placeholder="Root path">
+<button class="btn" onclick="runScan()">Scan Now</button>
+<button class="btn secondary" onclick="batchAppraise()">Scan + Appraise All</button>
+<pre id="scanResult">Ready to scan.</pre>
+</div>
+</div>
+
+<div id="appraisals" class="section">
+<div class="card">
+<h2>All Appraisals</h2>
+<table><thead><tr><th>Project</th><th>Type</th><th>Score</th><th>Grade</th><th>Value</th><th>Secrets</th></tr></thead><tbody id="apprBody"></tbody></table>
+</div>
+</div>
+
+<div id="pricing" class="section">
+<div class="grid">
+<div class="pricing-card"><h3>Basic</h3><div class="price">Free</div><ul class="features"><li>Project inventory</li><li>Basic readiness score</li><li>Security secrets check</li></ul><button class="btn secondary" onclick="alert('Basic is free — just scan!')">Start Free</button></div>
+<div class="pricing-card"><h3>Pro</h3><div class="price">$29</div><ul class="features"><li>Full appraisal report</li><li>Monetization scoring</li><li>Action plan</li><li>Priority support</li></ul><button class="btn" onclick="createPayment('pro')">Buy Pro</button></div>
+<div class="pricing-card"><h3>Enterprise</h3><div class="price">$99</div><ul class="features"><li>Everything in Pro</li><li>Custom CI/CD setup</li><li>Deployment packaging</li><li>Dedicated agent</li></ul><button class="btn" onclick="createPayment('enterprise')">Buy Enterprise</button></div>
+</div>
+<div class="card" style="margin-top:16px"><h2>Payment Status</h2><pre id="paymentResult">No payments yet.</pre></div>
+</div>
+
+</div>
+<script>
+const API = location.origin + '/api';
+async function fetchJSON(url,opts){try{const r=await fetch(url,opts);return await r.json()}catch(e){return {error:e.message}}}
+function showTab(id){document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));document.querySelectorAll('.section').forEach(s=>s.classList.remove('active'));event.target.classList.add('active');document.getElementById(id).classList.add('active');if(id==='appraisals')loadAppraisals();if(id==='dashboard')loadDashboard();}
+async function loadDashboard(){const a=(await fetchJSON(API+'/appraisals')).appraisals||[];document.getElementById('totalAppraisals').textContent=a.length;const s=(await fetchJSON(API+'/scans')).scans||[];document.getElementById('totalScans').textContent=s.length;const scores=a.filter(x=>x.overall_score).map(x=>x.overall_score);document.getElementById('avgScore').textContent=scores.length?(scores.reduce((a,b)=>a+b,0)/scores.length).toFixed(1):'-';const tv=a.reduce((sum,x)=>sum+(x.estimated_value_usd||0),0);document.getElementById('totalValue').textContent='$'+tv.toLocaleString();const tb=document.getElementById('latestBody');tb.innerHTML='';a.slice(0,10).forEach(r=>{const g='grade-'+r.readiness_grade;tb.innerHTML+=`<tr><td>${r.project_name}</td><td>${r.project_type}</td><td>${r.overall_score}</td><td class="${g}">${r.readiness_grade}</td><td>$${(r.estimated_value_usd||0).toLocaleString()}</td></tr>`;});}
+async function runScan(){const path=document.getElementById('scanPath').value;document.getElementById('scanResult').textContent='Scanning...';const res=await fetchJSON(API+'/scan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({root_path:path})});document.getElementById('scanResult').textContent=JSON.stringify(res,null,2);loadDashboard();}
+async function batchAppraise(){const path=document.getElementById('scanPath').value;document.getElementById('scanResult').textContent='Scanning and appraising all projects...';const res=await fetchJSON(API+'/batch-appraise',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({root_path:path})});document.getElementById('scanResult').textContent=JSON.stringify(res,null,2);loadDashboard();}
+async function loadAppraisals(){const a=(await fetchJSON(API+'/appraisals')).appraisals||[];const tb=document.getElementById('apprBody');tb.innerHTML='';a.forEach(r=>{const g='grade-'+r.readiness_grade;const sc=(r.secrets||[]).length;tb.innerHTML+=`<tr><td>${r.project_name}</td><td>${r.project_type}</td><td>${r.overall_score}</td><td class="${g}">${r.readiness_grade}</td><td>$${(r.estimated_value_usd||0).toLocaleString()}</td><td>${sc?'<span style=color:var(--danger)>Yes ('+sc+')</span>':'No'}</td></tr>`;});}
+async function createPayment(tier){const email=prompt('Enter email:');if(!email)return;const res=await fetchJSON(API+'/payment/intent',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tier,email})});document.getElementById('paymentResult').textContent=JSON.stringify(res,null,2);}
+loadDashboard();
+</script>
+</body>
+</html>
+
+```

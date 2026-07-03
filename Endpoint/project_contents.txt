@@ -1,0 +1,1032 @@
+Project Structure:
+requirements.txt
+Dockerfile
+README.md
+.gitattributes
+app.py
+
+File Contents:
+requirements.txt:
+```
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+python-multipart==0.0.20
+requests==2.32.3
+httpx==0.28.1
+
+```
+
+Dockerfile:
+```
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV PORT=7860
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash \
+    coreutils \
+    findutils \
+    grep \
+    sed \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+COPY app.py /app/app.py
+
+RUN mkdir -p /data/workspace /data/ledger
+
+EXPOSE 7860
+
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7860"]
+```
+
+README.md:
+```
+---
+title: Endpoint
+emoji: ⚡
+colorFrom: yellow
+colorTo: pink
+sdk: docker
+pinned: false
+---
+
+Check out the configuration reference at https://huggingface.co/docs/hub/spaces-config-reference
+
+```
+
+.gitattributes:
+```
+*.7z filter=lfs diff=lfs merge=lfs -text
+*.arrow filter=lfs diff=lfs merge=lfs -text
+*.bin filter=lfs diff=lfs merge=lfs -text
+*.bz2 filter=lfs diff=lfs merge=lfs -text
+*.ckpt filter=lfs diff=lfs merge=lfs -text
+*.ftz filter=lfs diff=lfs merge=lfs -text
+*.gz filter=lfs diff=lfs merge=lfs -text
+*.h5 filter=lfs diff=lfs merge=lfs -text
+*.joblib filter=lfs diff=lfs merge=lfs -text
+*.lfs.* filter=lfs diff=lfs merge=lfs -text
+*.mlmodel filter=lfs diff=lfs merge=lfs -text
+*.model filter=lfs diff=lfs merge=lfs -text
+*.msgpack filter=lfs diff=lfs merge=lfs -text
+*.npy filter=lfs diff=lfs merge=lfs -text
+*.npz filter=lfs diff=lfs merge=lfs -text
+*.onnx filter=lfs diff=lfs merge=lfs -text
+*.ot filter=lfs diff=lfs merge=lfs -text
+*.parquet filter=lfs diff=lfs merge=lfs -text
+*.pb filter=lfs diff=lfs merge=lfs -text
+*.pickle filter=lfs diff=lfs merge=lfs -text
+*.pkl filter=lfs diff=lfs merge=lfs -text
+*.pt filter=lfs diff=lfs merge=lfs -text
+*.pth filter=lfs diff=lfs merge=lfs -text
+*.rar filter=lfs diff=lfs merge=lfs -text
+*.safetensors filter=lfs diff=lfs merge=lfs -text
+saved_model/**/* filter=lfs diff=lfs merge=lfs -text
+*.tar.* filter=lfs diff=lfs merge=lfs -text
+*.tar filter=lfs diff=lfs merge=lfs -text
+*.tflite filter=lfs diff=lfs merge=lfs -text
+*.tgz filter=lfs diff=lfs merge=lfs -text
+*.wasm filter=lfs diff=lfs merge=lfs -text
+*.xz filter=lfs diff=lfs merge=lfs -text
+*.zip filter=lfs diff=lfs merge=lfs -text
+*.zst filter=lfs diff=lfs merge=lfs -text
+*tfevents* filter=lfs diff=lfs merge=lfs -text
+
+```
+
+app.py:
+```
+import os
+import re
+import json
+import uuid
+import time
+import html
+import socket
+import hashlib
+import sqlite3
+import asyncio
+import shlex
+import ipaddress
+from pathlib import Path
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
+
+import httpx
+from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi.responses import HTMLResponse, PlainTextResponse, FileResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://josephrw-endpoint.hf.space").rstrip("/")
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
+APP_NAME = "Self-Relaunching GPT Kernel"
+
+DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
+WORKSPACE_ROOT = Path(os.getenv("WORKSPACE_ROOT", str(DATA_DIR / "workspaces"))).resolve()
+ARTIFACT_ROOT = Path(os.getenv("ARTIFACT_ROOT", str(DATA_DIR / "artifacts"))).resolve()
+RECEIPTS_ROOT = Path(os.getenv("RECEIPTS_ROOT", str(DATA_DIR / "receipts"))).resolve()
+LEDGER_DB = Path(os.getenv("LEDGER_DB", str(DATA_DIR / "ledger.sqlite3"))).resolve()
+TOOLS_FILE = Path(os.getenv("TOOLS_FILE", str(DATA_DIR / "tools.json"))).resolve()
+RELAUNCH_FLAG = Path(os.getenv("RELAUNCH_FLAG", str(DATA_DIR / "relaunch_requested.json"))).resolve()
+
+MAX_TIMEOUT_SECONDS = int(os.getenv("MAX_TIMEOUT_SECONDS", "30"))
+MAX_OUTPUT_BYTES = int(os.getenv("MAX_OUTPUT_BYTES", "120000"))
+MAX_FILE_BYTES = int(os.getenv("MAX_FILE_BYTES", "20000000"))
+SCRAPE_MAX_BYTES = int(os.getenv("SCRAPE_MAX_BYTES", "1500000"))
+SCRAPE_PREVIEW_CHARS = int(os.getenv("SCRAPE_PREVIEW_CHARS", "18000"))
+
+for p in [DATA_DIR, WORKSPACE_ROOT, ARTIFACT_ROOT, RECEIPTS_ROOT, LEDGER_DB.parent, TOOLS_FILE.parent]:
+    p.mkdir(parents=True, exist_ok=True)
+
+app = FastAPI(
+    title=APP_NAME,
+    version="4.0.0",
+    description=(
+        "GPT Actions compatible self-relaunching kernel with controlled terminal, Python execution, "
+        "public web scraping, file saving, receipts, request analysis, persistent tools, artifacts, "
+        "and admin-protected relaunch."
+    ),
+    openapi_url="/openapi_raw.json",
+    docs_url="/docs",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+BLOCKED_TOKENS = [
+    "rm -rf /", "mkfs", "dd if=", ":(){", "shutdown", "reboot",
+    "passwd", "useradd", "adduser", "su ", "sudo ", "chown /", "chmod 777 /",
+    "nc ", "ncat ", "telnet ", "ssh ", "scp ", "rsync ",
+    "python -m http.server", "uvicorn ", "gunicorn ", "nohup ", "& disown",
+    "/etc/passwd", "/etc/shadow", "/root", "/proc/self/environ",
+    "apt-get", "apk add", "yum install", "dnf install",
+]
+
+ALLOWED_COMMAND_PREFIXES = [
+    "pwd", "ls", "cat", "head", "tail", "wc", "find", "grep", "sed",
+    "python", "python3", "pytest", "git status", "git diff", "git log",
+    "tree", "du", "df", "date", "whoami", "echo", "touch", "mkdir",
+    "cp", "mv", "sha256sum", "sort", "uniq", "cut", "tr", "printf", "uname",
+    "node", "npm --version", "npx --yes vercel", "vercel --version"
+]
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def sha256_bytes(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def sha256_json(payload: Any) -> str:
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
+    return sha256_bytes(raw)
+
+
+def safe_name(value: str, default: str = "item") -> str:
+    value = (value or default).strip()
+    value = re.sub(r"[^a-zA-Z0-9._-]+", "-", value)
+    value = value.strip(".-")
+    return value[:120] or default
+
+
+def require_admin(x_admin_token: Optional[str]) -> None:
+    if not ADMIN_TOKEN:
+        raise HTTPException(status_code=503, detail="ADMIN_TOKEN is not configured")
+    if x_admin_token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="Admin token required")
+
+
+def workspace_path(workspace: str, relative_path: str = ".") -> Path:
+    ws = safe_name(workspace, "default")
+    base = (WORKSPACE_ROOT / ws).resolve()
+    base.mkdir(parents=True, exist_ok=True)
+    target = (base / relative_path).resolve()
+    if not str(target).startswith(str(base)):
+        raise HTTPException(status_code=400, detail="Path escapes workspace")
+    return target
+
+
+def artifact_path(relative_path: str) -> Path:
+    safe = relative_path.replace("\\", "/").lstrip("/")
+    target = (ARTIFACT_ROOT / safe).resolve()
+    if not str(target).startswith(str(ARTIFACT_ROOT)):
+        raise HTTPException(status_code=400, detail="Path escapes artifact root")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def validate_command(command: str) -> None:
+    lowered = command.lower()
+    for token in BLOCKED_TOKENS:
+        if token.lower() in lowered:
+            raise HTTPException(status_code=400, detail=f"Blocked command token: {token}")
+
+    lines = [ln.strip() for ln in command.strip().splitlines() if ln.strip()]
+    if not lines:
+        raise HTTPException(status_code=400, detail="Empty command")
+    for line in lines:
+        if not any(line == p or line.startswith(p + " ") for p in ALLOWED_COMMAND_PREFIXES):
+            raise HTTPException(status_code=400, detail=f"Command prefix not allowed: {line[:100]}")
+
+
+def init_db() -> None:
+    with sqlite3.connect(LEDGER_DB, timeout=5) as con:
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("""CREATE TABLE IF NOT EXISTS receipts (
+            id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            actor TEXT,
+            workspace TEXT,
+            summary TEXT,
+            payload_json TEXT NOT NULL,
+            payload_sha256 TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )""")
+        con.execute("""CREATE INDEX IF NOT EXISTS idx_receipts_kind_time ON receipts(kind, created_at)""")
+        con.execute("""CREATE TABLE IF NOT EXISTS request_log (
+            id TEXT PRIMARY KEY,
+            method TEXT,
+            path TEXT,
+            query TEXT,
+            client TEXT,
+            user_agent TEXT,
+            status_code INTEGER,
+            duration_ms REAL,
+            request_sha256 TEXT,
+            response_sha256 TEXT,
+            created_at TEXT NOT NULL
+        )""")
+        con.execute("""CREATE TABLE IF NOT EXISTS tools (
+            name TEXT PRIMARY KEY,
+            description TEXT,
+            mode TEXT NOT NULL,
+            template TEXT NOT NULL,
+            input_schema_json TEXT DEFAULT '{}',
+            required_args_json TEXT DEFAULT '[]',
+            enabled INTEGER DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )""")
+        con.execute("""CREATE TABLE IF NOT EXISTS sessions (
+            id TEXT PRIMARY KEY,
+            workspace TEXT NOT NULL,
+            cwd TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )""")
+
+
+def save_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True, default=str), encoding="utf-8")
+    tmp.replace(path)
+
+
+def make_receipt(kind: str, payload: Dict[str, Any], *, actor: str = "gpt", workspace: Optional[str] = None, summary: str = "") -> Dict[str, Any]:
+    rid = f"receipt_{uuid.uuid4().hex[:16]}"
+    clean = json.loads(json.dumps(payload, ensure_ascii=False, default=str))
+    digest = sha256_json(clean)
+    receipt = {
+        "id": rid,
+        "kind": kind,
+        "actor": actor,
+        "workspace": workspace,
+        "summary": summary or "",
+        "payload_sha256": digest,
+        "payload": clean,
+        "created_at": now_iso(),
+    }
+    save_json(RECEIPTS_ROOT / f"{rid}.json", receipt)
+    with sqlite3.connect(LEDGER_DB, timeout=5) as con:
+        con.execute(
+            "INSERT INTO receipts(id, kind, actor, workspace, summary, payload_json, payload_sha256, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (rid, kind, actor, workspace, summary or "", json.dumps(clean, ensure_ascii=False), digest, receipt["created_at"]),
+        )
+    return {k: v for k, v in receipt.items() if k != "payload"}
+
+
+def attach_receipt(payload: Dict[str, Any], kind: str, *, actor: str = "gpt", workspace: Optional[str] = None, summary: str = "") -> Dict[str, Any]:
+    try:
+        payload["receipt"] = make_receipt(kind, payload, actor=actor, workspace=workspace, summary=summary)
+        payload["receipt_error"] = None
+    except Exception as e:
+        payload["receipt"] = None
+        payload["receipt_error"] = f"{type(e).__name__}: {str(e)}"
+    return payload
+
+
+def private_or_internal_host(hostname: str) -> bool:
+    if not hostname:
+        return True
+    h = hostname.lower().strip(".")
+    if h in {"localhost", "metadata.google.internal"} or h.endswith(".local") or h.endswith(".internal"):
+        return True
+    try:
+        ip = ipaddress.ip_address(h)
+        return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified
+    except ValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(h, None)
+    except socket.gaierror:
+        raise HTTPException(status_code=400, detail="Could not resolve hostname")
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified:
+            return True
+    return False
+
+
+def extract_title_text(raw: bytes, content_type: str) -> Dict[str, str]:
+    text = raw.decode("utf-8", errors="replace")
+    if "html" in (content_type or "").lower() or "<html" in text[:5000].lower():
+        title_match = re.search(r"<title[^>]*>(.*?)</title>", text, flags=re.I | re.S)
+        title = html.unescape(re.sub(r"\s+", " ", title_match.group(1)).strip()) if title_match else ""
+        no_script = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", text, flags=re.I | re.S)
+        no_tags = re.sub(r"<[^>]+>", " ", no_script)
+        clean = html.unescape(re.sub(r"\s+", " ", no_tags).strip())
+        return {"title": title, "text": clean}
+    return {"title": "", "text": re.sub(r"\s+", " ", text).strip()}
+
+
+def render_template(template: str, params: Dict[str, Any], required_args: List[str]) -> str:
+    missing = [x for x in required_args if x not in params or params[x] is None]
+    if missing:
+        raise HTTPException(status_code=422, detail={"missing_required_args": missing})
+    rendered = template
+    for k, v in params.items():
+        val = str(v).replace("\\", "\\\\").replace('"', '\\"').replace("`", "\\`").replace("$", "\\$")
+        rendered = rendered.replace("{{" + k + "}}", val)
+    unresolved = re.findall(r"{{\s*([a-zA-Z0-9_.$-]+)\s*}}", rendered)
+    if unresolved:
+        raise HTTPException(status_code=422, detail={"unresolved_params": unresolved})
+    return rendered
+
+
+class TerminalRunRequest(BaseModel):
+    workspace: str = "default"
+    command: str
+    timeout_seconds: int = Field(default=10, ge=1, le=30)
+    cwd: str = "."
+    create_receipt: bool = True
+
+
+class PythonRunRequest(BaseModel):
+    workspace: str = "default"
+    code: str
+    timeout_seconds: int = Field(default=10, ge=1, le=30)
+    create_receipt: bool = True
+
+
+class FileWriteRequest(BaseModel):
+    workspace: str = "default"
+    path: str
+    content: str
+    encoding: str = "utf-8"
+
+
+class FileReadRequest(BaseModel):
+    workspace: str = "default"
+    path: str
+    max_bytes: int = Field(default=120000, ge=1, le=20000000)
+
+
+class FileListRequest(BaseModel):
+    workspace: str = "default"
+    path: str = "."
+    max_items: int = Field(default=250, ge=1, le=5000)
+
+
+class ArtifactRequest(BaseModel):
+    workspace: str = "default"
+    filename: str
+    content: str
+    content_type: str = "text/plain"
+
+
+class WebScrapeRequest(BaseModel):
+    url: str
+    workspace: str = "scrapes"
+    save: bool = True
+    max_bytes: int = Field(default=SCRAPE_MAX_BYTES, ge=1, le=3000000)
+    preview_chars: int = Field(default=SCRAPE_PREVIEW_CHARS, ge=100, le=50000)
+
+
+class ToolRegisterRequest(BaseModel):
+    name: str
+    description: str = ""
+    mode: str = Field(default="command", description="command or python")
+    template: str
+    input_schema: Dict[str, Any] = Field(default_factory=dict)
+    required_args: List[str] = []
+    enabled: bool = True
+
+
+class ToolInvokeRequest(BaseModel):
+    workspace: str = "default"
+    params: Dict[str, Any] = Field(default_factory=dict)
+    timeout_seconds: int = Field(default=10, ge=1, le=30)
+
+
+class SessionCreateRequest(BaseModel):
+    workspace: str = "default"
+    cwd: str = "."
+
+
+class SessionRunRequest(BaseModel):
+    session_id: str
+    command: str
+    timeout_seconds: int = Field(default=10, ge=1, le=30)
+
+
+class AnalyzeRequest(BaseModel):
+    request_text: str
+    context: Dict[str, Any] = {}
+
+
+class RelaunchRequest(BaseModel):
+    reason: str = "manual relaunch requested by Custom GPT"
+    delay_seconds: int = Field(default=1, ge=0, le=10)
+
+
+@app.middleware("http")
+async def request_analysis_middleware(request: Request, call_next):
+    started = time.time()
+    body = b""
+    if request.method in {"POST", "PUT", "PATCH"}:
+        body = await request.body()
+
+        async def receive():
+            return {"type": "http.request", "body": body, "more_body": False}
+        request = Request(request.scope, receive)
+
+    response = await call_next(request)
+    duration_ms = round((time.time() - started) * 1000, 3)
+
+    try:
+        rid = f"req_{uuid.uuid4().hex[:16]}"
+        with sqlite3.connect(LEDGER_DB, timeout=5) as con:
+            con.execute(
+                "INSERT INTO request_log(id, method, path, query, client, user_agent, status_code, duration_ms, request_sha256, response_sha256, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    rid,
+                    request.method,
+                    request.url.path,
+                    str(request.url.query),
+                    request.client.host if request.client else "",
+                    request.headers.get("user-agent", ""),
+                    response.status_code,
+                    duration_ms,
+                    sha256_bytes(body),
+                    "",
+                    now_iso(),
+                ),
+            )
+    except Exception:
+        pass
+    return response
+
+
+@app.on_event("startup")
+def startup():
+    init_db()
+
+
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
+def home():
+    return f"""
+    <html><head><title>{APP_NAME}</title></head>
+    <body>
+      <h1>{APP_NAME}</h1>
+      <p>Schema: <a href="/openapi.json">/openapi.json</a></p>
+      <p>Docs: <a href="/docs">/docs</a></p>
+      <p>Health: <a href="/health">/health</a></p>
+      <p>Admin relaunch requires ADMIN_TOKEN.</p>
+    </body></html>
+    """
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    return PlainTextResponse("", status_code=204)
+
+
+@app.get("/health", operation_id="health")
+def health():
+    return {
+        "ok": True,
+        "app": APP_NAME,
+        "version": "4.0.0",
+        "public_base_url": PUBLIC_BASE_URL,
+        "openapi_url": f"{PUBLIC_BASE_URL}/openapi.json",
+        "admin_token_enabled": bool(ADMIN_TOKEN),
+        "time": now_iso(),
+    }
+
+
+@app.get("/capabilities", operation_id="get_capabilities")
+def capabilities():
+    return {
+        "kernel": APP_NAME,
+        "version": "4.0.0",
+        "features": [
+            "admin_protected_self_relaunch",
+            "controlled_terminal",
+            "python_execution",
+            "public_web_scrape_with_private_ip_block",
+            "file_save_read_list",
+            "artifact_url_issue",
+            "persistent_json_receipts",
+            "sqlite_ledger",
+            "request_analysis_log",
+            "persistent_parameterized_tools",
+            "sessions",
+        ],
+        "mutation_auth": "X-Admin-Token required for relaunch and persistent tool mutation when ADMIN_TOKEN is set",
+        "schema": f"{PUBLIC_BASE_URL}/openapi.json",
+    }
+
+
+@app.post("/terminal/run", operation_id="run_terminal")
+async def terminal_run(req: TerminalRunRequest):
+    validate_command(req.command)
+    cwd = workspace_path(req.workspace, req.cwd)
+    proc = await asyncio.create_subprocess_shell(
+        req.command,
+        cwd=str(cwd),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env={**os.environ, "HOME": str(workspace_path(req.workspace, "."))},
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=req.timeout_seconds)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.communicate()
+        payload = {"workspace": req.workspace, "cwd": str(cwd), "command": req.command, "returncode": 124, "stdout": "", "stderr": "Command timed out", "truncated": False}
+        return attach_receipt(payload, "terminal.timeout", workspace=req.workspace, summary=req.command[:240])
+
+    payload = {
+        "workspace": req.workspace,
+        "cwd": str(cwd),
+        "command": req.command,
+        "returncode": int(proc.returncode or 0),
+        "stdout": stdout[:MAX_OUTPUT_BYTES].decode("utf-8", errors="replace"),
+        "stderr": stderr[:MAX_OUTPUT_BYTES].decode("utf-8", errors="replace"),
+        "truncated": len(stdout) > MAX_OUTPUT_BYTES or len(stderr) > MAX_OUTPUT_BYTES,
+    }
+    if req.create_receipt:
+        payload = attach_receipt(payload, "terminal.run", workspace=req.workspace, summary=req.command[:240])
+    return payload
+
+
+@app.post("/python/run", operation_id="run_python")
+async def python_run(req: PythonRunRequest):
+    ws = workspace_path(req.workspace, ".")
+    run_id = uuid.uuid4().hex[:12]
+    script = ws / f"_run_{run_id}.py"
+    script.write_text(req.code, encoding="utf-8")
+    proc = await asyncio.create_subprocess_shell(
+        f"python {shlex.quote(script.name)}",
+        cwd=str(ws),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env={**os.environ, "HOME": str(ws), "PYTHONUNBUFFERED": "1"},
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=req.timeout_seconds)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.communicate()
+        payload = {"workspace": req.workspace, "script": script.name, "returncode": 124, "stdout": "", "stderr": "Python timed out", "truncated": False}
+        return attach_receipt(payload, "python.timeout", workspace=req.workspace, summary=script.name)
+
+    payload = {
+        "workspace": req.workspace,
+        "script": script.name,
+        "returncode": int(proc.returncode or 0),
+        "stdout": stdout[:MAX_OUTPUT_BYTES].decode("utf-8", errors="replace"),
+        "stderr": stderr[:MAX_OUTPUT_BYTES].decode("utf-8", errors="replace"),
+        "truncated": len(stdout) > MAX_OUTPUT_BYTES or len(stderr) > MAX_OUTPUT_BYTES,
+    }
+    if req.create_receipt:
+        payload = attach_receipt(payload, "python.run", workspace=req.workspace, summary=script.name)
+    return payload
+
+
+@app.post("/files/write", operation_id="write_file")
+def files_write(req: FileWriteRequest):
+    target = workspace_path(req.workspace, req.path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    raw = req.content.encode(req.encoding)
+    if len(raw) > MAX_FILE_BYTES:
+        raise HTTPException(status_code=413, detail="File too large")
+    target.write_bytes(raw)
+    payload = {"workspace": req.workspace, "path": req.path, "bytes": len(raw), "sha256": sha256_bytes(raw)}
+    return attach_receipt(payload, "files.write", workspace=req.workspace, summary=req.path)
+
+
+@app.post("/files/read", operation_id="read_file")
+def files_read(req: FileReadRequest):
+    target = workspace_path(req.workspace, req.path)
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+    raw_all = target.read_bytes()
+    raw = raw_all[: req.max_bytes]
+    return {
+        "workspace": req.workspace,
+        "path": req.path,
+        "bytes": len(raw),
+        "sha256": sha256_bytes(raw_all),
+        "content": raw.decode("utf-8", errors="replace"),
+        "truncated": len(raw_all) > req.max_bytes,
+    }
+
+
+@app.post("/files/list", operation_id="list_files")
+def files_list(req: FileListRequest):
+    base = workspace_path(req.workspace, req.path)
+    if not base.exists():
+        raise HTTPException(status_code=404, detail="Path not found")
+    root = workspace_path(req.workspace, ".")
+    items = []
+    for idx, p in enumerate(sorted(base.iterdir(), key=lambda x: x.name.lower())):
+        if idx >= req.max_items:
+            break
+        items.append({
+            "name": p.name,
+            "path": str(p.relative_to(root)),
+            "type": "dir" if p.is_dir() else "file",
+            "bytes": p.stat().st_size if p.is_file() else None,
+            "modified_at": datetime.fromtimestamp(p.stat().st_mtime, timezone.utc).isoformat(),
+        })
+    return {"workspace": req.workspace, "path": req.path, "items": items}
+
+
+@app.get("/workspace/tree", response_class=PlainTextResponse, operation_id="get_workspace_tree")
+def workspace_tree(workspace: str = "default", max_items: int = 500):
+    base = workspace_path(workspace, ".")
+    lines = [f"{workspace}/"]
+    count = 0
+    for p in sorted(base.rglob("*")):
+        count += 1
+        if count > max_items:
+            lines.append("... truncated ...")
+            break
+        rel = p.relative_to(base)
+        indent = "  " * (len(rel.parts) - 1)
+        lines.append(f"{indent}{rel.name}{'/' if p.is_dir() else ''}")
+    return "\n".join(lines)
+
+
+@app.post("/artifact/compile", operation_id="compile_artifact")
+def artifact_compile(req: ArtifactRequest):
+    filename = safe_name(req.filename, "artifact.txt")
+    if "." not in filename:
+        filename += ".txt"
+    aid = f"art_{uuid.uuid4().hex[:12]}_{filename}"
+    target = artifact_path(aid)
+    raw = req.content.encode("utf-8")
+    if len(raw) > MAX_FILE_BYTES:
+        raise HTTPException(status_code=413, detail="Artifact too large")
+    target.write_bytes(raw)
+    payload = {
+        "artifact_id": aid,
+        "filename": filename,
+        "bytes": len(raw),
+        "sha256": sha256_bytes(raw),
+        "url": f"{PUBLIC_BASE_URL}/u/{aid}",
+        "content_type": req.content_type,
+    }
+    return attach_receipt(payload, "artifact.compile", workspace=req.workspace, summary=filename)
+
+
+@app.post("/url/issue", operation_id="issue_url")
+def url_issue(req: ArtifactRequest):
+    return artifact_compile(req)
+
+
+@app.get("/u/{artifact_id}", include_in_schema=False)
+def artifact_get(artifact_id: str):
+    p = artifact_path(artifact_id)
+    if not p.exists() or not p.is_file():
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    return FileResponse(str(p), filename=p.name)
+
+
+@app.get("/artifacts", operation_id="list_artifacts")
+def list_artifacts(limit: int = 100):
+    items = []
+    for idx, p in enumerate(sorted(ARTIFACT_ROOT.glob("*"), key=lambda x: x.stat().st_mtime, reverse=True)):
+        if idx >= max(1, min(limit, 1000)):
+            break
+        if not p.is_file():
+            continue
+        raw = p.read_bytes()
+        items.append({
+            "artifact_id": p.name,
+            "bytes": len(raw),
+            "sha256": sha256_bytes(raw),
+            "url": f"{PUBLIC_BASE_URL}/u/{p.name}",
+            "modified_at": datetime.fromtimestamp(p.stat().st_mtime, timezone.utc).isoformat(),
+        })
+    return {"items": items}
+
+
+@app.post("/web/scrape", operation_id="scrape_public_url")
+async def web_scrape(req: WebScrapeRequest):
+    parsed = urlparse(req.url)
+    if parsed.scheme not in {"http", "https"}:
+        raise HTTPException(status_code=400, detail="Only http and https URLs are allowed")
+    if private_or_internal_host(parsed.hostname or ""):
+        raise HTTPException(status_code=400, detail="Private/internal hosts are blocked")
+
+    async with httpx.AsyncClient(
+        follow_redirects=True,
+        timeout=15,
+        headers={"User-Agent": "SelfRelaunchingGPTKernel/4.0 public scraper"},
+    ) as client:
+        resp = await client.get(req.url)
+        final_url = str(resp.url)
+        if private_or_internal_host(urlparse(final_url).hostname or ""):
+            raise HTTPException(status_code=400, detail="Redirected to private/internal host")
+        raw = resp.content[: req.max_bytes]
+
+    ctype = resp.headers.get("content-type", "")
+    extracted = extract_title_text(raw, ctype)
+    payload = {
+        "url": req.url,
+        "final_url": final_url,
+        "status_code": resp.status_code,
+        "content_type": ctype,
+        "headers": {k: v for k, v in resp.headers.items() if k.lower() in {"content-type", "content-length", "server", "last-modified", "etag"}},
+        "title": extracted["title"],
+        "text_preview": extracted["text"][: req.preview_chars],
+        "bytes_read": len(raw),
+        "sha256": sha256_bytes(raw),
+        "truncated": len(resp.content) > len(raw),
+        "saved_path": None,
+    }
+
+    if req.save:
+        fname = safe_name(parsed.netloc + parsed.path, "scrape") + ".json"
+        target = workspace_path(req.workspace, fname)
+        save_json(target, payload)
+        payload["saved_path"] = str(target.relative_to(workspace_path(req.workspace, ".")))
+
+    return attach_receipt(payload, "web.scrape", workspace=req.workspace, summary=req.url[:240])
+
+
+@app.post("/analyze/request", operation_id="analyze_gpt_request")
+def analyze_request(req: AnalyzeRequest):
+    text = req.request_text
+    lower = text.lower()
+    labels = []
+    if any(x in lower for x in ["trade", "trading", "underwrite", "market", "perp", "futures"]):
+        labels.append("trading_or_underwriting")
+    if any(x in lower for x in ["terminal", "run", "execute", "shell", "command"]):
+        labels.append("terminal_execution")
+    if any(x in lower for x in ["scrape", "crawl", "website", "url", "fetch"]):
+        labels.append("web_retrieval")
+    if any(x in lower for x in ["file", "save", "artifact", "receipt", "ledger"]):
+        labels.append("artifact_or_receipt")
+    if any(x in lower for x in ["relaunch", "restart", "rebuild", "deploy"]):
+        labels.append("deployment_control")
+
+    risk_flags = []
+    if any(x in lower for x in ["api key", "secret", "private key", "password", "token"]):
+        risk_flags.append("credential_sensitive")
+    if any(x in lower for x in ["live order", "real money", "no stop loss", "guaranteed profit"]):
+        risk_flags.append("financial_risk")
+    if any(x in lower for x in ["unrestricted shell", "public shell", "no auth"]):
+        risk_flags.append("unsafe_public_execution")
+
+    payload = {
+        "labels": labels,
+        "risk_flags": risk_flags,
+        "recommended_route": labels[0] if labels else "general",
+        "request_sha256": sha256_bytes(text.encode("utf-8")),
+        "context": req.context,
+    }
+    return attach_receipt(payload, "request.analysis", summary=text[:240])
+
+
+@app.get("/requests/recent", operation_id="recent_request_analysis")
+def recent_requests(limit: int = 100):
+    limit = max(1, min(limit, 500))
+    with sqlite3.connect(LEDGER_DB, timeout=5) as con:
+        rows = con.execute(
+            "SELECT id, method, path, query, client, user_agent, status_code, duration_ms, request_sha256, created_at FROM request_log ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return {"items": [
+        {"id": r[0], "method": r[1], "path": r[2], "query": r[3], "client": r[4], "user_agent": r[5], "status_code": r[6], "duration_ms": r[7], "request_sha256": r[8], "created_at": r[9]}
+        for r in rows
+    ]}
+
+
+@app.post("/tools/register", operation_id="register_tool")
+def register_tool(req: ToolRegisterRequest, x_admin_token: Optional[str] = Header(default=None)):
+    require_admin(x_admin_token)
+    name = safe_name(req.name)
+    if req.mode not in {"command", "python"}:
+        raise HTTPException(status_code=400, detail="mode must be command or python")
+    if req.mode == "command" and req.template:
+        validate_command(render_template(req.template, {k: "x" for k in req.required_args}, req.required_args))
+    now = now_iso()
+    with sqlite3.connect(LEDGER_DB, timeout=5) as con:
+        con.execute(
+            """INSERT INTO tools(name, description, mode, template, input_schema_json, required_args_json, enabled, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(name) DO UPDATE SET description=excluded.description, mode=excluded.mode, template=excluded.template,
+               input_schema_json=excluded.input_schema_json, required_args_json=excluded.required_args_json, enabled=excluded.enabled, updated_at=excluded.updated_at""",
+            (name, req.description, req.mode, req.template, json.dumps(req.input_schema), json.dumps(req.required_args), 1 if req.enabled else 0, now, now)
+        )
+    payload = {"name": name, "registered": True, "mode": req.mode}
+    return attach_receipt(payload, "tool.register", actor="admin", summary=name)
+
+
+@app.get("/tools", operation_id="list_tools")
+def list_tools():
+    with sqlite3.connect(LEDGER_DB, timeout=5) as con:
+        rows = con.execute("SELECT name, description, mode, enabled, input_schema_json, required_args_json, created_at, updated_at FROM tools ORDER BY name").fetchall()
+    return {"tools": [
+        {"name": r[0], "description": r[1], "mode": r[2], "enabled": bool(r[3]), "input_schema": json.loads(r[4] or "{}"), "required_args": json.loads(r[5] or "[]"), "created_at": r[6], "updated_at": r[7]}
+        for r in rows
+    ]}
+
+
+@app.post("/tool/{name}", operation_id="invoke_tool")
+async def invoke_tool(name: str, req: ToolInvokeRequest):
+    name = safe_name(name)
+    with sqlite3.connect(LEDGER_DB, timeout=5) as con:
+        row = con.execute("SELECT mode, template, enabled, required_args_json FROM tools WHERE name = ?", (name,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Tool not found")
+    mode, template, enabled, required_json = row
+    if not enabled:
+        raise HTTPException(status_code=403, detail="Tool disabled")
+    required = json.loads(required_json or "[]")
+    rendered = render_template(template, req.params, required)
+    if mode == "command":
+        return await terminal_run(TerminalRunRequest(workspace=req.workspace, command=rendered, timeout_seconds=req.timeout_seconds))
+    if mode == "python":
+        code = "ARGS = " + json.dumps(req.params, ensure_ascii=False) + "\n" + rendered
+        return await python_run(PythonRunRequest(workspace=req.workspace, code=code, timeout_seconds=req.timeout_seconds))
+    raise HTTPException(status_code=400, detail="Unknown tool mode")
+
+
+@app.post("/sessions", operation_id="create_session")
+def create_session(req: SessionCreateRequest, x_admin_token: Optional[str] = Header(default=None)):
+    require_admin(x_admin_token)
+    sid = f"sess_{uuid.uuid4().hex[:16]}"
+    cwd = workspace_path(req.workspace, req.cwd)
+    now = now_iso()
+    with sqlite3.connect(LEDGER_DB, timeout=5) as con:
+        con.execute("INSERT INTO sessions(id, workspace, cwd, created_at, updated_at) VALUES (?, ?, ?, ?, ?)", (sid, req.workspace, str(cwd), now, now))
+    return attach_receipt({"session_id": sid, "workspace": req.workspace, "cwd": str(cwd), "created_at": now}, "session.create", actor="admin", workspace=req.workspace, summary=sid)
+
+
+@app.post("/sessions/run", operation_id="run_session")
+async def run_session(req: SessionRunRequest, x_admin_token: Optional[str] = Header(default=None)):
+    require_admin(x_admin_token)
+    with sqlite3.connect(LEDGER_DB, timeout=5) as con:
+        row = con.execute("SELECT workspace, cwd FROM sessions WHERE id = ?", (req.session_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Session not found")
+    workspace, cwd = row
+    rel = os.path.relpath(cwd, workspace_path(workspace, "."))
+    return await terminal_run(TerminalRunRequest(workspace=workspace, command=req.command, timeout_seconds=req.timeout_seconds, cwd=rel))
+
+
+@app.get("/receipts", operation_id="list_receipts")
+def list_receipts(kind: Optional[str] = None, q: Optional[str] = None, limit: int = 100):
+    limit = max(1, min(limit, 1000))
+    rows = []
+    with sqlite3.connect(LEDGER_DB, timeout=5) as con:
+        if kind:
+            data = con.execute("SELECT id, kind, actor, workspace, summary, payload_sha256, created_at FROM receipts WHERE kind = ? ORDER BY created_at DESC LIMIT ?", (kind, limit)).fetchall()
+        else:
+            data = con.execute("SELECT id, kind, actor, workspace, summary, payload_sha256, created_at FROM receipts ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+    for r in data:
+        item = {"id": r[0], "kind": r[1], "actor": r[2], "workspace": r[3], "summary": r[4], "payload_sha256": r[5], "created_at": r[6]}
+        if q and q.lower() not in json.dumps(item, ensure_ascii=False).lower():
+            continue
+        rows.append(item)
+    return {"items": rows}
+
+
+@app.get("/receipts/{receipt_id}", operation_id="get_receipt")
+def get_receipt(receipt_id: str):
+    rid = safe_name(receipt_id)
+    path = RECEIPTS_ROOT / f"{rid}.json"
+    if path.exists():
+        return json.loads(path.read_text(encoding="utf-8"))
+    with sqlite3.connect(LEDGER_DB, timeout=5) as con:
+        row = con.execute("SELECT id, kind, actor, workspace, summary, payload_json, payload_sha256, created_at FROM receipts WHERE id = ?", (receipt_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Receipt not found")
+    return {"id": row[0], "kind": row[1], "actor": row[2], "workspace": row[3], "summary": row[4], "payload": json.loads(row[5]), "payload_sha256": row[6], "created_at": row[7]}
+
+
+@app.get("/deployment/status", operation_id="deployment_status")
+def deployment_status():
+    checks = {}
+    for label, path in {"data": DATA_DIR, "workspace": WORKSPACE_ROOT, "artifacts": ARTIFACT_ROOT, "receipts": RECEIPTS_ROOT}.items():
+        test = path / f".write_test_{uuid.uuid4().hex[:8]}"
+        try:
+            test.write_text("ok", encoding="utf-8")
+            test.unlink(missing_ok=True)
+            checks[label] = {"path": str(path), "writable": True}
+        except Exception as e:
+            checks[label] = {"path": str(path), "writable": False, "error": f"{type(e).__name__}: {str(e)}"}
+    return {"public_base_url": PUBLIC_BASE_URL, "admin_token_enabled": bool(ADMIN_TOKEN), "relaunch_flag_exists": RELAUNCH_FLAG.exists(), "checks": checks}
+
+
+@app.post("/admin/relaunch", operation_id="admin_relaunch")
+async def admin_relaunch(req: RelaunchRequest, x_admin_token: Optional[str] = Header(default=None)):
+    require_admin(x_admin_token)
+    payload = {"requested": True, "reason": req.reason, "delay_seconds": req.delay_seconds, "created_at": now_iso()}
+    save_json(RELAUNCH_FLAG, payload)
+    receipt = make_receipt("admin.relaunch", payload, actor="admin", summary=req.reason[:240])
+
+    async def delayed_exit():
+        await asyncio.sleep(req.delay_seconds)
+        os._exit(0)
+
+    asyncio.create_task(delayed_exit())
+    return {"accepted": True, "message": "Relaunch requested. The process will exit; Hugging Face should restart the Space.", "receipt": receipt}
+
+
+STRICT_OPENAPI_PATHS = [
+    "/health",
+    "/capabilities",
+    "/terminal/run",
+    "/python/run",
+    "/files/write",
+    "/files/read",
+    "/files/list",
+    "/workspace/tree",
+    "/artifact/compile",
+    "/url/issue",
+    "/artifacts",
+    "/web/scrape",
+    "/analyze/request",
+    "/requests/recent",
+    "/tools/register",
+    "/tools",
+    "/tool/{name}",
+    "/sessions",
+    "/sessions/run",
+    "/receipts",
+    "/receipts/{receipt_id}",
+    "/deployment/status",
+    "/admin/relaunch",
+]
+
+
+@app.get("/openapi.json", include_in_schema=False)
+def actions_openapi():
+    raw = app.openapi()
+    strict = {
+        "openapi": "3.0.3",
+        "info": raw.get("info", {}),
+        "servers": [{"url": PUBLIC_BASE_URL}],
+        "paths": {k: v for k, v in raw.get("paths", {}).items() if k in STRICT_OPENAPI_PATHS},
+        "components": raw.get("components", {}),
+    }
+
+    def scrub(obj):
+        if isinstance(obj, dict):
+            obj.pop("examples", None)
+            obj.pop("const", None)
+            for k in list(obj.keys()):
+                scrub(obj[k])
+        elif isinstance(obj, list):
+            for x in obj:
+                scrub(x)
+
+    scrub(strict)
+    return JSONResponse(strict)
+
+```
