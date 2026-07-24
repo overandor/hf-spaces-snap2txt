@@ -14,7 +14,7 @@ jobs:
   snapshot:
     name: Build canonical project_contents.txt
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       - name: Check out pushed repository state
@@ -41,6 +41,55 @@ jobs:
           test -s project_contents.txt
           cp project_contents.txt "$RUNNER_TEMP/project_contents.txt"
 
+          bytes="$(stat -c '%s' "$RUNNER_TEMP/project_contents.txt")"
+          digest="$(sha256sum "$RUNNER_TEMP/project_contents.txt" | cut -d' ' -f1)"
+          {
+            echo "### Snap2Text dossier"
+            echo
+            echo "- Repository: \`$GITHUB_REPOSITORY\`"
+            echo "- Source commit: \`$GITHUB_SHA\`"
+            echo "- Bytes: \`$bytes\`"
+            echo "- SHA-256: \`$digest\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish the canonical file as a rolling release asset
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SNAP_RELEASE: snap2txt-latest
+        run: |
+          set -Eeuo pipefail
+
+          snapshot="$RUNNER_TEMP/project_contents.txt"
+          notes="$RUNNER_TEMP/snap2txt-release-notes.md"
+          bytes="$(stat -c '%s' "$snapshot")"
+          digest="$(sha256sum "$snapshot" | cut -d' ' -f1)"
+
+          cat > "$notes" <<EOF
+          Canonical one-file Snap2Text dossier for **$GITHUB_REPOSITORY**.
+
+          - Source commit: \`$GITHUB_SHA\`
+          - Source ref: \`$GITHUB_REF\`
+          - Size: \`$bytes bytes\`
+          - SHA-256: \`$digest\`
+          EOF
+
+          if gh release view "$SNAP_RELEASE" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$SNAP_RELEASE" "$snapshot" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+            gh release edit "$SNAP_RELEASE" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Latest Snap2Text dossier" \
+              --notes-file "$notes"
+          else
+            gh release create "$SNAP_RELEASE" "$snapshot" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "Latest Snap2Text dossier" \
+              --notes-file "$notes"
+          fi
+
       - name: Publish the dossier to the snap2txt branch
         shell: bash
         env:
@@ -48,6 +97,15 @@ jobs:
           SNAP_BRANCH: snap2txt
         run: |
           set -Eeuo pipefail
+
+          snapshot="$RUNNER_TEMP/project_contents.txt"
+          bytes="$(stat -c '%s' "$snapshot")"
+          max_git_blob_bytes=$((95 * 1024 * 1024))
+
+          if (( bytes > max_git_blob_bytes )); then
+            echo "Snapshot is too large for a normal Git blob; the release asset remains canonical."
+            exit 0
+          fi
 
           archive="$RUNNER_TEMP/snap2txt-branch"
           repository_url="${{ github.server_url }}/${{ github.repository }}.git"
@@ -66,14 +124,14 @@ jobs:
           fi
 
           find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
-          cp "$RUNNER_TEMP/project_contents.txt" project_contents.txt
+          cp "$snapshot" project_contents.txt
 
           git config user.name "overandor-snap2txt[bot]"
           git config user.email "overandor-snap2txt[bot]@users.noreply.github.com"
           git add -- project_contents.txt
 
           if git diff --cached --quiet; then
-            echo "Snapshot is unchanged; no commit required."
+            echo "Snapshot is unchanged; no branch commit required."
             exit 0
           fi
 
