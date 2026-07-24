@@ -1,0 +1,81 @@
+name: Repository Snap2Text
+
+on:
+  workflow_call:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: snap2txt-${{ github.repository }}
+  cancel-in-progress: true
+
+jobs:
+  snapshot:
+    name: Build canonical project_contents.txt
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out pushed repository state
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install the verified Snap2Txt implementation
+        run: >-
+          python -m pip install --disable-pip-version-check
+          "git+https://github.com/vorniches/snap2txt.git@970539bec15a27e7f562e8229c2fff6a6ef34d6e"
+
+      - name: Convert the repository into one text dossier
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          snap2txt
+          test -s project_contents.txt
+          cp project_contents.txt "$RUNNER_TEMP/project_contents.txt"
+
+      - name: Publish the dossier to the snap2txt branch
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SNAP_BRANCH: snap2txt
+        run: |
+          set -Eeuo pipefail
+
+          archive="$RUNNER_TEMP/snap2txt-branch"
+          repository_url="${{ github.server_url }}/${{ github.repository }}.git"
+
+          mkdir -p "$archive"
+          cd "$archive"
+          git init
+          git remote add origin "$repository_url"
+          gh auth setup-git
+
+          if git ls-remote --exit-code --heads origin "$SNAP_BRANCH" >/dev/null 2>&1; then
+            git fetch --depth=1 origin "$SNAP_BRANCH"
+            git checkout -B "$SNAP_BRANCH" FETCH_HEAD
+          else
+            git checkout --orphan "$SNAP_BRANCH"
+          fi
+
+          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          cp "$RUNNER_TEMP/project_contents.txt" project_contents.txt
+
+          git config user.name "overandor-snap2txt[bot]"
+          git config user.email "overandor-snap2txt[bot]@users.noreply.github.com"
+          git add -- project_contents.txt
+
+          if git diff --cached --quiet; then
+            echo "Snapshot is unchanged; no commit required."
+            exit 0
+          fi
+
+          git commit -m "snapshot: $GITHUB_REPOSITORY@$GITHUB_SHA"
+          git push origin "HEAD:$SNAP_BRANCH"
